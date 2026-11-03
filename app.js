@@ -1,5 +1,5 @@
-// AYT TMA Radarless Approach Calculator & Master Scenario Solver
-// Hardcoded speed: 5 NM / 1 minute (300 kt GS)
+// AYT TMA Radarless Approach Calculator & Conflict Finder
+// Speed: 5 NM / 1 minute (300 kt GS)
 // Chart scale: 4.2 px per NM from center (430, 430)
 
 const SPEED_NM_PER_MIN = 5;
@@ -108,38 +108,89 @@ const WAYPOINTS = [
   },
 ];
 
+const AYT_VOR_POINT = {
+  id: "AYT",
+  name: "AYT VOR",
+  entryWpt: "0 NM",
+  airway: "VOR",
+  radial: "CENTER",
+  deg: 0,
+  fl: "—",
+  meaFt: 0,
+  msaFt: 3000,
+  defaultArrFl: 150,
+  defaultDepFl: 150,
+  straightInRwy: null,
+};
+
+const ALL_ROUTE_POINTS = [...WAYPOINTS, AYT_VOR_POINT];
+
+function getWaypointOrVor(id) {
+  if (id === "AYT") return AYT_VOR_POINT;
+  return WAYPOINTS.find((w) => w.id === id) || WAYPOINTS[0];
+}
+
 // Application State
 const state = {
-  activeView: "calc", // 'calc' | 'chart' | 'timeline'
+  activeView: "calc", // 'calc' | 'chart'
   activeRwy: "36",
   wizardOpen: false,
-  wizardStepIdx: 0, // 0 = ARR/DEP, then 1..N
-  flightType: "ARR", // 'ARR' | 'DEP'
+  wizardStepIdx: 0,
+  flightType: "ARR", // 'ARR' | 'DEP' | 'TRN'
   selectedWpt: "DERYA",
+  transitRoute: ["KUMRU", "AYT", "DERYA"], // Route array for Transit planes
   selectedDist: 60,
   selectedFl: 250,
   inputTimeRaw: "00",
   inputCallsign: "",
-  approachMode: "auto",
+  globalQueryDme: 30,
   lookupTimeRaw: "00",
   aircraftList: [],
   nextId: 1,
   playInterval: null,
 };
 
+function normalizeTransitEndpoints(acft) {
+  let entryWptId = acft.entryWptId || acft.wptId || "KUMRU";
+  let exitWptId = acft.exitWptId || "DERYA";
+
+  if (Array.isArray(acft.route) && acft.route.length > 0) {
+    entryWptId = acft.route[0];
+    if (acft.route.length === 1) {
+      exitWptId = entryWptId === "AYT" ? "DERYA" : "AYT";
+    } else {
+      exitWptId = acft.route[acft.route.length - 1];
+    }
+  }
+  return { entryWptId, exitWptId };
+}
+
 function loadSavedState() {
   try {
-    const saved = localStorage.getItem("ayt_radarsiz_state_v3") || localStorage.getItem("ayt_radarsiz_state_v2");
+    const saved =
+      localStorage.getItem("ayt_radarsiz_state_v4") ||
+      localStorage.getItem("ayt_radarsiz_state_v3") ||
+      localStorage.getItem("ayt_radarsiz_state_v2");
     if (saved) {
       const parsed = JSON.parse(saved);
       if (parsed.activeRwy) state.activeRwy = parsed.activeRwy;
+      if (typeof parsed.globalQueryDme === "number") {
+        state.globalQueryDme = parsed.globalQueryDme;
+      }
       if (Array.isArray(parsed.aircraftList)) {
         state.aircraftList = parsed.aircraftList.map((a) => {
-          const wpt = WAYPOINTS.find((w) => w.id === a.wptId) || WAYPOINTS[0];
+          const wpt = getWaypointOrVor(a.wptId || a.entryWptId);
+          const type = a.type || "ARR";
+          const endpoints =
+            type === "TRN" ? normalizeTransitEndpoints(a) : { entryWptId: a.wptId, exitWptId: null };
           return {
             ...a,
-            type: a.type || "ARR",
-            fl: a.fl || (a.type === "DEP" ? wpt.defaultDepFl : wpt.defaultArrFl),
+            type,
+            wptId: a.wptId || endpoints.entryWptId || "DERYA",
+            entryWptId: endpoints.entryWptId,
+            exitWptId: endpoints.exitWptId,
+            fl: a.fl || (type === "DEP" ? wpt.defaultDepFl : wpt.defaultArrFl),
+            queryDme: typeof a.queryDme === "number" ? a.queryDme : state.globalQueryDme,
           };
         });
       }
@@ -153,9 +204,10 @@ function loadSavedState() {
 function saveState() {
   try {
     localStorage.setItem(
-      "ayt_radarsiz_state_v3",
+      "ayt_radarsiz_state_v4",
       JSON.stringify({
         activeRwy: state.activeRwy,
+        globalQueryDme: state.globalQueryDme,
         aircraftList: state.aircraftList,
         nextId: state.nextId,
       })
@@ -169,9 +221,9 @@ function saveState() {
 function flInputToFeet(val) {
   const n = Number(val) || 0;
   if (n <= 0) return 10000;
-  if (n <= 25) return n * 1000; // e.g. 3 -> 3000', 9 -> 9000', 12 -> 12000'
-  if (n <= 500) return n * 100; // e.g. 70 -> 7000', 120 -> 12000', 130 -> 13000'
-  return n; // e.g. 9000 -> 9000'
+  if (n <= 25) return n * 1000;
+  if (n <= 500) return n * 100;
+  return n;
 }
 
 // Format feet as ATC altitude / Flight Level string
@@ -296,8 +348,15 @@ function denormalizeTime(normMins, hasHour, refHour) {
   return normMins;
 }
 
-// Base Arrival Checkpoints (before EAT sequencing)
-function calculateArrivalCheckpoints({ wptId, dist, timeRaw, mode, holdMins = 0, fl }, activeRwy) {
+// ============================================================================
+// CHECKPOINT & CUSTOM DME CROSSING CALCULATORS (ARRIVAL, DEPARTURE, TRANSIT)
+// ============================================================================
+
+// 1. Arrival Checkpoints (Flies TO AYT VOR at 5 NM / 1 min)
+function calculateArrivalCheckpoints(
+  { wptId, dist, timeRaw, mode, holdMins = 0, fl, queryDme = 30 },
+  activeRwy
+) {
   const wpt = WAYPOINTS.find((w) => w.id === wptId) || WAYPOINTS[0];
   const parsedTime = parseTimeInput(timeRaw);
   const tInit = parsedTime.totalMinutes;
@@ -306,11 +365,16 @@ function calculateArrivalCheckpoints({ wptId, dist, timeRaw, mode, holdMins = 0,
   const d = Number(dist) || 60;
   const hold = Number(holdMins) || 0;
   const initAltFt = flInputToFeet(fl || wpt.defaultArrFl);
+  const qDme = queryDme !== undefined && queryDme !== "" ? Number(queryDme) : 30;
 
   const t25 = d >= 25 ? tInit + (d - 25) / SPEED_NM_PER_MIN : null;
   const t15 = d >= 15 ? tInit + (d - 15) / SPEED_NM_PER_MIN : null;
   const t10 = d >= 10 ? tInit + (d - 10) / SPEED_NM_PER_MIN : tInit;
   const tRadialZero = tInit + d / SPEED_NM_PER_MIN;
+
+  // Custom DME crossing time TO AYT
+  const tQueryTo =
+    !Number.isNaN(qDme) && qDme >= 0 ? tRadialZero - qDme / SPEED_NM_PER_MIN : null;
 
   let tVor = null;
   let tFixBase = null;
@@ -339,6 +403,8 @@ function calculateArrivalCheckpoints({ wptId, dist, timeRaw, mode, holdMins = 0,
     straightIn,
     holdMins: hold,
     initAltFt,
+    qDme,
+    tQueryTo,
     tInit,
     t25,
     t15,
@@ -353,55 +419,109 @@ function calculateArrivalCheckpoints({ wptId, dist, timeRaw, mode, holdMins = 0,
   };
 }
 
-// Departure Checkpoints Calculation (Starts at 0 NM at depTime, flies outbound at 5 NM / 1 min)
-function calculateDepartureCheckpoints({ wptId, timeRaw, fl }) {
+// 2. Departure Checkpoints (Starts at 0 NM at depTime, flies FROM AYT VOR at 5 NM / 1 min)
+function calculateDepartureCheckpoints({ wptId, timeRaw, fl, queryDme = 30 }) {
   const wpt = WAYPOINTS.find((w) => w.id === wptId) || WAYPOINTS[0];
   const parsedTime = parseTimeInput(timeRaw);
   const tDep = parsedTime.totalMinutes;
   const hasHour = parsedTime.hasHour;
   const reqAltFt = flInputToFeet(fl || wpt.defaultDepFl);
+  const qDme = queryDme !== undefined && queryDme !== "" ? Number(queryDme) : 30;
+
+  // Custom DME crossing time FROM AYT
+  const tQueryFrom =
+    !Number.isNaN(qDme) && qDme >= 0 ? tDep + qDme / SPEED_NM_PER_MIN : null;
 
   return {
     wptId,
     hasHour,
     reqAltFt,
+    qDme,
+    tQueryFrom,
     tDep,
-    t10: tDep + 2, // 10 NM (+2m) -> Must reach >= MSA before 10 NM
-    t15: tDep + 3, // 15 NM (+3m)
-    t25: tDep + 5, // 25 NM (+5m) -> Must reach >= MEA before 25 NM
+    t10: tDep + 2,
+    t15: tDep + 3,
+    t25: tDep + 5,
     t50: tDep + 10,
     t60: tDep + 12,
   };
 }
 
-// ============================================================================
-// MASTER SCENARIO SOLVER & LIVE TIME-STEP SIMULATION ENGINE (dt = 0.2m / 1 NM)
-// Solves:
-// 1. Optimal Landing Sequence & EATs (Expected Approach Times)
-// 2. Dynamic Multi-Aircraft Approach & Holding Stack (3,000', 4,000', 5,000', 6,000'...)
-//    with automatic 1,000' step-downs as preceding aircraft establish
-// 3. Same-Waypoint & Cross-Radial (<15 NM VOR) Departure <-> Arrival Separation
-// 4. Live 0.2-min (1 NM) Time-Step Verification across all active traffic pairs
-// ============================================================================
-function evaluateTimelineAlt(altTimeline, t, fallbackAlt) {
-  if (!altTimeline || altTimeline.length === 0) return fallbackAlt;
-  let activeAlt = altTimeline[0].altFt;
-  for (let i = 0; i < altTimeline.length; i++) {
-    if (t + 1e-6 >= altTimeline[i].tFrom) {
-      activeAlt = altTimeline[i].altFt;
-    } else {
-      break;
-    }
-  }
-  return activeAlt;
+// 3. Transit Checkpoints (Enters at entryWpt -> flies TO AYT VOR -> flies FROM AYT VOR toward exitWpt, maintaining FL)
+function calculateTransitCheckpoints(acft) {
+  const { entryWptId, exitWptId } = normalizeTransitEndpoints(acft);
+  const entryWpt = getWaypointOrVor(entryWptId);
+  const exitWpt = getWaypointOrVor(exitWptId);
+  const parsedTime = parseTimeInput(acft.timeRaw);
+  const tInit = parsedTime.totalMinutes;
+  const hasHour = parsedTime.hasHour;
+  const d = entryWptId === "AYT" ? 0 : Number(acft.dist) || 60;
+  const maintAltFt = flInputToFeet(acft.fl || 150);
+  const qDme =
+    acft.queryDme !== undefined && acft.queryDme !== "" ? Number(acft.queryDme) : 30;
+
+  const hasInbound = entryWptId !== "AYT";
+  const hasOutbound = Boolean(exitWptId && exitWptId !== "AYT");
+
+  // Inbound TO AYT VOR
+  const t25To = hasInbound && d >= 25 ? tInit + (d - 25) / SPEED_NM_PER_MIN : null;
+  const t15To = hasInbound && d >= 15 ? tInit + (d - 15) / SPEED_NM_PER_MIN : null;
+  const t10To = hasInbound && d >= 10 ? tInit + (d - 10) / SPEED_NM_PER_MIN : null;
+  const tVor = hasInbound ? tInit + d / SPEED_NM_PER_MIN : tInit;
+
+  // Outbound FROM AYT VOR
+  const t10From = hasOutbound ? tVor + 2 : null;
+  const t15From = hasOutbound ? tVor + 3 : null;
+  const t25From = hasOutbound ? tVor + 5 : null;
+  const t50From = hasOutbound ? tVor + 10 : null;
+  const t60From = hasOutbound ? tVor + 12 : null;
+
+  // Custom DME crossing times: BOTH TO AYT (on entryWpt) and FROM AYT (on exitWpt)
+  const tQueryTo =
+    hasInbound && !Number.isNaN(qDme) && qDme >= 0 ? tVor - qDme / SPEED_NM_PER_MIN : null;
+  const tQueryFrom =
+    hasOutbound && !Number.isNaN(qDme) && qDme >= 0 ? tVor + qDme / SPEED_NM_PER_MIN : null;
+
+  return {
+    entryWptId,
+    exitWptId,
+    entryWpt,
+    exitWpt,
+    hasInbound,
+    hasOutbound,
+    dist: d,
+    hasHour,
+    maintAltFt,
+    qDme,
+    tQueryTo,
+    tQueryFrom,
+    tInit,
+    t25To,
+    t15To,
+    t10To,
+    tVor,
+    t10From,
+    t15From,
+    t25From,
+    t50From,
+    t60From,
+  };
 }
 
-function solveScenario(aircraftList, activeRwy) {
+// ============================================================================
+// CONFLICT FINDER ENGINE (ARRIVALS, DEPARTURES & TRANSIT)
+// Finds:
+// 1. Head-On Conflicts on the same Waypoint/Radial (DEP<->ARR, TRN<->ARR, TRN<->DEP, TRN<->TRN)
+// 2. Radial, Same-Track & <15 NM AYT VOR Convergence Conflicts
+// 3. Approach Sequence & ILS / EAT Window Delays
+// ============================================================================
+function analyzeScenarioConflicts(aircraftList, activeRwy) {
   const refHour = getReferenceBaseHour(aircraftList);
   const useHasHour = refHour !== null;
 
-  const arrivalsRaw = aircraftList.filter((a) => a.type !== "DEP");
+  const arrivalsRaw = aircraftList.filter((a) => a.type === "ARR" || !a.type);
   const departuresRaw = aircraftList.filter((a) => a.type === "DEP");
+  const transitsRaw = aircraftList.filter((a) => a.type === "TRN");
 
   const computedArrivals = arrivalsRaw.map((acft) => {
     const wpt = WAYPOINTS.find((w) => w.id === acft.wptId) || WAYPOINTS[0];
@@ -436,8 +556,27 @@ function solveScenario(aircraftList, activeRwy) {
     };
   });
 
+  const computedTransits = transitsRaw.map((acft) => {
+    const calc = calculateTransitCheckpoints(acft);
+    return {
+      acft,
+      entryWpt: calc.entryWpt,
+      exitWpt: calc.exitWpt,
+      calc,
+      normInit: normalizeTime(calc.tInit, calc.hasHour, refHour),
+      norm25To: calc.t25To !== null ? normalizeTime(calc.t25To, calc.hasHour, refHour) : null,
+      norm15To: calc.t15To !== null ? normalizeTime(calc.t15To, calc.hasHour, refHour) : null,
+      norm10To: calc.t10To !== null ? normalizeTime(calc.t10To, calc.hasHour, refHour) : null,
+      normVor: normalizeTime(calc.tVor, calc.hasHour, refHour),
+      norm10From: calc.t10From !== null ? normalizeTime(calc.t10From, calc.hasHour, refHour) : null,
+      norm15From: calc.t15From !== null ? normalizeTime(calc.t15From, calc.hasHour, refHour) : null,
+      norm25From: calc.t25From !== null ? normalizeTime(calc.t25From, calc.hasHour, refHour) : null,
+      norm60From: calc.t60From !== null ? normalizeTime(calc.t60From, calc.hasHour, refHour) : null,
+    };
+  });
+
   // --------------------------------------------------------------------------
-  // STEP 1: Arrival Sequencing & Expected Approach Time (EAT) Calculation
+  // 1. Arrival Sequencing & Expected Approach Time (EAT) Calculation
   // --------------------------------------------------------------------------
   const sequencedArrivals = [...computedArrivals].sort((a, b) => {
     if (a.normClearBase !== b.normClearBase) return a.normClearBase - b.normClearBase;
@@ -525,7 +664,6 @@ function solveScenario(aircraftList, activeRwy) {
       }
     }
 
-    const effectiveClearNorm = willDelay ? eatNorm : item.normClearBase;
     const eatDisplay =
       eatNorm !== null
         ? formatTime(denormalizeTime(eatNorm, calc.hasHour, refHour), calc.hasHour)
@@ -539,47 +677,6 @@ function solveScenario(aircraftList, activeRwy) {
       calc.hasHour
     );
 
-    // Dynamic Multi-Aircraft Holding Stack Calculation (4,000', 5,000', 6,000'...)
-    // Find all preceding arrivals still un-established when this aircraft reaches its inner stack entry
-    const stackEntryTime = item.norm10;
-    let initialHoldAltFt = 4000;
-    const holdStepDowns = [];
-
-    if (willDelay && stackEntryTime < eatNorm) {
-      const activeAheadAt10 = [];
-      for (let k = 0; k < index; k++) {
-        const pred = sequencedArrivals[k];
-        const predEat = eatMap.get(pred.acft.id);
-        if (predEat && predEat.effectiveEstNorm > stackEntryTime + 1e-6) {
-          activeAheadAt10.push({ item: pred, eat: predEat });
-        }
-      }
-      // m aircraft ahead not yet established -> occupy 3,000' .. 3000 + (m-1)*1000
-      const m = Math.max(1, activeAheadAt10.length);
-      initialHoldAltFt = 3000 + m * 1000;
-
-      // As each preceding aircraft (before the final blocker) establishes, step down 1,000'
-      for (let p = 0; p < activeAheadAt10.length - 1; p++) {
-        const estEventTime = activeAheadAt10[p].eat.effectiveEstNorm;
-        if (estEventTime > stackEntryTime + 1e-6 && estEventTime < eatNorm - 1e-6) {
-          const remAhead = activeAheadAt10.length - 1 - p;
-          const stepAltFt = 3000 + remAhead * 1000;
-          const prevAltFt = stepAltFt + 1000;
-          holdStepDowns.push({
-            timeNorm: estEventTime,
-            timeStr: formatTime(
-              denormalizeTime(estEventTime, calc.hasHour, refHour),
-              calc.hasHour
-            ),
-            prevAltFt,
-            altFt: stepAltFt,
-            establishedAcft: activeAheadAt10[p].item.acft,
-            nextClearedAcft: activeAheadAt10[p + 1].item.acft,
-          });
-        }
-      }
-    }
-
     eatMap.set(acft.id, {
       seqNum: index + 1,
       willDelay,
@@ -591,1247 +688,276 @@ function solveScenario(aircraftList, activeRwy) {
       effectiveFixDisplay,
       effectiveEstNorm,
       effectiveEstDisplay,
-      effectiveClearNorm,
       clearancePhaseNote,
-      initialHoldAltFt,
-      holdStepDowns,
     });
 
     prevEstNorm = effectiveEstNorm;
     prevAcft = item;
   });
 
-  // Helper: query inner approach/hold stack altitude of arrival #k at time t (if inside 10 NM / on ILS)
-  function getInnerStackAltAt(arrItem, t) {
-    const eatInfo = eatMap.get(arrItem.acft.id);
-    if (!eatInfo) return null;
-    const tStartInner = arrItem.calc.straightIn ? arrItem.normClearBase : arrItem.norm10;
-    if (t + 1e-6 < tStartInner || t >= eatInfo.effectiveEstNorm - 1e-6) return null;
-    if (t + 1e-6 >= eatInfo.effectiveClearNorm) return 3000;
-    if (arrItem.calc.straightIn && t < arrItem.norm10 - 1e-6) {
-      return Math.max(arrItem.wpt.msaFt, eatInfo.initialHoldAltFt);
-    }
-    let curHoldAlt = eatInfo.initialHoldAltFt;
-    for (const sd of eatInfo.holdStepDowns) {
-      if (t + 1e-6 >= sd.timeNorm) {
-        curHoldAlt = sd.altFt;
-      }
-    }
-    return curHoldAlt;
-  }
-
   // --------------------------------------------------------------------------
-  // STEP 2: Head-On (Same-Waypoint) & Cross-Radial (<15 NM VOR) Dep <-> Arr Conflicts
+  // 2. Head-On Conflicts (Opposite-Direction on Same Waypoint / Radial)
+  // Covers:
+  //   - Departure (FROM AYT) <-> Arrival (TO AYT)
+  //   - Transit Outbound (FROM AYT) <-> Arrival (TO AYT)
+  //   - Departure (FROM AYT) <-> Transit Inbound (TO AYT)
+  //   - Transit Outbound (FROM AYT) <-> Transit Inbound (TO AYT)
   // --------------------------------------------------------------------------
-  const depArrConflicts = []; // Strictly Head-On (Same Waypoint)
-  const radialDepArrConflicts = []; // Cross-Radial / <15 NM VOR Dep <-> Arr
-  const arrDepLocks = new Map(); // arrId -> list of lock instructions
-  const depArrLocks = new Map(); // depId -> list of lock instructions
+  const inboundLegs = [];
+  const outboundLegs = [];
 
-  computedDepartures.forEach((depItem) => {
-    const wptDep = depItem.wpt;
-    const tDepNorm = depItem.normDep;
-    const tDepExit15 = depItem.norm15; // tDep + 3m (15 NM)
-
-    // Check if any arrival is in the inner approach/hold stack (3,000', 4,000'...) while this departure
-    // is inside 15 NM, which matters when wptDep.msaFt === 3,000' (e.g. DERYA or MANAV)
-    let innerStackFloorForDep = wptDep.msaFt;
-    const innerStackTraffic = [];
-    sequencedArrivals.forEach((arrItem) => {
-      for (let t = tDepNorm; t < tDepExit15; t = +(t + 0.2).toFixed(2)) {
-        const stAlt = getInnerStackAltAt(arrItem, t);
-        if (stAlt !== null && stAlt >= innerStackFloorForDep && wptDep.msaFt <= 4000) {
-          // Only raise floor if not head-on locked below this same arrival
-          const sameWptInbound =
-            arrItem.acft.wptId === depItem.acft.wptId && arrItem.normRadialZero >= tDepNorm;
-          if (!sameWptInbound) {
-            innerStackFloorForDep = Math.max(innerStackFloorForDep, stAlt + 1000);
-            if (!innerStackTraffic.some((a) => a.id === arrItem.acft.id)) {
-              innerStackTraffic.push(arrItem.acft);
-            }
-          }
-        }
-      }
+  computedArrivals.forEach((arr) => {
+    inboundLegs.push({
+      kind: "ARR",
+      icon: "🛬",
+      acft: arr.acft,
+      wpt: arr.wpt,
+      tZeroNorm: arr.normRadialZero,
+      maxDist: Math.max(arr.calc.dist, 60),
+      altSummary: `Descends from ${formatAlt(arr.calc.initAltFt)} → MEA ${formatAlt(
+        arr.wpt.meaFt
+      )} → MSA ${formatAlt(arr.wpt.msaFt)}`,
+      maintAltFt: null,
+      minAltFt: arr.wpt.msaFt,
+      maxAltFt: arr.calc.initAltFt,
     });
+  });
 
-    if (innerStackFloorForDep > wptDep.msaFt && innerStackTraffic.length > 0) {
-      const climbTarget = Math.min(
-        depItem.calc.reqAltFt,
-        Math.max(innerStackFloorForDep, wptDep.meaFt)
-      );
-      const trafficNames = innerStackTraffic.map((a) => a.callsign).join(", ");
-      const resText = `VOR <15 NM Approach Stack Protection: ${trafficNames} active on approach/hold up to ${formatAlt(
-        innerStackFloorForDep - 1000
-      )}. Since ${wptDep.name} MSA is ${formatAlt(wptDep.msaFt)}, climb ${
-        depItem.acft.callsign
-      } directly to ≥${formatAlt(innerStackFloorForDep)} (or ${formatAlt(
-        climbTarget
-      )}) before 10 NM to stay ≥1,000' above the inner stack.`;
+  computedDepartures.forEach((dep) => {
+    outboundLegs.push({
+      kind: "DEP",
+      icon: "🛫",
+      acft: dep.acft,
+      wpt: dep.wpt,
+      tZeroNorm: dep.normDep,
+      maxDist: 60,
+      altSummary: `Climbs to MSA ${formatAlt(dep.wpt.msaFt)} (<10 NM) → MEA ${formatAlt(
+        dep.wpt.meaFt
+      )} (<25 NM) → Req ${formatAlt(dep.calc.reqAltFt)}`,
+      maintAltFt: null,
+      minAltFt: 0,
+      maxAltFt: dep.calc.reqAltFt,
+    });
+  });
 
-      if (!depArrLocks.has(depItem.acft.id)) depArrLocks.set(depItem.acft.id, []);
-      depArrLocks.get(depItem.acft.id).push({
-        type: "STACK_FLOOR",
-        arrAcft: innerStackTraffic[0],
-        tCrossNorm: tDepExit15,
-        dCross: 15,
-        depMinInitialAltFt: innerStackFloorForDep,
-        depRestrictedAltFt: depItem.calc.reqAltFt,
-        resolutionText: resText,
-      });
-
-      radialDepArrConflicts.push({
-        depAcft: depItem.acft,
-        arrAcft: innerStackTraffic[0],
-        arrCallsignDisplay: innerStackTraffic.map((a) => a.callsign).join(" & "),
-        wpt: {
-          ...wptDep,
-          name: `${wptDep.name} ↔ ${innerStackTraffic
-            .map((a) => a.wptId)
-            .filter((v, i, self) => self.indexOf(v) === i)
-            .join("/")}`,
-        },
-        tCrossNorm: tDepNorm,
-        displayTime: `${formatTime(depItem.calc.tDep, depItem.calc.hasHour)}–${formatTime(
-          depItem.calc.t15,
-          depItem.calc.hasHour
-        )}`,
-        dCross: "0–15",
-        zone: "< 15 NM (VOR Approach Stack Separation)",
-        isValidInboundConflict: true,
-        arrRestrictedAltFt: innerStackFloorForDep - 1000,
-        depRestrictedAltFt: innerStackFloorForDep,
-        resolutionText: resText,
+  computedTransits.forEach((trn) => {
+    if (trn.calc.hasInbound) {
+      inboundLegs.push({
+        kind: "TRN",
+        icon: "✈️",
+        acft: trn.acft,
+        wpt: trn.entryWpt,
+        tZeroNorm: trn.normVor,
+        maxDist: Math.max(trn.calc.dist, 60),
+        altSummary: `Transit maintaining ${formatAlt(trn.calc.maintAltFt)} inbound via ${
+          trn.entryWpt.name
+        }`,
+        maintAltFt: trn.calc.maintAltFt,
+        minAltFt: trn.calc.maintAltFt,
+        maxAltFt: trn.calc.maintAltFt,
       });
     }
+    if (trn.calc.hasOutbound) {
+      outboundLegs.push({
+        kind: "TRN",
+        icon: "✈️",
+        acft: trn.acft,
+        wpt: trn.exitWpt,
+        tZeroNorm: trn.normVor,
+        maxDist: 60,
+        altSummary: `Transit maintaining ${formatAlt(trn.calc.maintAltFt)} outbound via ${
+          trn.exitWpt.name
+        }`,
+        maintAltFt: trn.calc.maintAltFt,
+        minAltFt: trn.calc.maintAltFt,
+        maxAltFt: trn.calc.maintAltFt,
+      });
+    }
+  });
 
-    // 2A. Same-Waypoint Opposite-Direction (Head-On) Crossing
-    const matchingArrs = computedArrivals.filter(
-      (arrItem) => arrItem.acft.wptId === depItem.acft.wptId
-    );
+  const headOnConflicts = [];
 
-    matchingArrs.forEach((arrItem) => {
-      const wpt = depItem.wpt;
-      const tArrZeroNorm = arrItem.normRadialZero;
-      const tCrossNorm = (tDepNorm + tArrZeroNorm) / 2;
-      const dCross = +(SPEED_NM_PER_MIN * (tCrossNorm - tDepNorm)).toFixed(1);
-      const isValidInboundConflict = dCross >= 0 && dCross <= Math.max(arrItem.calc.dist, 60);
+  outboundLegs.forEach((outLeg) => {
+    inboundLegs.forEach((inLeg) => {
+      if (outLeg.acft.id === inLeg.acft.id) return;
+      if (outLeg.wpt.id !== inLeg.wpt.id) return;
 
-      let resolutionText = "";
-      let arrRestrictedAltFt = null;
-      let depRestrictedAltFt = null;
+      const wpt = outLeg.wpt;
+      const tCrossNorm = (outLeg.tZeroNorm + inLeg.tZeroNorm) / 2;
+      const dCross = +(SPEED_NM_PER_MIN * (tCrossNorm - outLeg.tZeroNorm)).toFixed(1);
+      const maxCheckDist = Math.max(inLeg.maxDist, outLeg.maxDist, 60);
+      const isValidInboundConflict = dCross >= 0 && dCross <= maxCheckDist;
+
       let zone = "";
-
-      if (isValidInboundConflict) {
-        if (dCross >= 25) {
-          zone = "≥ 25 NM (Enroute / MEA Zone)";
-          depRestrictedAltFt = wpt.meaFt;
-          arrRestrictedAltFt = wpt.meaFt + 1000;
-          resolutionText = `Conflict at ${dCross} NM (≥25 NM): Climb ${depItem.acft.callsign} to ${formatAlt(
-            depRestrictedAltFt
-          )} (MEA before 25 NM) and descend ${arrItem.acft.callsign} only to ${formatAlt(
-            arrRestrictedAltFt
-          )}. After passing at ${formatTime(
-            denormalizeTime(tCrossNorm, useHasHour, refHour),
-            useHasHour
-          )}, continue climb/descent.`;
-        } else if (dCross >= 10) {
-          zone = "10–25 NM (MSA Transition Zone)";
-          const safeDepMsa = Math.max(wpt.msaFt, innerStackFloorForDep);
-          if (safeDepMsa < wpt.meaFt) {
-            depRestrictedAltFt = safeDepMsa;
-            arrRestrictedAltFt = safeDepMsa + 1000;
-            resolutionText = `Conflict at ${dCross} NM (10–25 NM): Climb ${depItem.acft.callsign} to ${formatAlt(
-              depRestrictedAltFt
-            )} (MSA before 10 NM) and hold ${arrItem.acft.callsign} at ${formatAlt(
-              arrRestrictedAltFt
-            )} until passing at ${formatTime(
-              denormalizeTime(tCrossNorm, useHasHour, refHour),
-              useHasHour
-            )}; then climb ${depItem.acft.callsign} to ${formatAlt(wpt.meaFt)} before 25 NM.`;
-          } else {
-            depRestrictedAltFt = wpt.meaFt;
-            arrRestrictedAltFt = wpt.meaFt + 1000;
-            resolutionText = `Conflict at ${dCross} NM (MSA = MEA = ${formatAlt(
-              wpt.meaFt
-            )}): Climb ${depItem.acft.callsign} to ${formatAlt(
-              depRestrictedAltFt
-            )} before 10 NM and hold ${arrItem.acft.callsign} at ${formatAlt(
-              arrRestrictedAltFt
-            )} until passing at ${formatTime(
-              denormalizeTime(tCrossNorm, useHasHour, refHour),
-              useHasHour
-            )}.`;
-          }
-        } else {
-          zone = "< 10 NM (Inner Approach / MSA Zone)";
-          depRestrictedAltFt = Math.max(wpt.msaFt, innerStackFloorForDep);
-          arrRestrictedAltFt = depRestrictedAltFt + 1000;
-          resolutionText = `Conflict at ${dCross} NM (<10 NM): Keep ${arrItem.acft.callsign} at ${formatAlt(
-            arrRestrictedAltFt
-          )} and ${depItem.acft.callsign} at ${formatAlt(
-            depRestrictedAltFt
-          )} until passing at ${formatTime(
-            denormalizeTime(tCrossNorm, useHasHour, refHour),
-            useHasHour
-          )}.`;
-        }
-
-        if (!arrDepLocks.has(arrItem.acft.id)) arrDepLocks.set(arrItem.acft.id, []);
-        arrDepLocks.get(arrItem.acft.id).push({
-          type: "SAME_RADIAL",
-          depAcft: depItem.acft,
-          tCrossNorm,
-          dCross,
-          arrRestrictedAltFt,
-          depRestrictedAltFt,
-          resolutionText,
-        });
-
-        if (!depArrLocks.has(depItem.acft.id)) depArrLocks.set(depItem.acft.id, []);
-        depArrLocks.get(depItem.acft.id).push({
-          type: "SAME_RADIAL",
-          arrAcft: arrItem.acft,
-          tCrossNorm,
-          dCross,
-          arrRestrictedAltFt,
-          depRestrictedAltFt,
-          resolutionText,
-        });
+      if (dCross >= 25) {
+        zone = "≥ 25 NM (Enroute / MEA Zone)";
+      } else if (dCross >= 10) {
+        zone = "10–25 NM (MSA Transition Zone)";
+      } else {
+        zone = "< 10 NM (Inner VOR Zone)";
       }
 
-      depArrConflicts.push({
-        depAcft: depItem.acft,
-        arrAcft: arrItem.acft,
+      const crossTimeStr = formatTime(
+        denormalizeTime(tCrossNorm, useHasHour, refHour),
+        useHasHour
+      );
+
+      let conflictNote = "";
+      if (outLeg.kind === "TRN" && inLeg.kind === "TRN") {
+        const diff = Math.abs(outLeg.maintAltFt - inLeg.maintAltFt);
+        conflictNote =
+          diff < 1000
+            ? `CRITICAL: Both Transit aircraft maintain ${formatAlt(
+                outLeg.maintAltFt
+              )} head-on on ${wpt.name}! Cross at ${dCross} NM @ ${crossTimeStr}.`
+            : `Head-on Transit crossing on ${wpt.name} at ${dCross} NM @ ${crossTimeStr} (${
+                outLeg.acft.callsign
+              } @ ${formatAlt(outLeg.maintAltFt)} vs ${inLeg.acft.callsign} @ ${formatAlt(
+                inLeg.maintAltFt
+              )}).`;
+      } else if (outLeg.kind === "TRN" || inLeg.kind === "TRN") {
+        const trnLeg = outLeg.kind === "TRN" ? outLeg : inLeg;
+        const otherLeg = outLeg.kind === "TRN" ? inLeg : outLeg;
+        conflictNote = `Head-on with Transit ${trnLeg.acft.callsign} (maintaining ${formatAlt(
+          trnLeg.maintAltFt
+        )}) on ${wpt.name}! ${otherLeg.acft.callsign} (${
+          otherLeg.altSummary
+        }) crosses ${trnLeg.acft.callsign} at ${dCross} NM @ ${crossTimeStr}.`;
+      } else {
+        conflictNote = `Head-on Departure ↔ Arrival on ${wpt.name}: ${outLeg.acft.callsign} (outbound) and ${inLeg.acft.callsign} (inbound) cross at ${dCross} NM @ ${crossTimeStr} (${zone}).`;
+      }
+
+      headOnConflicts.push({
+        outLeg,
+        inLeg,
         wpt,
         tCrossNorm,
-        displayTime: formatTime(denormalizeTime(tCrossNorm, useHasHour, refHour), useHasHour),
+        displayTime: crossTimeStr,
         dCross,
         zone,
         isValidInboundConflict,
-        arrRestrictedAltFt,
-        depRestrictedAltFt,
-        resolutionText,
-        tDepFormatted: formatTime(depItem.calc.tDep, depItem.calc.hasHour),
-        tArrZeroFormatted: formatTime(arrItem.calc.tRadialZero, arrItem.calc.hasHour),
-        tArrInitFormatted: formatTime(arrItem.calc.tInit, arrItem.calc.hasHour),
-        arrDist: arrItem.calc.dist,
+        conflictNote,
       });
-    });
-
-    // 2B. Cross-Radial (<15 NM VOR) Departure <-> Arrival Overlap Checks
-    sequencedArrivals.forEach((arrItem) => {
-      if (arrItem.acft.wptId === depItem.acft.wptId) return; // Handled in 2A
-
-      const eatInfo = eatMap.get(arrItem.acft.id);
-      const arrEnter15 = arrItem.norm15 !== null ? arrItem.norm15 : arrItem.normInit;
-      // An on-time Straight-In arrival is cleared to 3,000' at 25 NM (norm25), so inside 15 NM it is already
-      // in the inner approach stack (handled by STACK_FLOOR above), NOT in an un-cleared 25-10 NM MSA phase.
-      const arrMsaPhaseEnd = arrItem.calc.straightIn
-        ? eatInfo.willDelay
-          ? Math.min(arrItem.norm10, eatInfo.eatNorm)
-          : arrItem.norm25 ?? arrItem.normInit
-        : arrItem.norm10;
-
-      const ovStart = Math.max(tDepNorm, arrEnter15);
-      const ovEnd = Math.min(tDepExit15, arrMsaPhaseEnd);
-
-      // Both inside <15 NM of AYT VOR at the same time while arrival is in its pre-ILS MSA transition phase
-      if (ovStart < ovEnd - 1e-6 && ovStart < arrMsaPhaseEnd - 1e-6) {
-        const depMsa = wptDep.msaFt;
-        const depMea = wptDep.meaFt;
-        const arrMsa = arrItem.wpt.msaFt;
-        const releaseTime = Math.min(tDepExit15, arrMsaPhaseEnd);
-        const releaseStr = formatTime(
-          denormalizeTime(releaseTime, useHasHour, refHour),
-          useHasHour
-        );
-        const ovStartStr = formatTime(
-          denormalizeTime(ovStart, useHasHour, refHour),
-          useHasHour
-        );
-
-        let depRestrictedAltFt = null;
-        let arrRestrictedAltFt = null;
-        let resolutionText = "";
-
-        if (depMsa >= arrMsa) {
-          depRestrictedAltFt = depMsa;
-          arrRestrictedAltFt = depMsa + 1000;
-          resolutionText = `Cross-radial <15 NM VOR conflict (${ovStartStr}–${releaseStr}): ${
-            depItem.acft.callsign
-          } (${wptDep.name}) requires ${formatAlt(
-            depMsa
-          )} MSA before 10 NM. Hold ${depItem.acft.callsign} at ${formatAlt(
-            depRestrictedAltFt
-          )} until exiting 15 NM (${formatTime(
-            depItem.calc.t15,
-            depItem.calc.hasHour
-          )}) and restrict ${arrItem.acft.callsign} (${arrItem.wpt.name}) to ${formatAlt(
-            arrRestrictedAltFt
-          )} before 15 NM until ${releaseStr}.`;
-        } else if (depMea >= arrMsa && ovEnd > depItem.norm10 + 1e-6) {
-          depRestrictedAltFt = arrMsa - 1000;
-          arrRestrictedAltFt = arrMsa;
-          resolutionText = `Cross-radial <15 NM VOR conflict (${ovStartStr}–${releaseStr}): Cap ${
-            depItem.acft.callsign
-          } (${wptDep.name}) at ${formatAlt(
-            depRestrictedAltFt
-          )} (1,000' below ${arrItem.acft.callsign} at ${formatAlt(
-            arrMsa
-          )}) until exiting 15 NM at ${formatTime(
-            depItem.calc.t15,
-            depItem.calc.hasHour
-          )}, then climb to ${formatAlt(depMea)} before 25 NM.`;
-        }
-
-        if (depRestrictedAltFt !== null) {
-          if (!arrDepLocks.has(arrItem.acft.id)) arrDepLocks.set(arrItem.acft.id, []);
-          arrDepLocks.get(arrItem.acft.id).push({
-            type: "CROSS_RADIAL_VOR15",
-            depAcft: depItem.acft,
-            tCrossNorm: releaseTime,
-            dCross: 15,
-            arrRestrictedAltFt,
-            depRestrictedAltFt,
-            resolutionText,
-          });
-
-          if (!depArrLocks.has(depItem.acft.id)) depArrLocks.set(depItem.acft.id, []);
-          depArrLocks.get(depItem.acft.id).push({
-            type: "CROSS_RADIAL_VOR15",
-            arrAcft: arrItem.acft,
-            tCrossNorm: depItem.norm15,
-            dCross: 15,
-            arrRestrictedAltFt,
-            depRestrictedAltFt,
-            resolutionText,
-          });
-
-          radialDepArrConflicts.push({
-            depAcft: depItem.acft,
-            arrAcft: arrItem.acft,
-            arrCallsignDisplay: arrItem.acft.callsign,
-            wpt: {
-              ...wptDep,
-              name: `${wptDep.name} ↔ ${arrItem.wpt.name}`,
-            },
-            tCrossNorm: ovStart,
-            displayTime: `${ovStartStr}–${releaseStr}`,
-            dCross: "<15",
-            zone: "< 15 NM (Cross-Radial VOR Zone)",
-            isValidInboundConflict: true,
-            arrRestrictedAltFt,
-            depRestrictedAltFt,
-            resolutionText,
-          });
-        }
-      }
     });
   });
 
   // --------------------------------------------------------------------------
-  // STEP 3: Live Time-Step (0.2m / 1 NM) Convergence & Altitude Timeline Solver
-  // Solves arrivals sequentially #1 -> #N so every aircraft #i reacts to the
-  // exact live-solved altitude profile of all preceding aircraft #0..#(i-1)!
+  // 3. Radial, Same-Direction & <15 NM AYT VOR Convergence Conflicts
   // --------------------------------------------------------------------------
-  const vorSepConstraints = [];
-  const perAircraftVorNotes = new Map(); // acftId -> array of constraint objects
-  const solvedTimelines = new Map(); // acftId -> Array<{ tFrom, altFt, label }>
-  const arrivalProfileMeta = new Map(); // acftId -> { enrouteTargetFt, msaTargetFt }
+  const radialConflicts = [];
 
-  sequencedArrivals.forEach((item, index) => {
-    const { acft, wpt, calc } = item;
-    const eatInfo = eatMap.get(acft.id);
-    const depLocks = arrDepLocks.get(acft.id) || [];
+  // 3A. Build <15 NM AYT VOR Occupancy Windows for all aircraft (ARR, DEP, TRN)
+  const vor15Occupants = [];
 
-    const highZoneDepLock = depLocks.find((l) => l.type === "SAME_RADIAL" && l.dCross >= 25);
-    const midZoneDepLock = depLocks.find(
-      (l) =>
-        (l.type === "SAME_RADIAL" && l.dCross >= 10 && l.dCross < 25) ||
-        l.type === "CROSS_RADIAL_VOR15"
-    );
-    const lowZoneDepLock = depLocks.find((l) => l.type === "SAME_RADIAL" && l.dCross < 10);
-
-    let baseEnrouteFt = wpt.meaFt;
-    if (highZoneDepLock && highZoneDepLock.arrRestrictedAltFt > baseEnrouteFt) {
-      baseEnrouteFt = highZoneDepLock.arrRestrictedAltFt;
-    }
-
-    let baseMsaFt = wpt.msaFt;
-    if (midZoneDepLock && midZoneDepLock.arrRestrictedAltFt > baseMsaFt) {
-      baseMsaFt = midZoneDepLock.arrRestrictedAltFt;
-    }
-    if (lowZoneDepLock && lowZoneDepLock.arrRestrictedAltFt > baseMsaFt) {
-      baseMsaFt = lowZoneDepLock.arrRestrictedAltFt;
-    }
-
-    const tInit = item.normInit;
-    const t25 = item.norm25 !== null ? item.norm25 : tInit;
-    const t15 = item.norm15 !== null ? item.norm15 : tInit;
-    const t10 = item.norm10;
-
-    // Live 0.2m time-step scan against all preceding arrivals k < index
-    let requiredEnrouteFt = baseEnrouteFt;
-    let requiredMsaAtEntryFt = baseMsaFt;
-
-    for (let k = 0; k < index; k++) {
-      const first = sequencedArrivals[k];
-      const firstEat = eatMap.get(first.acft.id);
-      const firstTimeline = solvedTimelines.get(first.acft.id);
-      const firstMeta = arrivalProfileMeta.get(first.acft.id);
-      const w1 = first.wpt;
-      const w2 = wpt;
-      const sameWpt = w1.id === w2.id;
-
-      // 1. Same-corridor Enroute (60-25 NM) live step check
-      if (sameWpt && item.norm25 !== null && first.norm25 !== null) {
-        for (let t = tInit; t < t25 - 1e-6; t = +(t + 0.2).toFixed(2)) {
-          if (t >= first.normInit && t < first.norm25 - 1e-6) {
-            const altFirst = evaluateTimelineAlt(firstTimeline, t, w1.meaFt);
-            if (altFirst + 1000 > requiredEnrouteFt) {
-              requiredEnrouteFt = altFirst + 1000;
-            }
-          }
-        }
-      }
-
-      // 2. Check <15 NM VOR / 25-10 NM convergence across live 0.2m time steps
-      const firstT25 = first.norm25 !== null ? first.norm25 : first.normInit;
-      const firstEnter15 = first.norm15 !== null ? first.norm15 : first.normInit;
-      const firstClearOr10 =
-        first.calc.straightIn && !firstEat.willDelay ? firstT25 : first.norm10;
-      const checkStart = sameWpt ? t25 : t15;
-      const checkEnd = calc.straightIn && !eatInfo.willDelay ? t25 : t10;
-
-      let maxFirstAltInOverlap = null;
-      let hasVor15Overlap = false;
-
-      for (let t = checkStart; t < checkEnd - 1e-6; t = +(t + 0.2).toFixed(2)) {
-        const firstActiveInZone = sameWpt
-          ? t >= first.normInit && t < firstEat.effectiveEstNorm - 1e-6
-          : t >= firstEnter15 - 1e-6 && t < firstEat.effectiveEstNorm - 1e-6;
-
-        if (firstActiveInZone) {
-          hasVor15Overlap = true;
-          const altFirst = evaluateTimelineAlt(firstTimeline, t, w1.msaFt);
-          if (maxFirstAltInOverlap === null || altFirst > maxFirstAltInOverlap) {
-            maxFirstAltInOverlap = altFirst;
-          }
-        }
-      }
-
-      // True ONLY if both aircraft are in their 25-10 NM MSA transition zone at the same time!
-      // (If Plane #1 already reached 10 NM and dropped to 3,000'/4,000' before Plane #2 even hits 25 NM,
-      // their 25-10 NM MSA transitions do NOT overlap in time!)
-      const msaZoneOverlap =
-        Math.max(firstT25, t25) < Math.min(firstClearOr10, checkEnd) - 1e-6;
-
-      // Low-MSA arrival (e.g. MANAV/DERYA MSA 3,000') entering <15 NM while #1 is in the 3,000'/4,000' stack
-      const needsInnerStackProtection =
-        hasVor15Overlap &&
-        maxFirstAltInOverlap !== null &&
-        maxFirstAltInOverlap + 1000 > w2.msaFt &&
-        w2.msaFt === 3000;
-
-      if (
-        (sameWpt && (hasVor15Overlap || t25 < firstEat.effectiveEstNorm - 1e-6)) ||
-        msaZoneOverlap ||
-        needsInnerStackProtection
-      ) {
-        const firstEnrouteFt = firstMeta ? firstMeta.enrouteTargetFt : w1.meaFt;
-        const firstMsaFt = firstMeta ? firstMeta.msaTargetFt : w1.msaFt;
-
-        let pairAssignedMsaFt = requiredMsaAtEntryFt;
-        if (maxFirstAltInOverlap !== null) {
-          pairAssignedMsaFt = Math.max(pairAssignedMsaFt, maxFirstAltInOverlap + 1000);
-        } else if (sameWpt || msaZoneOverlap) {
-          pairAssignedMsaFt = Math.max(pairAssignedMsaFt, firstMsaFt + 1000);
-        }
-
-        let type = "";
-        let firstInstruction = "";
-        let secondInstruction = "";
-        let summaryText = "";
-        let firstMustReachBefore15 = false;
-
-        if (sameWpt) {
-          type = "SAME-AIRWAY TRAIL (LIVE STEP)";
-          requiredEnrouteFt = Math.max(requiredEnrouteFt, firstEnrouteFt + 1000);
-          requiredMsaAtEntryFt = Math.max(requiredMsaAtEntryFt, pairAssignedMsaFt);
-          firstInstruction = `Descend to ${formatAlt(firstEnrouteFt)} (MEA), then ${formatAlt(
-            firstMsaFt
-          )} at 25 NM (reach before 15 NM).`;
-          secondInstruction = `Trailing ${first.acft.callsign} on ${
-            w1.name
-          }: Maintain ≥1,000' above ${first.acft.callsign} (${formatAlt(
-            requiredEnrouteFt
-          )} before 25 NM, then ${formatAlt(requiredMsaAtEntryFt)} at 25 NM until ${
-            first.acft.callsign
-          } descends below).`;
-          summaryText = `Same airway (${w1.name}): ${acft.callsign} is kept ≥1,000' above ${
-            first.acft.callsign
-          } at every 0.2m step (${formatAlt(requiredEnrouteFt)} enroute → ${formatAlt(
-            requiredMsaAtEntryFt
-          )} at 25 NM).`;
-        } else if (
-          msaZoneOverlap &&
-          firstEnrouteFt >= requiredEnrouteFt &&
-          firstMsaFt < pairAssignedMsaFt
-        ) {
-          // Altitude Crossing Case: ONLY when both aircraft are simultaneously in the 25-10 NM transition zone!
-          type = "ALTITUDE CROSSING (<15 NM)";
-          firstMustReachBefore15 = true;
-          requiredMsaAtEntryFt = Math.max(requiredMsaAtEntryFt, pairAssignedMsaFt);
-          firstInstruction = `⚠️ CROSSING ALTITUDES w/ ${acft.callsign}: At 25 NM, descend to ${formatAlt(
-            firstMsaFt
-          )} — MUST REACH & MAINTAIN ${formatAlt(firstMsaFt)} BEFORE 15 NM (${formatTime(
-            first.calc.t15,
-            first.calc.hasHour
-          )})!`;
-          secondInstruction = `At 25 NM, descend to ${formatAlt(
-            requiredMsaAtEntryFt
-          )} and maintain ${formatAlt(requiredMsaAtEntryFt)} before 15 NM (≥1,000' above ${
-            first.acft.callsign
-          } at ${formatAlt(firstMsaFt)}).`;
-          summaryText = `${first.acft.callsign} (${w1.name}: ${formatAltShort(
-            firstEnrouteFt
-          )} → ${formatAltShort(firstMsaFt)}) and ${acft.callsign} (${
-            w2.name
-          }: ${formatAltShort(requiredEnrouteFt)} → ${formatAltShort(
-            requiredMsaAtEntryFt
-          )}) converge in the 25–15 NM zone simultaneously. Because their altitudes cross, issue constraint to ${
-            first.acft.callsign
-          }: "Maintain ${formatAlt(firstMsaFt)} BEFORE 15 NM"!`;
-
-          if (!perAircraftVorNotes.has(first.acft.id)) perAircraftVorNotes.set(first.acft.id, []);
-          perAircraftVorNotes.get(first.acft.id).push({
-            role: "lead",
-            other: acft,
-            text: firstInstruction,
-            type,
-          });
-        } else if (needsInnerStackProtection) {
-          type = "INNER STACK PROTECTION (<15 NM)";
-          requiredMsaAtEntryFt = Math.max(requiredMsaAtEntryFt, pairAssignedMsaFt);
-          firstInstruction = `Active on approach/hold inside 15 NM at ${formatAlt(
-            maxFirstAltInOverlap
-          )}.`;
-          secondInstruction = `⚠️ VOR <15 NM STACK SEP w/ ${first.acft.callsign}: Even though ${
-            w2.name
-          } MSA is ${formatAlt(w2.msaFt)}, ${
-            first.acft.callsign
-          } occupies ${formatAlt(
-            maxFirstAltInOverlap
-          )} inside 15 NM. Restrict ${acft.callsign} at 25 NM to ${formatAlt(
-            requiredMsaAtEntryFt
-          )} before 15 NM!`;
-          summaryText = `${acft.callsign} (${w2.name} MSA ${formatAlt(
-            w2.msaFt
-          )}) enters <15 NM while #${firstEat.seqNum} ${
-            first.acft.callsign
-          } is at ${formatAlt(maxFirstAltInOverlap)}. Hold ${acft.callsign} at ${formatAlt(
-            requiredMsaAtEntryFt
-          )} before 15 NM.`;
-        } else if (maxFirstAltInOverlap !== null && maxFirstAltInOverlap === w2.msaFt) {
-          type = "EQUAL ALT CONVERGENCE (<15 NM)";
-          firstMustReachBefore15 = true;
-          requiredMsaAtEntryFt = Math.max(requiredMsaAtEntryFt, pairAssignedMsaFt);
-          firstInstruction = `At 25 NM, descend to ${formatAlt(
-            firstMsaFt
-          )} — reach before 15 NM.`;
-          secondInstruction = `⚠️ VOR <15 NM SEP w/ ${first.acft.callsign} (at ${formatAlt(
-            maxFirstAltInOverlap
-          )}): At 25 NM, restrict descent to ${formatAlt(
-            requiredMsaAtEntryFt
-          )} before 15 NM (1,000' above ${first.acft.callsign}).`;
-          summaryText = `Inside <15 NM, #${firstEat.seqNum} ${first.acft.callsign} (${
-            w1.name
-          }) occupies ${formatAlt(maxFirstAltInOverlap)}. Restrict #${eatInfo.seqNum} ${
-            acft.callsign
-          } (${w2.name}) to ${formatAlt(requiredMsaAtEntryFt)} before 15 NM for 1,000' separation.`;
-        } else if (maxFirstAltInOverlap !== null && maxFirstAltInOverlap > w2.msaFt) {
-          type = "INVERTED MSA SEQUENCE (<15 NM)";
-          requiredMsaAtEntryFt = Math.max(requiredMsaAtEntryFt, pairAssignedMsaFt);
-          firstInstruction = `At 25 NM, descend to ${formatAlt(
-            firstMsaFt
-          )} before 15 NM, then ${formatAlt(
-            firstEat.willDelay ? firstEat.initialHoldAltFt : 3000
-          )} at 10 NM.`;
-          secondInstruction = `⚠️ #${firstEat.seqNum} ${
-            first.acft.callsign
-          } is at ${formatAlt(maxFirstAltInOverlap)} inside 15 NM. Keep ${
-            acft.callsign
-          } at ${formatAlt(
-            requiredMsaAtEntryFt
-          )} before 15 NM so ${first.acft.callsign} stays below; descend to ${formatAlt(
-            w2.msaFt
-          )} once ${first.acft.callsign} descends at 10 NM.`;
-          summaryText = `#${firstEat.seqNum} ${first.acft.callsign} (${
-            w1.name
-          } @ ${formatAlt(maxFirstAltInOverlap)}) is ahead of #${eatInfo.seqNum} ${
-            acft.callsign
-          } (${w2.name} MSA ${formatAlt(w2.msaFt)}) inside <15 NM. Restrict ${
-            acft.callsign
-          } to ${formatAlt(requiredMsaAtEntryFt)} before 15 NM.`;
-        } else {
-          type = "NATURAL VERTICAL SEP (<15 NM)";
-          firstMustReachBefore15 = true;
-          firstInstruction = `At 25 NM, descend to ${formatAlt(
-            firstMsaFt
-          )} (MSA) before 15 NM.`;
-          secondInstruction = `At 25 NM, descend to ${formatAlt(
-            requiredMsaAtEntryFt
-          )} before 15 NM (naturally ≥1,000' above ${first.acft.callsign}).`;
-          summaryText = `${first.acft.callsign} and ${
-            acft.callsign
-          } converge in the 25–10 NM window and maintain ≥1,000' natural vertical separation.`;
-        }
-
-        vorSepConstraints.push({
-          first,
-          second: item,
-          type,
-          firstInstruction,
-          secondInstruction,
-          summaryText,
-          secondAssignedMsaFt: requiredMsaAtEntryFt,
-          firstMustReachBefore15,
-        });
-
-        if (!perAircraftVorNotes.has(acft.id)) perAircraftVorNotes.set(acft.id, []);
-        perAircraftVorNotes.get(acft.id).push({
-          role: "trail",
-          other: first.acft,
-          text: secondInstruction,
-          assignedMsaFt: requiredMsaAtEntryFt,
-          type,
-        });
-      }
-    }
-
-    // Ensure arrival altitude profile never climbs at 25 NM (enroute >= msaTarget)
-    requiredEnrouteFt = Math.max(requiredEnrouteFt, requiredMsaAtEntryFt);
-    const initFloorFt = Math.max(calc.initAltFt, requiredEnrouteFt);
-
-    // Build exact piecewise altitude timeline for Arrival #i
-    const timeline = [];
-    timeline.push({ tFrom: -Infinity, altFt: initFloorFt, label: "INIT" });
-
-    if (highZoneDepLock && highZoneDepLock.tCrossNorm > tInit && highZoneDepLock.tCrossNorm < t25) {
-      timeline.push({
-        tFrom: tInit,
-        altFt: Math.max(requiredEnrouteFt, highZoneDepLock.arrRestrictedAltFt),
-        label: "DEP_LOCK_HIGH",
-      });
-      timeline.push({
-        tFrom: highZoneDepLock.tCrossNorm,
-        altFt: Math.max(wpt.meaFt, requiredMsaAtEntryFt),
-        label: "MEA",
-      });
-    } else {
-      timeline.push({ tFrom: tInit, altFt: requiredEnrouteFt, label: "MEA" });
-    }
-
-    if (calc.straightIn) {
-      if (!eatInfo.willDelay) {
-        if (midZoneDepLock && midZoneDepLock.tCrossNorm > t25) {
-          timeline.push({
-            tFrom: t25,
-            altFt: requiredMsaAtEntryFt,
-            label: "DEP_LOCK_MID",
-          });
-          timeline.push({
-            tFrom: midZoneDepLock.tCrossNorm,
-            altFt: 3000,
-            label: "ILS_3000",
-          });
-        } else {
-          timeline.push({ tFrom: t25, altFt: 3000, label: "ILS_3000" });
-        }
-      } else {
-        // Delayed Straight-In
-        const pre10Alt = Math.max(requiredMsaAtEntryFt, eatInfo.initialHoldAltFt);
-        timeline.push({ tFrom: t25, altFt: pre10Alt, label: "MSA_DELAY" });
-        if (eatInfo.eatNorm > t10 + 1e-6) {
-          timeline.push({
-            tFrom: t10,
-            altFt: eatInfo.initialHoldAltFt,
-            label: "HOLD_STACK",
-          });
-          eatInfo.holdStepDowns.forEach((sd) => {
-            timeline.push({
-              tFrom: sd.timeNorm,
-              altFt: sd.altFt,
-              label: "HOLD_STEPDOWN",
-            });
-          });
-        }
-        timeline.push({
-          tFrom: eatInfo.eatNorm,
-          altFt: 3000,
-          label: "ILS_3000",
-        });
-      }
-    } else {
-      // Normal Arrival: 25 NM -> 10 NM -> Hold Stack / 3,000'
-      timeline.push({ tFrom: t25, altFt: requiredMsaAtEntryFt, label: "MSA" });
-      if (midZoneDepLock && midZoneDepLock.tCrossNorm > t25 && midZoneDepLock.tCrossNorm < t10) {
-        timeline.push({
-          tFrom: midZoneDepLock.tCrossNorm,
-          altFt: Math.max(wpt.msaFt, eatInfo.willDelay ? eatInfo.initialHoldAltFt : 3000),
-          label: "MSA_POST_DEP",
-        });
-      }
-
-      if (!eatInfo.willDelay) {
-        if (lowZoneDepLock && lowZoneDepLock.tCrossNorm > t10) {
-          timeline.push({
-            tFrom: t10,
-            altFt: lowZoneDepLock.arrRestrictedAltFt,
-            label: "DEP_LOCK_LOW",
-          });
-          timeline.push({
-            tFrom: lowZoneDepLock.tCrossNorm,
-            altFt: 3000,
-            label: "ILS_3000",
-          });
-        } else {
-          timeline.push({ tFrom: t10, altFt: 3000, label: "ILS_3000" });
-        }
-      } else {
-        timeline.push({
-          tFrom: t10,
-          altFt: eatInfo.initialHoldAltFt,
-          label: "HOLD_STACK",
-        });
-        eatInfo.holdStepDowns.forEach((sd) => {
-          timeline.push({
-            tFrom: sd.timeNorm,
-            altFt: sd.altFt,
-            label: "HOLD_STEPDOWN",
-          });
-        });
-        timeline.push({
-          tFrom: eatInfo.eatNorm,
-          altFt: 3000,
-          label: "ILS_3000",
-        });
-      }
-    }
-
-    timeline.sort((a, b) => a.tFrom - b.tFrom);
-    solvedTimelines.set(acft.id, timeline);
-    arrivalProfileMeta.set(acft.id, {
-      enrouteTargetFt: requiredEnrouteFt,
-      msaTargetFt: requiredMsaAtEntryFt,
+  sequencedArrivals.forEach((arr) => {
+    const eatInfo = eatMap.get(arr.acft.id);
+    const tEnter = arr.norm15 !== null ? arr.norm15 : arr.normInit;
+    const tExit = eatInfo ? eatInfo.effectiveEstNorm : arr.norm10 + 9;
+    vor15Occupants.push({
+      kind: "ARR",
+      icon: "🛬",
+      acft: arr.acft,
+      corridorLabel: arr.wpt.name,
+      tEnter,
+      tExit,
+      altLabel: `MSA ${formatAltShort(arr.wpt.msaFt)} → ILS`,
     });
   });
 
-  // Build Departure Altitude Timelines (including same-corridor & <15 NM locks)
-  computedDepartures.forEach((depItem, depIdx) => {
-    const { acft, wpt, calc } = depItem;
-    const locks = depArrLocks.get(acft.id) || [];
-    const stackLock = locks.find((l) => l.type === "STACK_FLOOR");
-    const radialOrVorLock = locks.find(
-      (l) => l.type === "SAME_RADIAL" || l.type === "CROSS_RADIAL_VOR15"
-    );
-
-    let initial10Ft = stackLock
-      ? Math.max(wpt.msaFt, stackLock.depMinInitialAltFt)
-      : wpt.msaFt;
-    let mid25Ft = Math.max(initial10Ft, wpt.meaFt);
-    let finalFt = Math.max(mid25Ft, calc.reqAltFt);
-
-    // Check against earlier departures on the same corridor or within <15 NM VOR
-    for (let k = 0; k < depIdx; k++) {
-      const prevDep = computedDepartures[k];
-      if (Math.abs(depItem.normDep - prevDep.normDep) < 3) {
-        const prevTl = solvedTimelines.get(prevDep.acft.id);
-        const prevAltAtDep = evaluateTimelineAlt(prevTl, depItem.normDep + 0.5, prevDep.wpt.msaFt);
-        if (Math.abs(initial10Ft - prevAltAtDep) < 1000) {
-          initial10Ft = prevAltAtDep + 1000;
-          mid25Ft = Math.max(mid25Ft, initial10Ft);
-          finalFt = Math.max(finalFt, mid25Ft);
-        }
-      }
-    }
-
-    const timeline = [{ tFrom: -Infinity, altFt: 0, label: "GND" }];
-
-    if (radialOrVorLock) {
-      const cappedAlt = radialOrVorLock.depRestrictedAltFt;
-      const tRelease = radialOrVorLock.tCrossNorm;
-      timeline.push({
-        tFrom: depItem.normDep,
-        altFt: Math.min(initial10Ft, cappedAlt),
-        label: "DEP_LOCKED",
-      });
-      if (depItem.norm10 < tRelease) {
-        timeline.push({
-          tFrom: depItem.norm10,
-          altFt: Math.min(mid25Ft, cappedAlt),
-          label: "DEP_LOCKED_10",
-        });
-      }
-      timeline.push({
-        tFrom: tRelease,
-        altFt: tRelease < depItem.norm25 ? mid25Ft : finalFt,
-        label: "DEP_RELEASED",
-      });
-      if (tRelease < depItem.norm25) {
-        timeline.push({
-          tFrom: depItem.norm25,
-          altFt: finalFt,
-          label: "DEP_FINAL",
-        });
-      }
-    } else {
-      timeline.push({ tFrom: depItem.normDep, altFt: initial10Ft, label: "DEP_MSA" });
-      timeline.push({ tFrom: depItem.norm10, altFt: mid25Ft, label: "DEP_MEA" });
-      timeline.push({ tFrom: depItem.norm25, altFt: finalFt, label: "DEP_REQ" });
-    }
-
-    timeline.sort((a, b) => a.tFrom - b.tFrom);
-    solvedTimelines.set(acft.id, timeline);
-  });
-
-  // --------------------------------------------------------------------------
-  // STEP 4: Build Step-by-Step Solved Clearance Plan Cards for Each Aircraft
-  // --------------------------------------------------------------------------
-  const aircraftPlans = new Map();
-
-  sequencedArrivals.forEach((item) => {
-    const { acft, wpt, calc } = item;
-    const eatInfo = eatMap.get(acft.id);
-    const meta = arrivalProfileMeta.get(acft.id);
-    const depLocks = arrDepLocks.get(acft.id) || [];
-    const vorNotes = perAircraftVorNotes.get(acft.id) || [];
-    const steps = [];
-
-    const enrouteTargetFt = meta ? meta.enrouteTargetFt : wpt.meaFt;
-    const msaTargetFt = meta ? meta.msaTargetFt : wpt.msaFt;
-
-    const highZoneDepLock = depLocks.find((l) => l.type === "SAME_RADIAL" && l.dCross >= 25);
-    const midZoneDepLock = depLocks.find(
-      (l) =>
-        (l.type === "SAME_RADIAL" && l.dCross >= 10 && l.dCross < 25) ||
-        l.type === "CROSS_RADIAL_VOR15"
-    );
-
-    // 1. Initial Contact (60-50 NM)
-    if (highZoneDepLock && highZoneDepLock.arrRestrictedAltFt >= enrouteTargetFt) {
-      steps.push({
-        timeNorm: item.normInit,
-        timeStr: formatTime(calc.tInit, calc.hasHour),
-        severity: "crit",
-        text: `Reports ${calc.dist} NM ${wpt.name} (${formatAlt(
-          calc.initAltFt
-        )}): Descend only to <strong>${formatAlt(
-          enrouteTargetFt
-        )}</strong> (traffic <strong>${
-          highZoneDepLock.depAcft.callsign
-        }</strong> climbing to ${formatAlt(
-          highZoneDepLock.depRestrictedAltFt
-        )}; cross at <strong>${highZoneDepLock.dCross} NM @ ${formatTime(
-          denormalizeTime(highZoneDepLock.tCrossNorm, calc.hasHour, refHour),
-          calc.hasHour
-        )}</strong>). Report 25 NM.`,
-      });
-      steps.push({
-        timeNorm: highZoneDepLock.tCrossNorm,
-        timeStr: formatTime(
-          denormalizeTime(highZoneDepLock.tCrossNorm, calc.hasHour, refHour),
-          calc.hasHour
-        ),
-        severity: "ok",
-        text: `Passed outbound <strong>${highZoneDepLock.depAcft.callsign}</strong> at ${
-          highZoneDepLock.dCross
-        } NM → Descend to <strong>${formatAlt(
-          Math.max(wpt.meaFt, msaTargetFt)
-        )}</strong>.`,
-      });
-    } else if (enrouteTargetFt > wpt.meaFt) {
-      steps.push({
-        timeNorm: item.normInit,
-        timeStr: formatTime(calc.tInit, calc.hasHour),
-        severity: "warn",
-        text: `Reports ${calc.dist} NM ${wpt.name} (${formatAlt(
-          calc.initAltFt
-        )}) → Descend to <strong>${formatAlt(
-          enrouteTargetFt
-        )}</strong> (held above ${formatAlt(wpt.meaFt)} MEA for vertical separation), report 25 NM.`,
-      });
-    } else {
-      steps.push({
-        timeNorm: item.normInit,
-        timeStr: formatTime(calc.tInit, calc.hasHour),
-        severity: "normal",
-        text: `Reports ${calc.dist} NM ${wpt.name} (${formatAlt(
-          calc.initAltFt
-        )}) → Descend to <strong>${formatAlt(wpt.meaFt)} (MEA)</strong>, report 25 NM.`,
-      });
-    }
-
-    // 2. At 25 NM -> MSA & <15 NM VOR Constraints (or Straight-In ILS Clearance)
-    const trailVorConstraints = vorNotes.filter(
-      (n) => n.role === "trail" && n.assignedMsaFt && n.assignedMsaFt > wpt.msaFt
-    );
-    const highestTrailConstraint =
-      trailVorConstraints.length > 0
-        ? trailVorConstraints.reduce((a, b) => (b.assignedMsaFt >= a.assignedMsaFt ? b : a))
-        : null;
-    const leadCrossingConstraint = vorNotes.find(
-      (n) => n.role === "lead" && n.type.includes("CROSSING")
-    );
-
-    if (calc.t25 !== null) {
-      if (calc.straightIn) {
-        if (!eatInfo.willDelay) {
-          steps.push({
-            timeNorm: item.norm25,
-            timeStr: formatTime(calc.t25, calc.hasHour),
-            severity: "ok",
-            text: `At 25 NM ${wpt.name} → <strong>Clear Straight-In ILS RWY ${activeRwy}</strong>, descend to <strong>3,000'</strong>, report Established at 10 NM.`,
-          });
-        } else {
-          const hold25Alt = Math.max(msaTargetFt, eatInfo.initialHoldAltFt);
-          steps.push({
-            timeNorm: item.norm25,
-            timeStr: formatTime(calc.t25, calc.hasHour),
-            severity: "warn",
-            text: `At 25 NM ${wpt.name} → Delayed by <strong>${
-              eatInfo.blockedBy.acft.callsign
-            }</strong>. Issue <strong>EAT ${
-              eatInfo.eatDisplay
-            }</strong>, descend to <strong>${formatAlt(hold25Alt)}</strong>.`,
-          });
-        }
-      } else {
-        let constraintNote = "";
-        let sev = "normal";
-        if (leadCrossingConstraint) {
-          sev = "warn";
-          constraintNote = ` — <strong>MUST REACH &amp; MAINTAIN ${formatAlt(
-            msaTargetFt
-          )} BEFORE 15 NM (${formatTime(calc.t15, calc.hasHour)})</strong> (crossing <strong>${
-            leadCrossingConstraint.other.callsign
-          }</strong>)!`;
-        } else if (highestTrailConstraint) {
-          sev = "warn";
-          constraintNote = ` — <strong>RESTRICT to ${formatAlt(
-            msaTargetFt
-          )} before 15 NM</strong> (≥1,000' above <strong>${
-            highestTrailConstraint.other.callsign
-          }</strong> inside 15 NM).`;
-        } else if (midZoneDepLock) {
-          sev = "crit";
-          constraintNote = ` — <strong>HOLD AT ${formatAlt(
-            msaTargetFt
-          )} until clear of outbound ${midZoneDepLock.depAcft.callsign}</strong>.`;
-        } else {
-          constraintNote = ` (reach before 15 NM @ ${formatTime(calc.t15, calc.hasHour)}).`;
-        }
-
-        steps.push({
-          timeNorm: item.norm25,
-          timeStr: formatTime(calc.t25, calc.hasHour),
-          severity: sev,
-          text: `At 25 NM ${wpt.name} → Descend to <strong>${formatAlt(
-            msaTargetFt
-          )}</strong>${constraintNote} Report 10 NM.`,
-        });
-      }
-    }
-
-    if (midZoneDepLock && midZoneDepLock.tCrossNorm < item.norm10) {
-      steps.push({
-        timeNorm: midZoneDepLock.tCrossNorm,
-        timeStr: formatTime(
-          denormalizeTime(midZoneDepLock.tCrossNorm, calc.hasHour, refHour),
-          calc.hasHour
-        ),
-        severity: "ok",
-        text: `Clear of outbound <strong>${midZoneDepLock.depAcft.callsign}</strong> → Descend to <strong>${formatAlt(
-          wpt.msaFt
-        )} (MSA)</strong>.`,
-      });
-    }
-
-    // 3. At 10 NM, Multi-Aircraft Hold Stack Step-Downs & EAT / ILS Clearance
-    if (!calc.straightIn) {
-      if (!eatInfo.willDelay) {
-        steps.push({
-          timeNorm: item.norm10,
-          timeStr: formatTime(calc.t10, calc.hasHour),
-          severity: "ok",
-          text: `At 10 NM ${wpt.name} → <strong>Clear ILS RWY ${activeRwy}</strong>, descend to <strong>3,000'</strong> (AYT VOR @ ${formatTime(
-            calc.tVor,
-            calc.hasHour
-          )} → 10 DME FIX @ ${eatInfo.effectiveFixDisplay}).`,
-        });
-      } else {
-        const stackLevelNum = Math.round((eatInfo.initialHoldAltFt - 2000) / 1000);
-        const stackDetail =
-          eatInfo.initialHoldAltFt > 4000
-            ? `Stack #${stackLevelNum} (${formatAlt(
-                eatInfo.initialHoldAltFt
-              )}, ≥1,000' above preceding hold/approach stack)`
-            : `1,000' above approach traffic`;
-
-        steps.push({
-          timeNorm: item.norm10,
-          timeStr: formatTime(calc.t10, calc.hasHour),
-          severity: "warn",
-          text: `At 10 NM ${wpt.name} → Preceding <strong>${
-            eatInfo.blockedBy.acft.callsign
-          }</strong> not yet established. Issue <strong>EAT ${
-            eatInfo.eatDisplay
-          }</strong>, descend to <strong>${formatAlt(
-            eatInfo.initialHoldAltFt
-          )}</strong> (${stackDetail}) and proceed via AYT VOR (${formatTime(
-            calc.tVor,
-            calc.hasHour
-          )}) to 10 DME FIX.`,
-        });
-
-        // Add any intermediate 1,000' holding stack step-downs
-        eatInfo.holdStepDowns.forEach((sd) => {
-          steps.push({
-            timeNorm: sd.timeNorm,
-            timeStr: sd.timeStr,
-            severity: "warn",
-            text: `<strong>Hold Stack Step-Down</strong> (${
-              sd.establishedAcft.callsign
-            } Established; ${
-              sd.nextClearedAcft.callsign
-            } descending to 3,000') → Descend ${
-              acft.callsign
-            } from ${formatAlt(sd.prevAltFt)} to <strong>${formatAlt(sd.altFt)}</strong>.`,
-          });
-        });
-
-        steps.push({
-          timeNorm: eatInfo.eatNorm,
-          timeStr: eatInfo.eatDisplay,
-          severity: "ok",
-          text: `<strong>EAT ${eatInfo.eatDisplay} Reached</strong> (${
-            eatInfo.blockedBy.acft.callsign
-          } Established) → <strong>Clear ${
-            acft.callsign
-          } for ILS RWY ${activeRwy}</strong>, descend to <strong>3,000'</strong>! (${
-            eatInfo.clearancePhaseNote
-          })`,
-        });
-      }
-    } else if (eatInfo.willDelay) {
-      if (eatInfo.eatNorm > item.norm10 + 1e-6) {
-        steps.push({
-          timeNorm: item.norm10,
-          timeStr: formatTime(calc.t10, calc.hasHour),
-          severity: "warn",
-          text: `At 10 NM (${wpt.name}) → Enter hold at <strong>${formatAlt(
-            eatInfo.initialHoldAltFt
-          )}</strong> until EAT ${eatInfo.eatDisplay}.`,
-        });
-        eatInfo.holdStepDowns.forEach((sd) => {
-          steps.push({
-            timeNorm: sd.timeNorm,
-            timeStr: sd.timeStr,
-            severity: "warn",
-            text: `<strong>Hold Stack Step-Down</strong> (${
-              sd.establishedAcft.callsign
-            } Established) → Descend from ${formatAlt(sd.prevAltFt)} to <strong>${formatAlt(
-              sd.altFt
-            )}</strong>.`,
-          });
-        });
-      }
-      steps.push({
-        timeNorm: eatInfo.eatNorm,
-        timeStr: eatInfo.eatDisplay,
-        severity: "ok",
-        text: `<strong>EAT ${eatInfo.eatDisplay} Reached</strong> → <strong>Clear ${acft.callsign} Straight-In ILS RWY ${activeRwy}</strong>, descend to <strong>3,000'</strong>.`,
-      });
-    }
-
-    // 4. Full Established -> Send to TWR
-    steps.push({
-      timeNorm: eatInfo.effectiveEstNorm,
-      timeStr: eatInfo.effectiveEstDisplay,
-      severity: "ok",
-      text: `<strong>FULL ESTABLISHED ILS RWY ${activeRwy}</strong> → Contact <strong>AYT TWR 118.1</strong>.`,
-    });
-
-    aircraftPlans.set(acft.id, {
-      seqNum: eatInfo.seqNum,
-      acft,
-      wpt,
-      eatInfo,
-      enrouteTargetFt,
-      msaTargetFt,
-      altTimeline: solvedTimelines.get(acft.id),
-      steps,
+  computedDepartures.forEach((dep) => {
+    vor15Occupants.push({
+      kind: "DEP",
+      icon: "🛫",
+      acft: dep.acft,
+      corridorLabel: dep.wpt.name,
+      tEnter: dep.normDep,
+      tExit: dep.norm15,
+      altLabel: `Climb ≥${formatAltShort(dep.wpt.msaFt)} MSA`,
     });
   });
 
-  // Departure Plans
-  computedDepartures.forEach((depItem) => {
-    const { acft, wpt, calc } = depItem;
-    const locks = depArrLocks.get(acft.id) || [];
-    const stackLock = locks.find((l) => l.type === "STACK_FLOOR");
-    const radialOrVorLock = locks.find(
-      (l) => l.type === "SAME_RADIAL" || l.type === "CROSS_RADIAL_VOR15"
-    );
-    const steps = [];
-
-    if (radialOrVorLock) {
-      const lockLabel =
-        radialOrVorLock.type === "CROSS_RADIAL_VOR15"
-          ? `15 NM VOR separation w/ <strong>${radialOrVorLock.arrAcft.callsign}</strong>`
-          : `inbound <strong>${radialOrVorLock.arrAcft.callsign}</strong> (cross at <strong>${
-              radialOrVorLock.dCross
-            } NM @ ${formatTime(
-              denormalizeTime(radialOrVorLock.tCrossNorm, calc.hasHour, refHour),
-              calc.hasHour
-            )}</strong>)`;
-      steps.push({
-        timeNorm: depItem.normDep,
-        timeStr: formatTime(calc.tDep, calc.hasHour),
-        severity: "crit",
-        text: `Departs 0 NM toward ${wpt.name} (${wpt.entryWpt}): Reach <strong>≥${formatAlt(
-          wpt.msaFt
-        )} (MSA) before 10 NM (${formatTime(
-          calc.t10,
-          calc.hasHour
-        )})</strong>. Stop climb at <strong>${formatAlt(
-          radialOrVorLock.depRestrictedAltFt
-        )}</strong> due to ${lockLabel}.`,
-      });
-      steps.push({
-        timeNorm: radialOrVorLock.tCrossNorm,
-        timeStr: formatTime(
-          denormalizeTime(radialOrVorLock.tCrossNorm, calc.hasHour, refHour),
-          calc.hasHour
-        ),
-        severity: "ok",
-        text: `Clear of conflict w/ <strong>${
-          radialOrVorLock.arrAcft.callsign
-        }</strong> → Climb to <strong>${formatAlt(
-          Math.max(wpt.meaFt, calc.reqAltFt)
-        )}</strong> (ensure ≥${formatAlt(wpt.meaFt)} MEA before 25 NM @ ${formatTime(
-          calc.t25,
-          calc.hasHour
-        )}).`,
-      });
-    } else if (stackLock) {
-      steps.push({
-        timeNorm: depItem.normDep,
-        timeStr: formatTime(calc.tDep, calc.hasHour),
-        severity: "warn",
-        text: `Departs 0 NM toward ${wpt.name} (${wpt.entryWpt}) → Climb directly to <strong>${formatAlt(
-          stackLock.depMinInitialAltFt
-        )} before 10 NM (${formatTime(
-          calc.t10,
-          calc.hasHour
-        )})</strong> (≥1,000' above active inner approach stack), <strong>${formatAlt(
-          wpt.meaFt
-        )} (MEA) before 25 NM (${formatTime(
-          calc.t25,
-          calc.hasHour
-        )})</strong>, then <strong>${formatAlt(calc.reqAltFt)}</strong>.`,
-      });
-    } else {
-      steps.push({
-        timeNorm: depItem.normDep,
-        timeStr: formatTime(calc.tDep, calc.hasHour),
-        severity: "normal",
-        text: `Departs 0 NM toward ${wpt.name} (${wpt.entryWpt}) → Climb to <strong>${formatAlt(
-          wpt.msaFt
-        )} (MSA) before 10 NM (${formatTime(
-          calc.t10,
-          calc.hasHour
-        )})</strong>, <strong>${formatAlt(
-          wpt.meaFt
-        )} (MEA) before 25 NM (${formatTime(
-          calc.t25,
-          calc.hasHour
-        )})</strong>, then <strong>${formatAlt(calc.reqAltFt)}</strong>.`,
-      });
-    }
-
-    aircraftPlans.set(acft.id, {
-      seqNum: "DEP",
-      acft,
-      wpt,
-      altTimeline: solvedTimelines.get(acft.id),
-      steps,
+  computedTransits.forEach((trn) => {
+    const tEnter = trn.calc.hasInbound
+      ? trn.norm15To !== null
+        ? trn.norm15To
+        : trn.normInit
+      : trn.normVor;
+    const tExit = trn.calc.hasOutbound ? trn.norm15From : trn.normVor;
+    vor15Occupants.push({
+      kind: "TRN",
+      icon: "✈️",
+      acft: trn.acft,
+      corridorLabel: `${trn.entryWpt.name}→${trn.exitWpt.name}`,
+      tEnter,
+      tExit,
+      altLabel: `Maintains ${formatAlt(trn.calc.maintAltFt)}`,
     });
   });
 
-  // --------------------------------------------------------------------------
-  // STEP 5: Live Time-Step Verification Sweep (dt = 0.2m = 1 NM)
-  // Audits every 0.2-minute step from scenario start to end across all pairs
-  // --------------------------------------------------------------------------
-  const allItems = [...sequencedArrivals, ...computedDepartures];
-  let totalStepsChecked = 0;
-  let totalPairChecks = 0;
-  let maxSimultaneousInVor15 = 0;
+  for (let i = 0; i < vor15Occupants.length; i++) {
+    for (let j = i + 1; j < vor15Occupants.length; j++) {
+      const A = vor15Occupants[i];
+      const B = vor15Occupants[j];
+      const ovStart = Math.max(A.tEnter, B.tEnter);
+      const ovEnd = Math.min(A.tExit, B.tExit);
 
-  if (allItems.length > 0) {
-    const simStart = Math.min(
-      ...allItems.map((it) => (it.acft.type === "DEP" ? it.normDep : it.normInit))
-    );
-    const simEnd = Math.max(
-      ...allItems.map((it) =>
-        it.acft.type === "DEP"
-          ? it.norm60
-          : eatMap.get(it.acft.id)?.effectiveEstNorm || it.normInit + 20
-      )
-    );
-
-    for (let t = simStart; t <= simEnd + 1e-6; t = +(t + 0.2).toFixed(2)) {
-      totalStepsChecked++;
-      const activeInStep = [];
-
-      allItems.forEach((it) => {
-        const tl = solvedTimelines.get(it.acft.id);
-        if (it.acft.type === "DEP") {
-          if (t >= it.normDep && t <= it.norm60) {
-            const dme = (t - it.normDep) * SPEED_NM_PER_MIN;
-            activeInStep.push({
-              it,
-              dme,
-              inVor15: dme < 15,
-              altFt: evaluateTimelineAlt(tl, t, it.wpt.msaFt),
-            });
-          }
-        } else {
-          const eat = eatMap.get(it.acft.id);
-          if (t >= it.normInit && t < eat.effectiveEstNorm - 1e-6) {
-            const enter15 = it.norm15 !== null ? it.norm15 : it.normInit;
-            activeInStep.push({
-              it,
-              dme: t <= (it.normVor ?? it.norm10) ? Math.max(0, it.calc.dist - (t - it.normInit) * 5) : 10,
-              inVor15: t >= enter15 - 1e-6,
-              altFt: evaluateTimelineAlt(tl, t, it.wpt.msaFt),
-            });
-          }
-        }
-      });
-
-      const vor15Count = activeInStep.filter((a) => a.inVor15).length;
-      if (vor15Count > maxSimultaneousInVor15) {
-        maxSimultaneousInVor15 = vor15Count;
+      if (ovStart < ovEnd - 1e-6) {
+        const startStr = formatTime(denormalizeTime(ovStart, useHasHour, refHour), useHasHour);
+        const endStr = formatTime(denormalizeTime(ovEnd, useHasHour, refHour), useHasHour);
+        radialConflicts.push({
+          pairLabel: `${A.icon} ${A.acft.callsign} (${A.corridorLabel}) & ${B.icon} ${B.acft.callsign} (${B.corridorLabel})`,
+          badgeText: `< 15 NM VOR OVERLAP`,
+          windowStr: `${startStr}–${endStr}`,
+          detailText: `Both aircraft are inside <strong>15 NM of AYT VOR</strong> simultaneously from <code>${startStr}</code> to <code>${endStr}</code> (${A.acft.callsign}: ${A.altLabel} • ${B.acft.callsign}: ${B.altLabel}). Maintain ≥1,000 ft vertical separation inside 15 NM.`,
+          isAlert: true,
+        });
       }
+    }
+  }
 
-      for (let a = 0; a < activeInStep.length; a++) {
-        for (let b = a + 1; b < activeInStep.length; b++) {
-          const A = activeInStep[a];
-          const B = activeInStep[b];
-          if ((A.inVor15 && B.inVor15) || A.it.acft.wptId === B.it.acft.wptId) {
-            totalPairChecks++;
-          }
-        }
+  // 3B. Same-Direction Same-Waypoint Proximity (< 3 min / 15 NM on same leg)
+  for (let i = 0; i < inboundLegs.length; i++) {
+    for (let j = i + 1; j < inboundLegs.length; j++) {
+      const A = inboundLegs[i];
+      const B = inboundLegs[j];
+      if (A.wpt.id !== B.wpt.id) continue;
+      const gapMins = Math.abs(A.tZeroNorm - B.tZeroNorm);
+      const gapNm = +(gapMins * SPEED_NM_PER_MIN).toFixed(1);
+      if (gapMins < 5) {
+        radialConflicts.push({
+          pairLabel: `${A.icon} ${A.acft.callsign} & ${B.icon} ${B.acft.callsign}`,
+          badgeText: `SAME INBOUND (${A.wpt.name})`,
+          windowStr: `${gapNm} NM (${+gapMins.toFixed(1)}m) spacing`,
+          detailText: `Both flying inbound (TO AYT) on <strong>${A.wpt.name}</strong> with <strong>${gapNm} NM (${+gapMins.toFixed(
+            1
+          )} min)</strong> spacing (${A.acft.callsign}: ${A.altSummary} • ${B.acft.callsign}: ${
+            B.altSummary
+          }).`,
+          isAlert: true,
+        });
+      }
+    }
+  }
+
+  for (let i = 0; i < outboundLegs.length; i++) {
+    for (let j = i + 1; j < outboundLegs.length; j++) {
+      const A = outboundLegs[i];
+      const B = outboundLegs[j];
+      if (A.wpt.id !== B.wpt.id) continue;
+      const gapMins = Math.abs(A.tZeroNorm - B.tZeroNorm);
+      const gapNm = +(gapMins * SPEED_NM_PER_MIN).toFixed(1);
+      if (gapMins < 5) {
+        radialConflicts.push({
+          pairLabel: `${A.icon} ${A.acft.callsign} & ${B.icon} ${B.acft.callsign}`,
+          badgeText: `SAME OUTBOUND (${A.wpt.name})`,
+          windowStr: `${gapNm} NM (${+gapMins.toFixed(1)}m) spacing`,
+          detailText: `Both flying outbound (FROM AYT) on <strong>${A.wpt.name}</strong> with <strong>${gapNm} NM (${+gapMins.toFixed(
+            1
+          )} min)</strong> spacing (${A.acft.callsign}: ${A.altSummary} • ${B.acft.callsign}: ${
+            B.altSummary
+          }).`,
+          isAlert: true,
+        });
       }
     }
   }
@@ -1841,26 +967,17 @@ function solveScenario(aircraftList, activeRwy) {
     useHasHour,
     computedArrivals,
     computedDepartures,
+    computedTransits,
     sequencedArrivals,
     eatMap,
-    depArrConflicts,
-    radialDepArrConflicts,
-    vorSepConstraints,
-    aircraftPlans,
-    solvedTimelines,
-    liveSimStats: {
-      dtMins: 0.2,
-      stepNm: 1,
-      totalStepsChecked,
-      totalPairChecks,
-      maxSimultaneousInVor15,
-    },
+    headOnConflicts,
+    radialConflicts,
   };
 }
 
 // ============================================================================
 // LIVE POSITION, ALTITUDE & SVG COORDINATE ESTIMATOR AT TIME T
-// Uses the exact live-simulated altitude timeline from solveScenario
+// Supports Arrivals (ARR), Departures (DEP), and Transit (TRN) aircraft!
 // ============================================================================
 function polarToSvg(dmeNm, deg) {
   const rad = (deg * Math.PI) / 180;
@@ -1872,10 +989,81 @@ function polarToSvg(dmeNm, deg) {
 }
 
 function getAircraftStateAtTime(item, solverData, queryNormMins) {
-  const { acft, wpt, calc } = item;
-  const plan = solverData.aircraftPlans.get(acft.id);
-  const altTimeline = plan ? plan.altTimeline : null;
+  const { acft, calc } = item;
 
+  // 1. TRANSIT AIRCRAFT ('TRN')
+  if (acft.type === "TRN") {
+    const { entryWpt, exitWpt } = item;
+    const altStr = formatAltShort(calc.maintAltFt);
+
+    if (queryNormMins < item.normInit) {
+      const wait = +(item.normInit - queryNormMins).toFixed(1);
+      return {
+        visible: false,
+        phase: "pending",
+        dme: calc.dist,
+        altFt: calc.maintAltFt,
+        altStr,
+        text: `Transit enters ${entryWpt.name} (${calc.dist} NM) in ${wait}m @ ${altStr}`,
+        color: "var(--text-muted)",
+      };
+    }
+
+    // Inbound leg TO AYT VOR
+    if (calc.hasInbound && queryNormMins <= item.normVor) {
+      const dme = Math.max(0, +((item.normVor - queryNormMins) * SPEED_NM_PER_MIN).toFixed(1));
+      const pos = polarToSvg(dme, entryWpt.deg);
+      const tip = polarToSvg(Math.max(0, dme - 4), entryWpt.deg);
+      return {
+        visible: dme <= 72,
+        phase: "transit-in",
+        x: pos.x,
+        y: pos.y,
+        tipX: tip.x,
+        tipY: tip.y,
+        dme,
+        altFt: calc.maintAltFt,
+        altStr,
+        text: `${dme} NM TO AYT (${entryWpt.name} → ${exitWpt.name}) @ ${altStr}`,
+        color: "#34d399",
+      };
+    }
+
+    // Outbound leg FROM AYT VOR
+    if (calc.hasOutbound) {
+      const dme = +((queryNormMins - item.normVor) * SPEED_NM_PER_MIN).toFixed(1);
+      if (dme <= 72) {
+        const pos = polarToSvg(dme, exitWpt.deg);
+        const tip = polarToSvg(Math.min(76, dme + 4), exitWpt.deg);
+        return {
+          visible: true,
+          phase: "transit-out",
+          x: pos.x,
+          y: pos.y,
+          tipX: tip.x,
+          tipY: tip.y,
+          dme,
+          altFt: calc.maintAltFt,
+          altStr,
+          text: `${dme} NM FROM AYT (toward ${exitWpt.name}) @ ${altStr}`,
+          color: "#34d399",
+        };
+      }
+    }
+
+    return {
+      visible: false,
+      phase: "exited",
+      dme: 0,
+      altFt: calc.maintAltFt,
+      altStr,
+      text: `Completed transit (${entryWpt.name} → ${exitWpt.name})`,
+      color: "var(--text-muted)",
+    };
+  }
+
+  // 2. DEPARTURE AIRCRAFT ('DEP')
+  const { wpt } = item;
   if (acft.type === "DEP") {
     const tDep = item.normDep;
     if (queryNormMins < tDep) {
@@ -1893,7 +1081,8 @@ function getAircraftStateAtTime(item, solverData, queryNormMins) {
 
     const elapsed = queryNormMins - tDep;
     const dme = +(elapsed * SPEED_NM_PER_MIN).toFixed(1);
-    const currentAltFt = evaluateTimelineAlt(altTimeline, queryNormMins, calc.reqAltFt);
+    const currentAltFt =
+      dme < 10 ? wpt.msaFt : dme < 25 ? Math.max(wpt.msaFt, wpt.meaFt) : calc.reqAltFt;
 
     const pos = polarToSvg(Math.min(dme, 72), wpt.deg);
     const tip = polarToSvg(Math.min(dme + 4, 76), wpt.deg);
@@ -1908,12 +1097,12 @@ function getAircraftStateAtTime(item, solverData, queryNormMins) {
       dme,
       altFt: currentAltFt,
       altStr: formatAltShort(currentAltFt),
-      text: `${dme} NM outbound on ${wpt.name} @ ${formatAltShort(currentAltFt)}`,
+      text: `${dme} NM FROM AYT on ${wpt.name} @ ${formatAltShort(currentAltFt)}`,
       color: "#fbbf24",
     };
   }
 
-  // Arrival State at queryNormMins
+  // 3. ARRIVAL AIRCRAFT ('ARR')
   const eatInfo = solverData.eatMap.get(acft.id);
   const tInit = item.normInit;
   const d0 = calc.dist;
@@ -1931,8 +1120,14 @@ function getAircraftStateAtTime(item, solverData, queryNormMins) {
     };
   }
 
-  // Exact live-simulated altitude at queryNormMins
-  const currentAltFt = evaluateTimelineAlt(altTimeline, queryNormMins, wpt.msaFt);
+  const currentAltFt =
+    queryNormMins < (item.norm25 ?? tInit)
+      ? wpt.meaFt
+      : queryNormMins < item.norm10
+      ? calc.straightIn && !eatInfo.willDelay
+        ? 3000
+        : wpt.msaFt
+      : 3000;
 
   // Straight-In Arrival Geometry
   if (calc.straightIn) {
@@ -1951,25 +1146,24 @@ function getAircraftStateAtTime(item, solverData, queryNormMins) {
         dme,
         altFt: currentAltFt,
         altStr: formatAltShort(currentAltFt),
-        text: `${dme} NM inbound ${wpt.name} (Str-In) @ ${formatAltShort(currentAltFt)}`,
+        text: `${dme} NM TO AYT ${wpt.name} (Str-In) @ ${formatAltShort(currentAltFt)}`,
         color: "#c084fc",
       };
     }
 
     if (queryNormMins <= eatInfo.effectiveEstNorm) {
-      const stackIdx = Math.max(0, Math.round((currentAltFt - 4000) / 1000));
       const pos = polarToSvg(10, wpt.deg);
       return {
         visible: true,
         phase: "hold",
-        x: pos.x + stackIdx * 8,
-        y: pos.y + stackIdx * 6,
+        x: pos.x,
+        y: pos.y,
         tipX: pos.x,
         tipY: pos.y,
         dme: 10,
-        altFt: currentAltFt,
-        altStr: formatAltShort(currentAltFt),
-        text: `10 NM (${wpt.name}) — Holding/Establishing @ ${formatAltShort(currentAltFt)}`,
+        altFt: 4000,
+        altStr: "4000' HLD",
+        text: `10 NM (${wpt.name}) — Holding until EAT ${eatInfo.eatDisplay}`,
         color: "#34d399",
       };
     }
@@ -2006,7 +1200,6 @@ function getAircraftStateAtTime(item, solverData, queryNormMins) {
   }
 
   // Normal Arrival Geometry:
-  // 1. Inbound from d0 to AYT VOR (0 NM)
   if (queryNormMins <= item.normVor) {
     const elapsed = queryNormMins - tInit;
     const dme = Math.max(0, +(d0 - elapsed * SPEED_NM_PER_MIN).toFixed(1));
@@ -2022,15 +1215,13 @@ function getAircraftStateAtTime(item, solverData, queryNormMins) {
       dme,
       altFt: currentAltFt,
       altStr: formatAltShort(currentAltFt),
-      text: `${dme} NM inbound ${wpt.name} @ ${formatAltShort(currentAltFt)}`,
+      text: `${dme} NM TO AYT ${wpt.name} @ ${formatAltShort(currentAltFt)}`,
       color: "#38bdf8",
     };
   }
 
-  // Outbound radial for procedure: R-170 (170 deg) for RWY 36, R-350 (350 deg) for RWY 18
   const procDeg = state.activeRwy === "36" ? 170 : 350;
 
-  // 2. Outbound from AYT VOR to 10 DME FIX (takes 2 mins)
   if (queryNormMins <= item.normFixBase) {
     const outElapsed = queryNormMins - item.normVor;
     const dme = +(outElapsed * SPEED_NM_PER_MIN).toFixed(1);
@@ -2044,36 +1235,33 @@ function getAircraftStateAtTime(item, solverData, queryNormMins) {
       tipX: tip.x,
       tipY: tip.y,
       dme,
-      altFt: currentAltFt,
-      altStr: formatAltShort(currentAltFt),
-      text: `${dme} NM outbound to 10 DME FIX @ ${formatAltShort(currentAltFt)}`,
+      altFt: 4000,
+      altStr: "4000'",
+      text: `${dme} NM outbound to 10 DME FIX`,
       color: "#fbbf24",
     };
   }
 
-  // 3. Holding at 10 DME FIX (if eatInfo.effectiveFixNorm > item.normFixBase)
   if (queryNormMins <= eatInfo.effectiveFixNorm) {
     const remHold = +(eatInfo.effectiveFixNorm - queryNormMins).toFixed(1);
-    const stackIdx = Math.max(0, Math.round((currentAltFt - 4000) / 1000));
     const pos = polarToSvg(10, procDeg);
     return {
       visible: true,
       phase: "hold",
-      x: +(pos.x + 12 + stackIdx * 8).toFixed(1),
-      y: +(pos.y + 8 + stackIdx * 6).toFixed(1),
+      x: +(pos.x + 12).toFixed(1),
+      y: +(pos.y + 8).toFixed(1),
       tipX: pos.x,
       tipY: pos.y,
       dme: 10,
-      altFt: currentAltFt,
-      altStr: `${formatAltShort(currentAltFt)} HLD`,
-      text: `HOLDING at 10 DME FIX (${remHold}m to EAT/Clearance) @ ${formatAltShort(currentAltFt)}`,
+      altFt: 4000,
+      altStr: "4000' HLD",
+      text: `HOLDING at 10 DME FIX (${remHold}m to EAT)`,
       color: "#f87171",
     };
   }
 
-  // 4. In 5-minute ILS procedure turn from 10 DME FIX to Established (10 NM final)
   if (queryNormMins <= eatInfo.effectiveEstNorm) {
-    const turnProgress = (queryNormMins - eatInfo.effectiveFixNorm) / 5; // 0 to 1
+    const turnProgress = (queryNormMins - eatInfo.effectiveFixNorm) / 5;
     const remTurn = +(eatInfo.effectiveEstNorm - queryNormMins).toFixed(1);
     const arcDme = 10 + 3 * Math.sin(turnProgress * Math.PI);
     const arcDeg = procDeg + 12 * Math.sin(turnProgress * Math.PI);
@@ -2126,33 +1314,82 @@ function getAircraftStateAtTime(item, solverData, queryNormMins) {
 }
 
 // ============================================================================
-// RENDER FUNCTIONS
+// RENDER FUNCTIONS (WIZARD, ROUTE BUILDER, LIVE PREVIEW & TABLES)
 // ============================================================================
 
 function getWizardStepOrder(flightType) {
   if (flightType === "DEP") {
-    // Departure prompt order: 0. ARR/DEP -> 1. Callsign -> 2. FL -> 3. Time -> 4. WPT
+    // Departure prompt order: 0. Type -> 1. Callsign -> 2. FL -> 3. Time -> 4. WPT
     return ["TYPE", "CALLSIGN", "FL", "TIME", "WPT"];
   }
-  // Arrival prompt order: 0. ARR/DEP -> 1. Callsign -> 2. Flight Level -> 3. First Report Dist -> 4. Waypoint -> 5. Report Time
+  // Arrival & Transit prompt order: 0. Type -> 1. Callsign -> 2. FL -> 3. Dist -> 4. WPT/Route -> 5. Report Time
   return ["TYPE", "CALLSIGN", "FL", "DIST", "WPT", "TIME"];
+}
+
+function renderTransitRouteChips() {
+  const chipsEl = document.getElementById("transitRouteChips");
+  if (!chipsEl) return;
+
+  if (!state.transitRoute || state.transitRoute.length === 0) {
+    chipsEl.innerHTML = `<span style="color:var(--text-muted);font-size:0.8rem;">Click Entry Waypoint below to start route...</span>`;
+    return;
+  }
+
+  chipsEl.innerHTML = state.transitRoute
+    .map((ptId, idx) => {
+      const pt = getWaypointOrVor(ptId);
+      const isVor = ptId === "AYT";
+      const chip = `<span class="route-chip ${isVor ? "vor-chip" : ""}">${idx + 1}. ${
+        pt.name
+      }</span>`;
+      return idx < state.transitRoute.length - 1
+        ? `${chip} <span class="route-arrow">→</span>`
+        : chip;
+    })
+    .join(" ");
 }
 
 function renderWaypointGrid() {
   const container = document.getElementById("wptGrid");
+  const routeBuilderEl = document.getElementById("transitRouteBuilder");
   if (!container) return;
   container.innerHTML = "";
 
-  WAYPOINTS.forEach((wpt) => {
+  const isTransit = state.flightType === "TRN";
+  if (routeBuilderEl) {
+    routeBuilderEl.classList.toggle("hidden", !isTransit);
+    if (isTransit) renderTransitRouteChips();
+  }
+
+  // For Transit, include all 7 waypoints PLUS AYT VOR!
+  const pointsList = isTransit ? ALL_ROUTE_POINTS : WAYPOINTS;
+
+  pointsList.forEach((wpt) => {
+    const isVor = wpt.id === "AYT";
     const isStraightForCurrentRwy =
       state.flightType === "ARR" && wpt.straightInRwy === state.activeRwy;
+    const isSelected = isTransit
+      ? state.transitRoute.includes(wpt.id)
+      : state.selectedWpt === wpt.id;
+
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = `wpt-btn ${state.selectedWpt === wpt.id ? "active" : ""} ${
+    btn.className = `wpt-btn ${isSelected ? "active" : ""} ${
       isStraightForCurrentRwy ? "straight-in-capable" : ""
-    }`;
+    } ${isVor ? "vor-special-btn" : ""}`;
 
-    btn.innerHTML = `
+    btn.innerHTML = isVor
+      ? `
+      <div class="wpt-name">
+        <span>🎯 AYT VOR</span>
+        <span class="wpt-entry-badge">0 NM</span>
+      </div>
+      <div class="wpt-meta">
+        <span>TMA Center VOR</span>
+        <span class="wpt-tag">VIA / OVER</span>
+      </div>
+    `
+      : `
       <div class="wpt-name">
         <span>${wpt.name}</span>
         <span class="wpt-entry-badge">${wpt.entryWpt}</span>
@@ -2164,13 +1401,34 @@ function renderWaypointGrid() {
     `;
 
     btn.addEventListener("click", () => {
+      if (isTransit) {
+        // Build Transit Route step-by-step:
+        // If user already had a full 3-point route (Entry -> AYT -> Exit) and clicks a new outer WPT, start fresh with it as Entry
+        if (state.transitRoute.length >= 3) {
+          state.transitRoute = [wpt.id];
+        } else if (state.transitRoute.length === 0) {
+          state.transitRoute = [wpt.id];
+        } else {
+          const last = state.transitRoute[state.transitRoute.length - 1];
+          if (last !== wpt.id) {
+            // If first point is an outer waypoint and user clicks another outer waypoint directly,
+            // automatically route via AYT VOR in between so the route is [Entry, AYT, Exit]!
+            if (last !== "AYT" && wpt.id !== "AYT" && !state.transitRoute.includes("AYT")) {
+              state.transitRoute.push("AYT", wpt.id);
+            } else {
+              state.transitRoute.push(wpt.id);
+            }
+          }
+        }
+        renderWaypointGrid();
+        renderLivePreview();
+        return;
+      }
+
       state.selectedWpt = wpt.id;
       renderWaypointGrid();
       renderLivePreview();
 
-      // In the one-by-one wizard:
-      // - For ARR, Waypoint is Step 4 of 5 -> clicking a waypoint advances to Step 5 (Report Time)!
-      // - For DEP, Waypoint is Step 4 of 4 (final step) -> clicking a waypoint selects it and focuses the Add button!
       if (state.wizardOpen) {
         const steps = getWizardStepOrder(state.flightType);
         if (steps[state.wizardStepIdx] === "WPT") {
@@ -2192,18 +1450,84 @@ function renderWaypointGrid() {
 
 function renderLivePreview() {
   const previewEl = document.getElementById("livePreview");
-  const wptObj = WAYPOINTS.find((w) => w.id === state.selectedWpt) || WAYPOINTS[0];
+  if (!previewEl) return;
+
   const callsignLabel = state.inputCallsign.trim()
     ? state.inputCallsign.trim().toUpperCase()
     : state.flightType === "DEP"
     ? "DEP PREVIEW"
+    : state.flightType === "TRN"
+    ? "TRANSIT PREVIEW"
     : "ARR PREVIEW";
 
+  // 1. TRANSIT PREVIEW
+  if (state.flightType === "TRN") {
+    const trnCalc = calculateTransitCheckpoints({
+      route: state.transitRoute,
+      dist: state.selectedDist,
+      timeRaw: state.inputTimeRaw,
+      fl: state.selectedFl,
+      queryDme: state.globalQueryDme,
+    });
+
+    const routeStr = `${trnCalc.entryWpt.name} → AYT VOR → ${trnCalc.exitWpt.name}`;
+
+    previewEl.innerHTML = `
+      <div class="preview-header">
+        <div class="preview-title">
+          <span class="badge badge-trn">✈️ TRANSIT TRAFFIC</span>
+          <span><strong>${callsignLabel}</strong> • Route: <strong>${routeStr}</strong> • Maintains <strong>${formatAlt(
+      trnCalc.maintAltFt
+    )}</strong></span>
+        </div>
+        <span class="step-delta">${state.globalQueryDme} NM: TO AYT <strong>${formatTime(
+      trnCalc.tQueryTo,
+      trnCalc.hasHour
+    )}</strong> • FROM AYT <strong>${formatTime(trnCalc.tQueryFrom, trnCalc.hasHour)}</strong></span>
+      </div>
+      <div class="preview-steps">
+        <div class="step-box">
+          <div class="step-label"><span>INIT (${trnCalc.dist} NM TO)</span> <span class="step-delta">${
+      trnCalc.entryWpt.name
+    }</span></div>
+          <div class="step-time">${formatTime(trnCalc.tInit, trnCalc.hasHour)}</div>
+        </div>
+        <div class="step-box">
+          <div class="step-label"><span>25 NM TO</span> <span class="step-delta">INB</span></div>
+          <div class="step-time">${formatTime(trnCalc.t25To, trnCalc.hasHour)}</div>
+        </div>
+        <div class="step-box">
+          <div class="step-label"><span>10 NM TO</span> <span class="step-delta">INB</span></div>
+          <div class="step-time">${formatTime(trnCalc.t10To, trnCalc.hasHour)}</div>
+        </div>
+        <div class="step-box">
+          <div class="step-label"><span>AYT VOR</span> <span class="step-delta">0 NM</span></div>
+          <div class="step-time">${formatTime(trnCalc.tVor, trnCalc.hasHour)}</div>
+        </div>
+        <div class="step-box">
+          <div class="step-label"><span>10 NM FROM</span> <span class="step-delta">${
+      trnCalc.exitWpt.name
+    }</span></div>
+          <div class="step-time">${formatTime(trnCalc.t10From, trnCalc.hasHour)}</div>
+        </div>
+        <div class="step-box">
+          <div class="step-label"><span>25 NM FROM</span> <span class="step-delta">OUTB</span></div>
+          <div class="step-time">${formatTime(trnCalc.t25From, trnCalc.hasHour)}</div>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  const wptObj = WAYPOINTS.find((w) => w.id === state.selectedWpt) || WAYPOINTS[0];
+
+  // 2. DEPARTURE PREVIEW
   if (state.flightType === "DEP") {
     const depCalc = calculateDepartureCheckpoints({
       wptId: state.selectedWpt,
       timeRaw: state.inputTimeRaw,
       fl: state.selectedFl,
+      queryDme: state.globalQueryDme,
     });
 
     previewEl.innerHTML = `
@@ -2214,9 +1538,10 @@ function renderLivePreview() {
       depCalc.reqAltFt
     )}</span>
         </div>
-        <span class="step-delta">MSA ${formatAlt(wptObj.msaFt)} &lt;10 NM • MEA ${formatAlt(
-      wptObj.meaFt
-    )} &lt;25 NM</span>
+        <span class="step-delta">${depCalc.qDme} NM FROM AYT @ <strong>${formatTime(
+      depCalc.tQueryFrom,
+      depCalc.hasHour
+    )}</strong></span>
       </div>
       <div class="preview-steps dep-steps">
         <div class="step-box">
@@ -2250,14 +1575,16 @@ function renderLivePreview() {
     return;
   }
 
+  // 3. ARRIVAL PREVIEW
   const calc = calculateArrivalCheckpoints(
     {
       wptId: state.selectedWpt,
       dist: state.selectedDist,
       timeRaw: state.inputTimeRaw,
-      mode: state.approachMode,
+      mode: "auto",
       holdMins: 0,
       fl: state.selectedFl,
+      queryDme: state.globalQueryDme,
     },
     state.activeRwy
   );
@@ -2272,7 +1599,10 @@ function renderLivePreview() {
     calc.initAltFt
   )} → MEA ${formatAlt(wptObj.meaFt)} → MSA ${formatAlt(wptObj.msaFt)}</span>
       </div>
-      <span class="step-delta">15 NM VOR Sep @ <strong>${formatTime(calc.t15, calc.hasHour)}</strong></span>
+      <span class="step-delta">${calc.qDme} NM TO AYT @ <strong>${formatTime(
+    calc.tQueryTo,
+    calc.hasHour
+  )}</strong></span>
     </div>
     <div class="preview-steps">
       <div class="step-box">
@@ -2307,16 +1637,19 @@ function renderLivePreview() {
   `;
 }
 
-function buildWaypointOptionsHtml(selectedWptId) {
-  return WAYPOINTS.map(
-    (w) =>
-      `<option value="${w.id}" ${w.id === selectedWptId ? "selected" : ""}>${w.name} (${w.entryWpt})</option>`
-  ).join("");
+function buildWaypointOptionsHtml(selectedWptId, includeVor = false) {
+  const list = includeVor ? ALL_ROUTE_POINTS : WAYPOINTS;
+  return list
+    .map(
+      (w) =>
+        `<option value="${w.id}" ${w.id === selectedWptId ? "selected" : ""}>${w.name} (${w.entryWpt})</option>`
+    )
+    .join("");
 }
 
 // Refresh calculated values in-place without losing input focus
 function refreshCalculatedValuesOnly() {
-  const solver = solveScenario(state.aircraftList, state.activeRwy);
+  const solver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
 
   solver.computedArrivals.forEach(({ acft, calc }) => {
     const tr = document.querySelector(`tr[data-row-id="${acft.id}"]`);
@@ -2347,6 +1680,7 @@ function refreshCalculatedValuesOnly() {
     );
     setCell("tEat", eatInfo.eatDisplay);
     setCell("tEst", eatInfo.effectiveEstDisplay);
+    setCell("dmeTo", `TO AYT: ${formatTime(calc.tQueryTo, calc.hasHour)}`);
     setCell(
       "willDelay",
       eatInfo.willDelay
@@ -2370,29 +1704,51 @@ function refreshCalculatedValuesOnly() {
     setCell("dep25", formatTime(calc.t25, calc.hasHour));
     setCell("dep50", formatTime(calc.t50, calc.hasHour));
     setCell("dep60", formatTime(calc.t60, calc.hasHour));
+    setCell("dmeFrom", `FROM AYT: ${formatTime(calc.tQueryFrom, calc.hasHour)}`);
   });
 
-  renderSolverPanels(solver);
+  solver.computedTransits.forEach(({ acft, calc }) => {
+    const tr = document.querySelector(`tr[data-row-id="${acft.id}"]`);
+    if (!tr) return;
+
+    const setCell = (col, val) => {
+      const el = tr.querySelector(`[data-col="${col}"]`);
+      if (el) el.innerHTML = val;
+    };
+
+    setCell("trn25To", formatTime(calc.t25To, calc.hasHour));
+    setCell("trn10To", formatTime(calc.t10To, calc.hasHour));
+    setCell("trnVor", formatTime(calc.tVor, calc.hasHour));
+    setCell("trn10From", formatTime(calc.t10From, calc.hasHour));
+    setCell("trn25From", formatTime(calc.t25From, calc.hasHour));
+    setCell("trn50From", formatTime(calc.t50From, calc.hasHour));
+    setCell("trnDmeTo", `TO: ${formatTime(calc.tQueryTo, calc.hasHour)}`);
+    setCell("trnDmeFrom", `FROM: ${formatTime(calc.tQueryFrom, calc.hasHour)}`);
+  });
+
+  renderConflictPanels(solver);
   renderRadarChartView(solver);
-  renderTimelineView(solver);
 }
 
-// Render Scenario Sheet + Master Solver + Chart + Timeline
+// Render Scenario Sheet + Conflict Finder + Chart
 function renderScenarioBoard() {
   const arrTbody = document.getElementById("scenarioTableBody");
   const depSection = document.getElementById("departuresSection");
   const depTbody = document.getElementById("departuresTableBody");
+  const trnSection = document.getElementById("transitSection");
+  const trnTbody = document.getElementById("transitTableBody");
   const summaryText = document.getElementById("scenarioSummaryText");
 
-  const solver = solveScenario(state.aircraftList, state.activeRwy);
-  const { computedArrivals, computedDepartures, eatMap } = solver;
+  const solver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+  const { computedArrivals, computedDepartures, computedTransits, eatMap } = solver;
 
-  summaryText.textContent = `${computedArrivals.length} Arrival(s), ${computedDepartures.length} Departure(s) • All fields editable. EAT & holds auto-computed.`;
+  summaryText.textContent = `${computedArrivals.length} Arrival(s), ${computedDepartures.length} Departure(s), ${computedTransits.length} Transit(s) • All fields & DME crossing queries editable.`;
 
+  // 1. Arrivals Table
   if (computedArrivals.length === 0) {
     arrTbody.innerHTML = `
       <tr class="empty-row">
-        <td colspan="16">No arriving aircraft added yet.</td>
+        <td colspan="17">No arriving aircraft added yet.</td>
       </tr>
     `;
   } else {
@@ -2419,7 +1775,7 @@ function renderScenarioBoard() {
             data-edit-field="wptId"
             data-id="${acft.id}"
           >
-            ${buildWaypointOptionsHtml(acft.wptId)}
+            ${buildWaypointOptionsHtml(acft.wptId, false)}
           </select>
         </td>
         <td>
@@ -2472,6 +1828,25 @@ function renderScenarioBoard() {
         }</td>
         <td class="time-cell eat-cell" data-col="tEat">${eatInfo.eatDisplay}</td>
         <td class="time-cell" data-col="tEst">${eatInfo.effectiveEstDisplay}</td>
+        <td>
+          <div class="dme-cross-cell">
+            <input
+              type="number"
+              class="inline-input inline-query-dme"
+              data-edit-field="queryDme"
+              data-id="${acft.id}"
+              value="${calc.qDme}"
+              min="0"
+              max="150"
+              step="0.5"
+              title="Distance TO AYT VOR (NM)"
+            />
+            <span class="dme-single-res" data-col="dmeTo">TO AYT: ${formatTime(
+              calc.tQueryTo,
+              calc.hasHour
+            )}</span>
+          </div>
+        </td>
         <td data-col="willDelay">
           ${
             eatInfo.willDelay
@@ -2504,7 +1879,7 @@ function renderScenarioBoard() {
     });
   }
 
-  // Departures Sub-Table
+  // 2. Departures Sub-Table
   if (computedDepartures.length === 0) {
     depSection.classList.add("hidden");
     depTbody.innerHTML = "";
@@ -2531,7 +1906,7 @@ function renderScenarioBoard() {
             data-edit-field="wptId"
             data-id="${acft.id}"
           >
-            ${buildWaypointOptionsHtml(acft.wptId)}
+            ${buildWaypointOptionsHtml(acft.wptId, false)}
           </select>
         </td>
         <td>
@@ -2559,6 +1934,25 @@ function renderScenarioBoard() {
         <td class="time-cell" data-col="dep50">${formatTime(calc.t50, calc.hasHour)}</td>
         <td class="time-cell" data-col="dep60">${formatTime(calc.t60, calc.hasHour)}</td>
         <td>
+          <div class="dme-cross-cell">
+            <input
+              type="number"
+              class="inline-input inline-query-dme"
+              data-edit-field="queryDme"
+              data-id="${acft.id}"
+              value="${calc.qDme}"
+              min="0"
+              max="150"
+              step="0.5"
+              title="Distance FROM AYT VOR (NM)"
+            />
+            <span class="dme-single-res from-res" data-col="dmeFrom">FROM AYT: ${formatTime(
+              calc.tQueryFrom,
+              calc.hasHour
+            )}</span>
+          </div>
+        </td>
+        <td>
           <button type="button" class="row-del-btn" data-del-id="${acft.id}" title="Remove departure">✕</button>
         </td>
       `;
@@ -2566,7 +1960,120 @@ function renderScenarioBoard() {
     });
   }
 
-  // Wire up inline editable fields
+  // 3. Transit Sub-Table
+  if (computedTransits.length === 0) {
+    trnSection.classList.add("hidden");
+    trnTbody.innerHTML = "";
+  } else {
+    trnSection.classList.remove("hidden");
+    trnTbody.innerHTML = "";
+    computedTransits.forEach(({ acft, calc }) => {
+      const tr = document.createElement("tr");
+      tr.setAttribute("data-row-id", acft.id);
+      tr.innerHTML = `
+        <td>
+          <input
+            type="text"
+            class="inline-input inline-callsign"
+            data-edit-field="callsign"
+            data-id="${acft.id}"
+            value="${acft.callsign}"
+            maxlength="12"
+          />
+        </td>
+        <td>
+          <div class="inline-route-wrap">
+            <select
+              class="inline-select inline-wpt"
+              data-edit-field="entryWptId"
+              data-id="${acft.id}"
+              title="Entry Waypoint (TO AYT)"
+            >
+              ${buildWaypointOptionsHtml(calc.entryWptId, true)}
+            </select>
+            <span class="inline-route-vor">→ AYT VOR →</span>
+            <select
+              class="inline-select inline-wpt"
+              data-edit-field="exitWptId"
+              data-id="${acft.id}"
+              title="Exit Waypoint (FROM AYT)"
+            >
+              ${buildWaypointOptionsHtml(calc.exitWptId, true)}
+            </select>
+          </div>
+        </td>
+        <td>
+          <input
+            type="number"
+            class="inline-input inline-fl"
+            data-edit-field="fl"
+            data-id="${acft.id}"
+            value="${acft.fl || 150}"
+            step="10"
+            title="Maintained Flight Level"
+          />
+        </td>
+        <td>
+          <input
+            type="number"
+            class="inline-input inline-dist"
+            data-edit-field="dist"
+            data-id="${acft.id}"
+            value="${calc.dist}"
+            min="0"
+            max="150"
+            step="1"
+          />
+        </td>
+        <td>
+          <input
+            type="text"
+            class="inline-input inline-time"
+            data-edit-field="timeRaw"
+            data-id="${acft.id}"
+            value="${acft.timeRaw}"
+          />
+        </td>
+        <td class="time-cell" data-col="trn25To">${formatTime(calc.t25To, calc.hasHour)}</td>
+        <td class="time-cell" data-col="trn10To">${formatTime(calc.t10To, calc.hasHour)}</td>
+        <td class="time-cell eat-cell" data-col="trnVor">${formatTime(calc.tVor, calc.hasHour)}</td>
+        <td class="time-cell" data-col="trn10From">${formatTime(calc.t10From, calc.hasHour)}</td>
+        <td class="time-cell" data-col="trn25From">${formatTime(calc.t25From, calc.hasHour)}</td>
+        <td class="time-cell" data-col="trn50From">${formatTime(calc.t50From, calc.hasHour)}</td>
+        <td>
+          <div class="dme-cross-cell">
+            <input
+              type="number"
+              class="inline-input inline-query-dme"
+              data-edit-field="queryDme"
+              data-id="${acft.id}"
+              value="${calc.qDme}"
+              min="0"
+              max="150"
+              step="0.5"
+              title="Distance TO & FROM AYT VOR (NM)"
+            />
+            <div class="dme-dual-res">
+              <span class="dme-mini-tag to-tag" data-col="trnDmeTo">TO: ${formatTime(
+                calc.tQueryTo,
+                calc.hasHour
+              )}</span>
+              <span class="dme-mini-tag from-tag" data-col="trnDmeFrom">FROM: ${formatTime(
+                calc.tQueryFrom,
+                calc.hasHour
+              )}</span>
+            </div>
+          </div>
+        </td>
+        <td>
+          <button type="button" class="row-del-btn" data-del-id="${acft.id}" title="Remove transit">✕</button>
+        </td>
+      `;
+      trnTbody.appendChild(tr);
+    });
+  }
+
+  // Wire up inline editable fields across all 3 tables
   document.querySelectorAll("[data-edit-field]").forEach((inputEl) => {
     const field = inputEl.getAttribute("data-edit-field");
     const id = Number(inputEl.getAttribute("data-id"));
@@ -2579,6 +2086,12 @@ function renderScenarioBoard() {
         target.callsign = inputEl.value.toUpperCase();
       } else if (field === "wptId") {
         target.wptId = inputEl.value;
+      } else if (field === "entryWptId") {
+        target.entryWptId = inputEl.value;
+        target.route = [target.entryWptId, "AYT", target.exitWptId || "DERYA"];
+      } else if (field === "exitWptId") {
+        target.exitWptId = inputEl.value;
+        target.route = [target.entryWptId || "KUMRU", "AYT", target.exitWptId];
       } else if (field === "fl") {
         target.fl = Number(inputEl.value) || 100;
       } else if (field === "dist") {
@@ -2587,6 +2100,8 @@ function renderScenarioBoard() {
         target.timeRaw = inputEl.value;
       } else if (field === "holdMins") {
         target.holdMins = Number(inputEl.value) || 0;
+      } else if (field === "queryDme") {
+        target.queryDme = inputEl.value === "" ? 0 : Number(inputEl.value);
       }
 
       saveState();
@@ -2619,112 +2134,34 @@ function renderScenarioBoard() {
     });
   });
 
-  renderSolverPanels(solver);
+  renderConflictPanels(solver);
   renderRadarChartView(solver);
-  renderTimelineView(solver);
 }
 
-// Render Master Solver Cards, Head-On Dep<->Arr Conflicts, Radial/VOR <15 NM Conflicts, and EAT Analysis
-function renderSolverPanels(solver) {
-  const plansGridEl = document.getElementById("solverAircraftPlans");
+// Render the 3 Conflict Finder Panels (Head-On, Radial/<15 NM VOR, and Approach Sequence/EAT)
+function renderConflictPanels(solver) {
   const depArrListEl = document.getElementById("depArrConflictList");
   const radialConflictListEl = document.getElementById("radialConflictList");
   const ilsDelayListEl = document.getElementById("ilsDelayList");
-  const liveSimBadgeEl = document.getElementById("liveSimBadge");
 
-  if (liveSimBadgeEl && solver.liveSimStats) {
-    const { totalStepsChecked, totalPairChecks, maxSimultaneousInVor15 } = solver.liveSimStats;
-    liveSimBadgeEl.innerHTML = `
-      <span class="freq-pill twr-pill">⚡ LIVE SIM: <strong>${totalStepsChecked} steps (0.2m / 1 NM)</strong></span>
-      <span class="freq-pill">VOR/Radial Checks: <strong>${totalPairChecks}</strong></span>
-      <span class="freq-pill">Peak &lt;15 NM Stack: <strong>${maxSimultaneousInVor15} acft</strong></span>
-    `;
-  }
-
-  // 1. Per-Aircraft Solved Clearance Plans
-  if (solver.aircraftPlans.size === 0) {
-    plansGridEl.innerHTML = `
-      <div class="conflict-box">
-        <div class="conflict-detail">Add arrivals and/or departures above to generate the complete solved ATC altitude &amp; clearance plan.</div>
-      </div>
-    `;
-  } else {
-    plansGridEl.innerHTML = "";
-    solver.aircraftPlans.forEach((plan) => {
-      const { acft, wpt, seqNum, eatInfo, steps } = plan;
-      const card = document.createElement("div");
-      card.className = "solver-plan-card";
-
-      const badgeHtml =
-        acft.type === "DEP"
-          ? `<span class="badge badge-dep">DEPARTURE</span>`
-          : `<span class="solver-seq-badge">LANDING #${seqNum}</span>`;
-
-      const eatBadge =
-        eatInfo && eatInfo.willDelay
-          ? `<span class="badge badge-eat">EAT ${eatInfo.eatDisplay}${
-              eatInfo.initialHoldAltFt > 4000
-                ? ` • STACK ${formatAltShort(eatInfo.initialHoldAltFt)}`
-                : ""
-            }</span>`
-          : "";
-
-      card.innerHTML = `
-        <div class="solver-plan-header">
-          <div>
-            <strong style="font-family:var(--font-mono);font-size:0.96rem;">${acft.callsign}</strong>
-            <span style="font-size:0.78rem;color:var(--text-muted);margin-left:0.35rem;">
-              ${wpt.name} (${wpt.entryWpt}) • MEA ${formatAltShort(wpt.meaFt)} / MSA ${formatAltShort(wpt.msaFt)}
-            </span>
-          </div>
-          <div style="display:flex;gap:0.35rem;align-items:center;">
-            ${eatBadge}
-            ${badgeHtml}
-          </div>
-        </div>
-        <div class="solver-steps-list">
-          ${steps
-            .map(
-              (s) => `
-            <div class="solver-step-item ${
-              s.severity === "crit"
-                ? "step-crit"
-                : s.severity === "warn"
-                ? "step-warn"
-                : s.severity === "ok"
-                ? "step-ok"
-                : ""
-            }">
-              <span class="solver-step-time">${s.timeStr}</span>
-              <span class="solver-step-text">${s.text}</span>
-            </div>
-          `
-            )
-            .join("")}
-        </div>
-      `;
-      plansGridEl.appendChild(card);
-    });
-  }
-
-  // 2. Head-On Departure <-> Arrival Conflicts (Strictly Same Waypoint)
-  if (solver.depArrConflicts.length === 0) {
+  // 1. Head-On Conflicts (Same Waypoint — ARR / DEP / TRN)
+  if (solver.headOnConflicts.length === 0) {
     depArrListEl.innerHTML = `
       <div class="conflict-box">
         <div class="conflict-detail">
-          No Head-On Arrival &amp; Departure pair on the same waypoint.
+          No Head-On opposite-direction traffic pairs on the same waypoint.
         </div>
       </div>
     `;
   } else {
     depArrListEl.innerHTML = "";
-    solver.depArrConflicts.forEach((c) => {
+    solver.headOnConflicts.forEach((c) => {
       const box = document.createElement("div");
       if (c.isValidInboundConflict) {
         box.className = "conflict-box alert-danger";
         box.innerHTML = `
           <div class="conflict-top">
-            <span class="conflict-pair">🛫 ${c.depAcft.callsign} ↔ 🛬 ${c.arrAcft.callsign}</span>
+            <span class="conflict-pair">${c.outLeg.icon} ${c.outLeg.acft.callsign} ↔ ${c.inLeg.icon} ${c.inLeg.acft.callsign}</span>
             <span class="badge badge-delayed">${c.wpt.name} (${c.zone})</span>
           </div>
           <div class="conflict-metrics">
@@ -2732,18 +2169,18 @@ function renderSolverPanels(solver) {
             <div class="metric-pill when-pill">⏰ WHEN: <strong>${c.displayTime}</strong></div>
           </div>
           <div class="conflict-detail" style="color:var(--text-main);">
-            <strong>Solved Action:</strong> ${c.resolutionText}
+            ${c.conflictNote}
           </div>
         `;
       } else {
         box.className = "conflict-box alert-safe";
         box.innerHTML = `
           <div class="conflict-top">
-            <span class="conflict-pair">🛫 ${c.depAcft.callsign} ↔ 🛬 ${c.arrAcft.callsign}</span>
+            <span class="conflict-pair">${c.outLeg.icon} ${c.outLeg.acft.callsign} ↔ ${c.inLeg.icon} ${c.inLeg.acft.callsign}</span>
             <span class="badge badge-nodelay">${c.wpt.name} — CLEAR</span>
           </div>
           <div class="conflict-detail">
-            No inbound radial crossing within ${c.arrDist} NM.
+            No head-on radial crossing within the active TMA segment.
           </div>
         `;
       }
@@ -2751,52 +2188,33 @@ function renderSolverPanels(solver) {
     });
   }
 
-  // 3. Radial & VOR <15 NM Conflicts (Cross-Radial Dep<->Arr & Converging Arr<->Arr)
+  // 2. Radial, Same-Direction & <15 NM AYT VOR Conflicts
   if (radialConflictListEl) {
     radialConflictListEl.innerHTML = "";
-    const radialDeps = solver.radialDepArrConflicts || [];
-    const vorArrs = solver.vorSepConstraints || [];
+    const radList = solver.radialConflicts || [];
 
-    if (radialDeps.length === 0 && vorArrs.length === 0) {
+    if (radList.length === 0) {
       radialConflictListEl.innerHTML = `
         <div class="conflict-box">
           <div class="conflict-detail">
-            No cross-radial or &lt;15 NM VOR convergence conflicts detected.
+            No cross-radial &lt;15 NM VOR or same-corridor spacing conflicts detected.
           </div>
         </div>
       `;
     } else {
-      radialDeps.forEach((c) => {
+      radList.forEach((rc) => {
         const box = document.createElement("div");
-        box.className = "conflict-box alert-warn";
-        const arrLabel = c.arrCallsignDisplay || c.arrAcft.callsign;
+        box.className = `conflict-box ${rc.isAlert ? "alert-warn" : "alert-safe"}`;
         box.innerHTML = `
           <div class="conflict-top">
-            <span class="conflict-pair">🛫 ${c.depAcft.callsign} ↔ 🛬 ${arrLabel}</span>
-            <span class="badge badge-eat">${c.wpt.name} (${c.zone})</span>
+            <span class="conflict-pair">${rc.pairLabel}</span>
+            <span class="badge badge-eat">${rc.badgeText}</span>
           </div>
           <div class="conflict-metrics">
-            <div class="metric-pill where-pill">📍 ZONE: <strong>${c.dCross} NM</strong></div>
-            <div class="metric-pill when-pill">⏰ WINDOW: <strong>${c.displayTime}</strong></div>
+            <div class="metric-pill when-pill">⏰ WINDOW / SPACING: <strong>${rc.windowStr}</strong></div>
           </div>
           <div class="conflict-detail" style="color:var(--text-main);">
-            <strong>Solved Action:</strong> ${c.resolutionText}
-          </div>
-        `;
-        radialConflictListEl.appendChild(box);
-      });
-
-      vorArrs.forEach((vc) => {
-        const box = document.createElement("div");
-        const isAlert = !vc.type.includes("NATURAL");
-        box.className = `conflict-box ${isAlert ? "alert-warn" : "alert-safe"}`;
-        box.innerHTML = `
-          <div class="conflict-top">
-            <span class="conflict-pair">🛬 ${vc.first.acft.callsign} &amp; 🛬 ${vc.second.acft.callsign}</span>
-            <span class="badge ${isAlert ? "badge-eat" : "badge-nodelay"}">${vc.type}</span>
-          </div>
-          <div class="conflict-detail" style="color:var(--text-main);">
-            ${vc.summaryText}
+            ${rc.detailText}
           </div>
         `;
         radialConflictListEl.appendChild(box);
@@ -2804,7 +2222,7 @@ function renderSolverPanels(solver) {
     }
   }
 
-  // 4. Approach Sequence, Multi-Aircraft Hold Stack & EAT Delays
+  // 3. Approach Sequence & EAT Delays
   ilsDelayListEl.innerHTML = "";
   const delayedArrs = solver.sequencedArrivals.filter(
     (item) => solver.eatMap.get(item.acft.id)?.willDelay
@@ -2812,7 +2230,7 @@ function renderSolverPanels(solver) {
   if (solver.sequencedArrivals.length === 0) {
     ilsDelayListEl.innerHTML = `
       <div class="conflict-box">
-        <div class="conflict-detail">Add arriving aircraft to see approach sequencing, holding stack altitudes, and EAT calculations.</div>
+        <div class="conflict-detail">Add arriving aircraft to see approach sequencing and EAT calculations.</div>
       </div>
     `;
   } else if (delayedArrs.length === 0) {
@@ -2832,31 +2250,21 @@ function renderSolverPanels(solver) {
       const eatInfo = solver.eatMap.get(item.acft.id);
       const box = document.createElement("div");
       box.className = "conflict-box alert-danger";
-      const stepDownHtml =
-        eatInfo.holdStepDowns && eatInfo.holdStepDowns.length > 0
-          ? `<br/>→ <strong>Hold Stack Entry: ${formatAlt(
-              eatInfo.initialHoldAltFt
-            )}</strong> • Step-downs: ${eatInfo.holdStepDowns
-              .map((sd) => `<code>${sd.timeStr}</code> → <strong>${formatAlt(sd.altFt)}</strong>`)
-              .join(", ")}`
-          : `<br/>→ <strong>Hold / Approach Altitude before EAT: ${formatAlt(
-              eatInfo.initialHoldAltFt
-            )}</strong>`;
 
       box.innerHTML = `
         <div class="conflict-top">
           <span class="conflict-pair">⏳ ${item.acft.callsign} (${item.wpt.name}) — EAT: ${eatInfo.eatDisplay}</span>
           <span class="badge badge-delayed">${
             eatInfo.autoHoldMins > 0 ? `HOLDS ${eatInfo.autoHoldMins}m` : "NO HOLD NEEDED"
-          } • ${formatAltShort(eatInfo.initialHoldAltFt)}</span>
+          }</span>
         </div>
         <div class="conflict-detail" style="color:var(--text-main);">
-          Would reach ILS clearance point at <code>${formatTime(
+          Reaches ILS clearance point at <code>${formatTime(
             item.calc.tClearBase,
             item.calc.hasHour
-          )}</code>, but <strong>#${eatInfo.seqNum - 1} ${
+          )}</code>, while <strong>#${eatInfo.seqNum - 1} ${
         eatInfo.blockedBy.acft.callsign
-      }</strong> is not established until <code>${eatInfo.eatDisplay}</code>.${stepDownHtml}<br/>
+      }</strong> is not established until <code>${eatInfo.eatDisplay}</code>.<br/>
           → <strong>EAT = ${eatInfo.eatDisplay}</strong> (${
         eatInfo.clearancePhaseNote
       }) → Established at <code>${eatInfo.effectiveEstDisplay}</code>.
@@ -2897,17 +2305,10 @@ function renderStaticSvgCorridors() {
       <text x="${pSpec.x}" y="${pSpec.y}" class="chart-spec">${wpt.radial} • ${wpt.fl}</text>
     `;
 
-    g.addEventListener("click", () => {
-      state.selectedWpt = wpt.id;
-      renderWaypointGrid();
-      renderLivePreview();
-    });
-
     layer.appendChild(g);
   });
 }
 
-// Helper: find nearest point on a rectangle's perimeter to point (px, py)
 function getRectPerimeterAnchor(px, py, rx, ry, rw, rh) {
   const cx = rx + rw / 2;
   const cy = ry + rh / 2;
@@ -2927,7 +2328,6 @@ function getRectPerimeterAnchor(px, py, rx, ry, rw, rh) {
   };
 }
 
-// Helper: check if two rectangles overlap (with padding)
 function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh, pad = 8) {
   return (
     ax < bx + bw + pad &&
@@ -2937,7 +2337,6 @@ function rectsOverlap(ax, ay, aw, ah, bx, by, bw, bh, pad = 8) {
   );
 }
 
-// Helper: check if two line segments (p1->p2) and (p3->p4) intersect
 function segmentsIntersect(p1x, p1y, p2x, p2y, p3x, p3y, p4x, p4y) {
   const ccw = (ax, ay, bx, by, cx, cy) =>
     (cy - ay) * (bx - ax) > (by - ay) * (cx - ax);
@@ -2947,7 +2346,6 @@ function segmentsIntersect(p1x, p1y, p2x, p2y, p3x, p3y, p4x, p4y) {
   );
 }
 
-// Compute guaranteed non-overlapping callsign tag positions around radar blips
 function computeNonOverlappingTagPositions(visibleBlips) {
   const TAG_W = 88;
   const TAG_H = 30;
@@ -2959,15 +2357,12 @@ function computeNonOverlappingTagPositions(visibleBlips) {
   const MAX_Y = 850 - TAG_H;
 
   const placedTags = [];
-
-  // Angle offsets (in degrees) from preferred outward direction
   const angleSteps = [
     0, 25, -25, 50, -50, 75, -75, 100, -100, 125, -125, 150, -150, 180,
   ];
   const radii = [46, 68, 92, 118, 146, 176, 210];
 
   visibleBlips.forEach((b, idx) => {
-    // Preferred outward direction away from chart center (430, 430)
     const dxCenter = b.x - SVG_CENTER_X;
     const dyCenter = b.y - SVG_CENTER_Y;
     const baseAngleRad =
@@ -2986,7 +2381,6 @@ function computeNonOverlappingTagPositions(visibleBlips) {
         const tx = Math.max(MIN_X, Math.min(MAX_X, centerX - TAG_W / 2));
         const ty = Math.max(MIN_Y, Math.min(MAX_Y, centerY - TAG_H / 2));
 
-        // 1. Check collision with already placed tags
         let overlapsTag = false;
         for (const pt of placedTags) {
           if (rectsOverlap(tx, ty, TAG_W, TAG_H, pt.tx, pt.ty, TAG_W, TAG_H, PAD)) {
@@ -2996,7 +2390,6 @@ function computeNonOverlappingTagPositions(visibleBlips) {
         }
         if (overlapsTag) continue;
 
-        // 2. Check collision with any visible blip diamond
         let overlapsBlip = false;
         for (const otherBlip of visibleBlips) {
           if (
@@ -3018,7 +2411,6 @@ function computeNonOverlappingTagPositions(visibleBlips) {
         }
         if (overlapsBlip) continue;
 
-        // 3. Score candidate by distance and leader-line crossings
         const anchor = getRectPerimeterAnchor(b.x, b.y, tx, ty, TAG_W, TAG_H);
         let lineCrossPenalty = 0;
         for (const pt of placedTags) {
@@ -3048,7 +2440,6 @@ function computeNonOverlappingTagPositions(visibleBlips) {
     }
 
     if (!bestCandidate) {
-      // Fallback position before relaxation pass
       bestCandidate = {
         tx: Math.max(MIN_X, Math.min(MAX_X, b.x + 28)),
         ty: Math.max(MIN_Y, Math.min(MAX_Y, b.y - 36 - idx * 38)),
@@ -3076,7 +2467,6 @@ function computeNonOverlappingTagPositions(visibleBlips) {
     });
   });
 
-  // Final Iterative Separation Pass to guarantee 0% overlap under all scenarios
   for (let iter = 0; iter < 50; iter++) {
     let moved = false;
     for (let i = 0; i < placedTags.length; i++) {
@@ -3103,7 +2493,6 @@ function computeNonOverlappingTagPositions(visibleBlips) {
     if (!moved) break;
   }
 
-  // Recompute exact perimeter anchor points after any relaxation adjustments
   placedTags.forEach((pt) => {
     const anchor = getRectPerimeterAnchor(pt.bx, pt.by, pt.tx, pt.ty, pt.w, pt.h);
     pt.anchorX = anchor.x;
@@ -3123,9 +2512,12 @@ function renderRadarChartView(solver) {
 
   if (!blipsLayer || !listEl) return;
 
-  const allItems = [...solver.computedArrivals, ...solver.computedDepartures];
+  const allItems = [
+    ...solver.computedArrivals,
+    ...solver.computedDepartures,
+    ...solver.computedTransits,
+  ];
 
-  // Update slider bounds based on scenario start/end times
   if (allItems.length > 0 && slider) {
     const minT = Math.min(
       ...allItems.map((it) => (it.acft.type === "DEP" ? it.normDep : it.normInit))
@@ -3134,6 +2526,8 @@ function renderRadarChartView(solver) {
       ...allItems.map((it) =>
         it.acft.type === "DEP"
           ? it.norm60
+          : it.acft.type === "TRN"
+          ? it.norm60From || it.normVor + 12
           : solver.eatMap.get(it.acft.id)?.effectiveEstNorm + 2 || it.normInit + 25
       )
     );
@@ -3166,20 +2560,26 @@ function renderRadarChartView(solver) {
 
   allItems.forEach((item) => {
     const st = getAircraftStateAtTime(item, solver, queryNorm);
+    const wptLabel =
+      item.acft.type === "TRN"
+        ? `${item.entryWpt.name}→${item.exitWpt.name}`
+        : item.wpt.name;
 
-    // 1. Add to Sidebar list
+    const badgeClass =
+      item.acft.type === "DEP"
+        ? "badge-dep"
+        : item.acft.type === "TRN"
+        ? "badge-trn"
+        : item.calc.straightIn
+        ? "badge-straight"
+        : "badge-normal";
+
     const row = document.createElement("div");
     row.className = "snapshot-item";
     row.innerHTML = `
       <div class="snapshot-top">
         <span class="callsign-cell">${item.acft.callsign}</span>
-        <span class="badge ${
-          item.acft.type === "DEP"
-            ? "badge-dep"
-            : item.calc.straightIn
-            ? "badge-straight"
-            : "badge-normal"
-        }">${item.wpt.name} • ${st.altStr}</span>
+        <span class="badge ${badgeClass}">${wptLabel} • ${st.altStr}</span>
       </div>
       <div class="snapshot-status" style="color: ${st.color}">${st.text}</div>
     `;
@@ -3195,27 +2595,21 @@ function renderRadarChartView(solver) {
     }
   });
 
-  // Compute non-overlapping callsign tag positions & connecting line anchors
   const tagPlacements = computeNonOverlappingTagPositions(visibleBlips);
 
-  // First pass: draw connecting leader lines, velocity vectors, and radar target diamonds
   visibleBlips.forEach(({ st }, i) => {
     const tag = tagPlacements[i];
     const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
     g.innerHTML = `
-      <!-- Connecting Line from Blip to Callsign Tag -->
       <line x1="${st.x}" y1="${st.y}" x2="${tag.anchorX}" y2="${tag.anchorY}" stroke="${st.color}" stroke-width="1.5" opacity="0.9" />
       <circle cx="${tag.anchorX}" cy="${tag.anchorY}" r="2.2" fill="${st.color}" />
-      <!-- Velocity Leader Vector -->
       <line x1="${st.x}" y1="${st.y}" x2="${st.tipX}" y2="${st.tipY}" stroke="${st.color}" stroke-width="2.2" />
-      <!-- Radar Target Blip (Diamond + Center Dot) -->
       <rect x="${st.x - 5}" y="${st.y - 5}" width="10" height="10" fill="#0b111e" stroke="${st.color}" stroke-width="2.2" transform="rotate(45 ${st.x} ${st.y})" />
       <circle cx="${st.x}" cy="${st.y}" r="2" fill="${st.color}" />
     `;
     blipsLayer.appendChild(g);
   });
 
-  // Second pass: draw callsign tag boxes on top so no line ever obscures tag text
   visibleBlips.forEach(({ item, st }, i) => {
     const tag = tagPlacements[i];
     const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
@@ -3229,137 +2623,16 @@ function renderRadarChartView(solver) {
 }
 
 // ============================================================================
-// VIEW 3: SCENARIO TIME VIEW (GANTT + CHRONOLOGICAL ATC CLEARANCE SCRIPT)
-// ============================================================================
-function renderTimelineView(solver) {
-  const ganttEl = document.getElementById("ganttContainer");
-  const scriptEl = document.getElementById("masterTimelineScript");
-  if (!ganttEl || !scriptEl) return;
-
-  const allItems = [...solver.computedArrivals, ...solver.computedDepartures];
-  if (allItems.length === 0) {
-    ganttEl.innerHTML = `<div style="color:var(--text-muted);font-size:0.84rem;">Add traffic in the Calculator tab to view the visual timeline and master ATC script.</div>`;
-    scriptEl.innerHTML = "";
-    return;
-  }
-
-  // 1. Visual Gantt Chart
-  const minT = Math.min(
-    ...allItems.map((it) => (it.acft.type === "DEP" ? it.normDep : it.normInit))
-  );
-  const maxT = Math.max(
-    ...allItems.map((it) =>
-      it.acft.type === "DEP"
-        ? it.norm60
-        : solver.eatMap.get(it.acft.id)?.effectiveEstNorm || it.normInit + 20
-    )
-  );
-  const span = Math.max(10, maxT - minT);
-
-  const pct = (t) => Math.max(0, Math.min(100, ((t - minT) / span) * 100));
-
-  ganttEl.innerHTML = "";
-  solver.sequencedArrivals.forEach((item) => {
-    const eatInfo = solver.eatMap.get(item.acft.id);
-    const tInit = item.normInit;
-    const tClear = eatInfo.willDelay ? eatInfo.eatNorm : item.normClearBase;
-    const tEst = eatInfo.effectiveEstNorm;
-
-    const row = document.createElement("div");
-    row.className = "gantt-row";
-
-    const leftEnroute = pct(tInit);
-    const widthEnroute = Math.max(1, pct(tClear) - leftEnroute);
-    const leftIls = pct(tClear);
-    const widthIls = Math.max(2, pct(tEst) - leftIls);
-
-    row.innerHTML = `
-      <div class="gantt-label">#${eatInfo.seqNum} ${item.acft.callsign} <span style="color:var(--text-muted);font-weight:500;">(${item.wpt.name})</span></div>
-      <div class="gantt-track">
-        <div class="gantt-seg" style="left:${leftEnroute}%;width:${widthEnroute}%;background:#38bdf8;" title="Inbound (${formatTime(
-      item.calc.tInit,
-      item.calc.hasHour
-    )} → ${
-      eatInfo.willDelay ? eatInfo.eatDisplay : formatTime(item.calc.tClearBase, item.calc.hasHour)
-    })">
-          Inbound
-        </div>
-        <div class="gantt-seg" style="left:${leftIls}%;width:${widthIls}%;background:#34d399;" title="ILS Cleared → Established (${
-      eatInfo.effectiveEstDisplay
-    })">
-          ILS (${eatInfo.effectiveEstDisplay})
-        </div>
-      </div>
-    `;
-    ganttEl.appendChild(row);
-  });
-
-  solver.computedDepartures.forEach((dep) => {
-    const leftDep = pct(dep.normDep);
-    const widthDep = Math.max(2, pct(dep.norm60) - leftDep);
-    const row = document.createElement("div");
-    row.className = "gantt-row";
-    row.innerHTML = `
-      <div class="gantt-label">🛫 ${dep.acft.callsign} <span style="color:var(--text-muted);font-weight:500;">(${dep.wpt.name})</span></div>
-      <div class="gantt-track">
-        <div class="gantt-seg" style="left:${leftDep}%;width:${widthDep}%;background:#fbbf24;" title="Outbound 0→60 NM">
-          Outbound 0→60 NM
-        </div>
-      </div>
-    `;
-    ganttEl.appendChild(row);
-  });
-
-  // 2. Collect all solved steps across all aircraft and sort chronologically
-  const allScriptEvents = [];
-  solver.aircraftPlans.forEach((plan) => {
-    plan.steps.forEach((st) => {
-      allScriptEvents.push({
-        timeNorm: st.timeNorm,
-        timeStr: st.timeStr,
-        severity: st.severity,
-        callsign: plan.acft.callsign,
-        wptName: plan.wpt.name,
-        text: st.text,
-      });
-    });
-  });
-
-  allScriptEvents.sort((a, b) => a.timeNorm - b.timeNorm);
-
-  scriptEl.innerHTML = "";
-  allScriptEvents.forEach((ev) => {
-    const row = document.createElement("div");
-    row.className = "script-row";
-    const color =
-      ev.severity === "crit"
-        ? "var(--accent-red)"
-        : ev.severity === "warn"
-        ? "var(--accent-amber)"
-        : ev.severity === "ok"
-        ? "var(--accent-green)"
-        : "var(--accent-blue)";
-
-    row.innerHTML = `
-      <div class="script-time" style="color:${color}">${ev.timeStr}</div>
-      <div class="script-body"><strong>${ev.callsign} (${ev.wptName})</strong>: ${ev.text}</div>
-    `;
-    scriptEl.appendChild(row);
-  });
-}
-
-// ============================================================================
 // INITIALIZE APP & EVENT LISTENERS
 // ============================================================================
 function initApp() {
   loadSavedState();
   renderStaticSvgCorridors();
 
-  // Main View Tabs (Calculator & Solver | Chart & Blips | Scenario Time View)
+  // Main View Tabs (Calculator & Conflicts | Chart & Blips)
   const viewTabs = document.querySelectorAll(".view-tab");
   const viewCalc = document.getElementById("viewCalc");
   const viewChart = document.getElementById("viewChart");
-  const viewTimeline = document.getElementById("viewTimeline");
 
   viewTabs.forEach((tab) => {
     tab.addEventListener("click", () => {
@@ -3371,7 +2644,6 @@ function initApp() {
       });
       viewCalc.classList.toggle("hidden", targetView !== "calc");
       viewChart.classList.toggle("hidden", targetView !== "chart");
-      viewTimeline.classList.toggle("hidden", targetView !== "timeline");
       renderScenarioBoard();
     });
   });
@@ -3395,6 +2667,9 @@ function initApp() {
 
   const wizBtnArr = document.getElementById("wizBtnArr");
   const wizBtnDep = document.getElementById("wizBtnDep");
+  const wizBtnTrn = document.getElementById("wizBtnTrn");
+  const btnResetTransitRoute = document.getElementById("btnResetTransitRoute");
+
   const wizCallsignLabel = document.getElementById("wizCallsignLabel");
   const wizFlLabel = document.getElementById("wizFlLabel");
   const wizWptLabel = document.getElementById("wizWptLabel");
@@ -3406,17 +2681,67 @@ function initApp() {
   const inputFl = document.getElementById("inputFl");
   const inputDist = document.getElementById("inputDist");
   const inputTime = document.getElementById("inputTime");
+  const globalQueryDmeInput = document.getElementById("globalQueryDmeInput");
+
+  if (globalQueryDmeInput) {
+    globalQueryDmeInput.value = state.globalQueryDme;
+    globalQueryDmeInput.addEventListener("input", () => {
+      const val = globalQueryDmeInput.value === "" ? 0 : Number(globalQueryDmeInput.value);
+      state.globalQueryDme = val;
+      state.aircraftList.forEach((a) => {
+        a.queryDme = val;
+      });
+      saveState();
+      renderLivePreview();
+      renderScenarioBoard();
+    });
+  }
+
+  document.querySelectorAll(".global-dme-step").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const step = Number(btn.getAttribute("data-dme-step"));
+      const cur = Number(globalQueryDmeInput.value) || 0;
+      const nextVal = Math.max(0, Math.min(150, cur + step));
+      globalQueryDmeInput.value = nextVal;
+      state.globalQueryDme = nextVal;
+      state.aircraftList.forEach((a) => {
+        a.queryDme = nextVal;
+      });
+      saveState();
+      renderLivePreview();
+      renderScenarioBoard();
+    });
+  });
+
+  if (btnResetTransitRoute) {
+    btnResetTransitRoute.addEventListener("click", () => {
+      state.transitRoute = [];
+      renderWaypointGrid();
+      renderLivePreview();
+    });
+  }
 
   function getStepMetaList() {
-    const isDep = state.flightType === "DEP";
     const cs = state.inputCallsign.trim().toUpperCase() || "—";
-    if (isDep) {
+    if (state.flightType === "DEP") {
       return [
         { key: "TYPE", title: "Type", val: "🛫 DEP" },
         { key: "CALLSIGN", title: "1. Callsign", val: cs },
         { key: "FL", title: "2. FL", val: `FL${state.selectedFl}` },
         { key: "TIME", title: "3. Time", val: state.inputTimeRaw || "00" },
         { key: "WPT", title: "4. WPT", val: state.selectedWpt },
+      ];
+    }
+    if (state.flightType === "TRN") {
+      const routeShort =
+        state.transitRoute.length > 0 ? state.transitRoute.join("→") : "Select Route";
+      return [
+        { key: "TYPE", title: "Type", val: "✈️ TRN" },
+        { key: "CALLSIGN", title: "1. Callsign", val: cs },
+        { key: "FL", title: "2. Maint FL", val: `FL${state.selectedFl}` },
+        { key: "DIST", title: "3. Dist", val: `${state.selectedDist} NM` },
+        { key: "WPT", title: "4. Route", val: routeShort },
+        { key: "TIME", title: "5. Report Time", val: state.inputTimeRaw || "00" },
       ];
     }
     return [
@@ -3431,23 +2756,42 @@ function initApp() {
 
   function submitWizardAircraft() {
     const isDep = state.flightType === "DEP";
-    const defaultPrefix = isDep ? "DEP" : "ACFT";
+    const isTrn = state.flightType === "TRN";
+    const defaultPrefix = isDep ? "DEP" : isTrn ? "TRN" : "ACFT";
     const callsign =
       state.inputCallsign.trim().toUpperCase() || `${defaultPrefix} ${state.nextId}`;
 
-    state.aircraftList.push({
-      id: state.nextId++,
-      type: state.flightType,
-      callsign,
-      wptId: state.selectedWpt,
-      fl: Number(inputFl.value) || state.selectedFl || 250,
-      dist: isDep ? 0 : Number(inputDist.value) || 60,
-      timeRaw: inputTime.value.trim() || "00",
-      mode: "auto",
-      holdMins: 0,
-    });
+    if (isTrn) {
+      const endpoints = normalizeTransitEndpoints({ route: state.transitRoute });
+      state.aircraftList.push({
+        id: state.nextId++,
+        type: "TRN",
+        callsign,
+        wptId: endpoints.entryWptId,
+        entryWptId: endpoints.entryWptId,
+        exitWptId: endpoints.exitWptId,
+        route: [endpoints.entryWptId, "AYT", endpoints.exitWptId],
+        fl: Number(inputFl.value) || state.selectedFl || 150,
+        dist: Number(inputDist.value) || 60,
+        timeRaw: inputTime.value.trim() || "00",
+        queryDme: state.globalQueryDme,
+        holdMins: 0,
+      });
+    } else {
+      state.aircraftList.push({
+        id: state.nextId++,
+        type: state.flightType,
+        callsign,
+        wptId: state.selectedWpt,
+        fl: Number(inputFl.value) || state.selectedFl || 250,
+        dist: isDep ? 0 : Number(inputDist.value) || 60,
+        timeRaw: inputTime.value.trim() || "00",
+        mode: "auto",
+        queryDme: state.globalQueryDme,
+        holdMins: 0,
+      });
+    }
 
-    // Reset wizard back to closed launcher bar
     state.inputCallsign = "";
     inputCallsign.value = "";
     state.wizardOpen = false;
@@ -3465,6 +2809,7 @@ function initApp() {
     if (!state.wizardOpen) return;
 
     const isDep = state.flightType === "DEP";
+    const isTrn = state.flightType === "TRN";
     const steps = getWizardStepOrder(state.flightType);
     if (state.wizardStepIdx < 0) state.wizardStepIdx = 0;
     if (state.wizardStepIdx >= steps.length) state.wizardStepIdx = steps.length - 1;
@@ -3472,7 +2817,6 @@ function initApp() {
     const currentKey = steps[state.wizardStepIdx];
     const metaList = getStepMetaList();
 
-    // Render step breadcrumb pills
     wizardStepPills.innerHTML = "";
     metaList.forEach((m, idx) => {
       const pill = document.createElement("button");
@@ -3482,7 +2826,7 @@ function initApp() {
       pill.className = `wiz-pill ${isDone ? "done" : ""} ${isActive ? "active" : ""}`;
       pill.innerHTML =
         idx === 0 && state.wizardStepIdx === 0
-          ? `<span>ARR / DEP</span>`
+          ? `<span>ARR / DEP / TRN</span>`
           : isDone || isActive
           ? `<span>${m.title}:</span> <strong>${m.val}</strong>`
           : `<span>${m.title}</span>`;
@@ -3493,7 +2837,6 @@ function initApp() {
       wizardStepPills.appendChild(pill);
     });
 
-    // Show only the active step pane
     wizStepType.classList.toggle("hidden", currentKey !== "TYPE");
     wizStepCallsign.classList.toggle("hidden", currentKey !== "CALLSIGN");
     wizStepFl.classList.toggle("hidden", currentKey !== "FL");
@@ -3501,38 +2844,46 @@ function initApp() {
     wizStepWpt.classList.toggle("hidden", currentKey !== "WPT");
     wizStepTime.classList.toggle("hidden", currentKey !== "TIME");
 
-    // Dynamic prompt titles & action buttons for ARR vs DEP
     wizCallsignLabel.textContent = isDep
       ? "Step 1 of 4 (Departure) — Enter Aircraft Callsign"
+      : isTrn
+      ? "Step 1 of 5 (Transit) — Enter Aircraft Callsign"
       : "Step 1 of 5 (Arrival) — Enter Aircraft Callsign";
 
     wizFlLabel.textContent = isDep
       ? "Step 2 of 4 (Departure) — Enter Requested Flight Level (FL)"
+      : isTrn
+      ? "Step 2 of 5 (Transit) — Enter Maintained Flight Level (FL)"
       : "Step 2 of 5 (Arrival) — Enter Initial Flight Level (FL)";
 
     wizWptLabel.textContent = isDep
       ? "Step 4 of 4 (Departure) — Select Departure Waypoint (WPT)"
+      : isTrn
+      ? "Step 4 of 5 (Transit) — Select Route (All Waypoints + AYT VOR)"
       : "Step 4 of 5 (Arrival) — Select Entry Waypoint (Auto Normal / Straight-In)";
 
     wizTimeLabel.innerHTML = isDep
       ? `Step 3 of 4 (Departure) — Enter Departure Time at 0 NM <span class="hint">(e.g. <code>02</code> or <code>10:02</code>)</span>`
+      : isTrn
+      ? `Step 5 of 5 (Transit) — Enter Entry Report Time at ${state.selectedDist} NM <span class="hint">(e.g. <code>03</code> or <code>10:03</code>)</span>`
       : `Step 5 of 5 (Arrival) — Enter Report Time at ${state.selectedDist} NM <span class="hint">(e.g. <code>01</code>, <code>05</code>, or <code>10:05</code>)</span>`;
 
-    // Waypoint step button: for ARR it goes to Step 5 (Time); for DEP it is the final Submit button!
     if (isDep) {
-      wizWptActionBtn.classList.add("dep-mode");
+      wizWptActionBtn.className = "primary-btn dep-mode";
       wizWptActionBtn.innerHTML = `<span>✅ Add Departure to Scenario (Enter)</span>`;
     } else {
-      wizWptActionBtn.classList.remove("dep-mode");
+      wizWptActionBtn.className = "primary-btn";
       wizWptActionBtn.innerHTML = `<span>Next: Report Time → (Enter)</span>`;
     }
 
-    // Time step button: forDEP it goes to Step 4 (WPT); for ARR it is the final Submit button!
     if (isDep) {
-      wizTimeActionBtn.classList.remove("dep-mode");
+      wizTimeActionBtn.className = "primary-btn";
       wizTimeActionBtn.innerHTML = `<span>Next: Waypoint → (Enter)</span>`;
+    } else if (isTrn) {
+      wizTimeActionBtn.className = "primary-btn trn-mode";
+      wizTimeActionBtn.innerHTML = `<span>✅ Add Transit to Scenario (Enter)</span>`;
     } else {
-      wizTimeActionBtn.classList.remove("dep-mode");
+      wizTimeActionBtn.className = "primary-btn";
       wizTimeActionBtn.innerHTML = `<span>✅ Add Arrival to Scenario (Enter)</span>`;
     }
 
@@ -3582,7 +2933,7 @@ function initApp() {
 
   btnOpenNewPlane.addEventListener("click", () => {
     state.wizardOpen = true;
-    state.wizardStepIdx = 0; // Start at ARR or DEP prompt
+    state.wizardStepIdx = 0;
     state.inputCallsign = "";
     inputCallsign.value = "";
     state.selectedDist = 60;
@@ -3599,15 +2950,30 @@ function initApp() {
     state.flightType = "ARR";
     state.selectedDist = 60;
     inputDist.value = 60;
-    state.wizardStepIdx = 1; // Advance to Callsign
+    state.wizardStepIdx = 1;
     syncWizardUI(true);
   });
 
   wizBtnDep.addEventListener("click", () => {
     state.flightType = "DEP";
-    state.wizardStepIdx = 1; // Advance to Callsign
+    state.wizardStepIdx = 1;
     syncWizardUI(true);
   });
+
+  if (wizBtnTrn) {
+    wizBtnTrn.addEventListener("click", () => {
+      state.flightType = "TRN";
+      state.selectedDist = 60;
+      inputDist.value = 60;
+      state.selectedFl = 150;
+      inputFl.value = 150;
+      if (!state.transitRoute || state.transitRoute.length === 0) {
+        state.transitRoute = ["KUMRU", "AYT", "DERYA"];
+      }
+      state.wizardStepIdx = 1;
+      syncWizardUI(true);
+    });
+  }
 
   document.querySelectorAll(".wiz-back-btn").forEach((btn) => {
     btn.addEventListener("click", prevWizardStep);
@@ -3626,14 +2992,13 @@ function initApp() {
   });
 
   wizTimeActionBtn.addEventListener("click", () => {
-    if (state.flightType === "ARR") {
+    if (state.flightType === "ARR" || state.flightType === "TRN") {
       submitWizardAircraft();
     } else {
       advanceWizardStep();
     }
   });
 
-  // Allow pressing Enter inside any wizard input to advance to the next prompt (or submit on final step)
   [inputCallsign, inputFl, inputDist, inputTime].forEach((inp) => {
     inp.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
@@ -3663,7 +3028,6 @@ function initApp() {
     updateRwyUI();
   });
 
-  // Flight Level Input & Step/Preset Buttons
   inputFl.addEventListener("input", () => {
     state.selectedFl = Number(inputFl.value) || 100;
     syncWizardUI(false);
@@ -3689,7 +3053,6 @@ function initApp() {
     });
   });
 
-  // Distance Input & Step/Preset Buttons (-5, -1, +1, +5)
   inputDist.addEventListener("input", () => {
     state.selectedDist = Number(inputDist.value) || 0;
     syncWizardUI(false);
@@ -3715,7 +3078,6 @@ function initApp() {
     });
   });
 
-  // Time Input & Step Buttons (-5m, -1m, +1m, +5m)
   inputTime.addEventListener("input", () => {
     state.inputTimeRaw = inputTime.value;
     syncWizardUI(false);
@@ -3736,31 +3098,18 @@ function initApp() {
     });
   });
 
-  // Callsign Input
   inputCallsign.addEventListener("input", () => {
     state.inputCallsign = inputCallsign.value;
     syncWizardUI(false);
   });
 
-  // Auto-Sequence by Solver Button
-  document.getElementById("btnApplySolverOrder").addEventListener("click", () => {
-    const solver = solveScenario(state.aircraftList, state.activeRwy);
-    const orderedIds = solver.sequencedArrivals.map((s) => s.acft.id);
-    state.aircraftList.sort((a, b) => {
-      if (a.type !== b.type) return a.type === "ARR" ? -1 : 1;
-      if (a.type === "ARR") {
-        return orderedIds.indexOf(a.id) - orderedIds.indexOf(b.id);
-      }
-      return a.id - b.id;
-    });
-    saveState();
-    renderScenarioBoard();
-  });
-
   document.getElementById("btnSortByEst").addEventListener("click", () => {
-    const solver = solveScenario(state.aircraftList, state.activeRwy);
+    const solver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
     state.aircraftList.sort((a, b) => {
-      if (a.type !== b.type) return a.type === "ARR" ? -1 : 1;
+      if (a.type !== b.type) {
+        const order = { ARR: 0, DEP: 1, TRN: 2 };
+        return (order[a.type] ?? 0) - (order[b.type] ?? 0);
+      }
       if (a.type === "ARR") {
         const ea = solver.eatMap.get(a.id)?.effectiveEstNorm || 0;
         const eb = solver.eatMap.get(b.id)?.effectiveEstNorm || 0;
@@ -3799,7 +3148,7 @@ function initApp() {
   const btnPlayRadar = document.getElementById("btnPlayRadar");
 
   function setRadarTimeFromMinutes(normMins) {
-    const solver = solveScenario(state.aircraftList, state.activeRwy);
+    const solver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
     const disp = denormalizeTime(normMins, solver.useHasHour, solver.refHour);
     if (solver.useHasHour) {
       lookupTimeInput.value = formatTime(disp, true);
@@ -3813,7 +3162,7 @@ function initApp() {
 
   lookupTimeInput.addEventListener("input", () => {
     state.lookupTimeRaw = lookupTimeInput.value;
-    const solver = solveScenario(state.aircraftList, state.activeRwy);
+    const solver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
     const p = parseTimeInput(state.lookupTimeRaw);
     const norm = normalizeTime(p.totalMinutes, p.hasHour, solver.refHour);
     if (radarTimeSlider) radarTimeSlider.value = norm;
@@ -3822,14 +3171,14 @@ function initApp() {
 
   if (radarTimeSlider) {
     radarTimeSlider.addEventListener("input", () => {
-      setRadarTimeFromMinutes( parseFloat(radarTimeSlider.value) );
+      setRadarTimeFromMinutes(parseFloat(radarTimeSlider.value));
     });
   }
 
   document.querySelectorAll(".lookup-step").forEach((btn) => {
     btn.addEventListener("click", () => {
       const step = Number(btn.getAttribute("data-step"));
-      const solver = solveScenario(state.aircraftList, state.activeRwy);
+      const solver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
       const parsed = parseTimeInput(lookupTimeInput.value);
       const norm = normalizeTime(parsed.totalMinutes, parsed.hasHour, solver.refHour);
       setRadarTimeFromMinutes(Math.max(0, norm + step));

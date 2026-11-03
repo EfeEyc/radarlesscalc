@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>AYT TMA Radarless Calculator &amp; Master Solver</title>
-  <link rel="stylesheet" href="styles.css?v=20261021b" />
+  <title>AYT TMA Radarless Calculator &amp; Conflict Finder</title>
+  <link rel="stylesheet" href="styles.css?v=20261103a" />
 </head>
 <body>
   <main class="container">
@@ -22,13 +22,10 @@
 
       <div class="main-view-tabs" role="tablist" aria-label="Main Views">
         <button type="button" class="view-tab active" data-view="calc" role="tab" aria-selected="true">
-          🧮 Calculator &amp; Solver
+          🧮 Calculator &amp; Conflicts
         </button>
         <button type="button" class="view-tab" data-view="chart" role="tab" aria-selected="false">
           📡 Chart &amp; Blips View
-        </button>
-        <button type="button" class="view-tab" data-view="timeline" role="tab" aria-selected="false">
-          ⏱️ Scenario Time View
         </button>
       </div>
     </div>
@@ -63,9 +60,9 @@
             </button>
           </div>
 
-          <!-- STEP 0: ARR OR DEP -->
+          <!-- STEP 0: ARR, DEP OR TRANSIT -->
           <div id="wizStepType" class="wizard-step-pane">
-            <div class="wizard-prompt-title">Step 1 — Select Traffic Type: Arrival or Departure?</div>
+            <div class="wizard-prompt-title">Step 1 — Select Traffic Type: Arrival, Departure, or Transit?</div>
             <div class="wizard-type-grid">
               <button type="button" id="wizBtnArr" class="wizard-type-card arr-card">
                 <span class="wiz-type-icon">🛬</span>
@@ -76,6 +73,11 @@
                 <span class="wiz-type-icon">🛫</span>
                 <span class="wiz-type-name">Departure (DEP)</span>
                 <span class="wiz-type-flow">Callsign → FL → Time (0 NM) → Waypoint</span>
+              </button>
+              <button type="button" id="wizBtnTrn" class="wizard-type-card trn-card">
+                <span class="wiz-type-icon">✈️</span>
+                <span class="wiz-type-name">Transit (TRN)</span>
+                <span class="wiz-type-flow">Callsign → Maintained FL → Dist → Route (WPTs + AYT VOR) → Time</span>
               </button>
             </div>
           </div>
@@ -171,10 +173,25 @@
             </div>
           </div>
 
-          <!-- STEP: WAYPOINT (ARR STEP 4 / DEP STEP 4) -->
+          <!-- STEP: WAYPOINT / TRANSIT ROUTE -->
           <div id="wizStepWpt" class="wizard-step-pane hidden">
             <div class="wizard-prompt-title" id="wizWptLabel">
               Select Waypoint / Fix (Auto Normal / Straight-In)
+            </div>
+            <!-- Shown when flightType === 'TRN' -->
+            <div id="transitRouteBuilder" class="transit-route-builder hidden">
+              <div class="transit-route-bar">
+                <span class="route-bar-label">Selected Route:</span>
+                <div id="transitRouteChips" class="transit-route-chips">
+                  <!-- Populated by JS -->
+                </div>
+                <button type="button" id="btnResetTransitRoute" class="small-btn danger-btn">
+                  ⌫ Clear Route
+                </button>
+              </div>
+              <div class="route-hint">
+                Click waypoints in order to build the route (e.g. <strong>Entry WPT → AYT VOR → Exit WPT</strong>). All waypoints including <strong>AYT VOR</strong> are available below.
+              </div>
             </div>
             <div class="wpt-grid" id="wptGrid">
               <!-- Populated by JS -->
@@ -222,13 +239,10 @@
       <section class="card scenario-card">
         <div class="card-header scenario-header">
           <div>
-            <h2>📋 Scenario Checkpoint Sheet &amp; EAT Calculator</h2>
+            <h2>📋 Scenario Checkpoint Sheet &amp; DME Crossing Calculator</h2>
             <p class="card-sub" id="scenarioSummaryText">All traffic fields are directly editable below.</p>
           </div>
           <div class="scenario-actions">
-            <button type="button" id="btnApplySolverOrder" class="small-btn accent-btn" title="Auto-apply optimal sequence & EAT delays">
-              🧠 Auto-Sequence by Solver
-            </button>
             <button type="button" id="btnSortByEst" class="small-btn" title="Sort by Established time">
               Sort by Est ⇅
             </button>
@@ -238,6 +252,26 @@
             <button type="button" id="btnClearAll" class="small-btn danger-btn">
               🗑️ Clear
             </button>
+          </div>
+        </div>
+
+        <!-- GLOBAL QUICK DME CROSSING BAR (Syncs custom DME across all planes or edit per plane below) -->
+        <div class="dme-finder-bar">
+          <div class="dme-finder-left">
+            <span class="dme-finder-title">📏 Find Crossing Time @ DME (TO / FROM AYT):</span>
+            <div class="custom-dist-wrap dme-global-wrap">
+              <input type="number" id="globalQueryDmeInput" value="30" min="0" max="150" step="1" aria-label="Custom DME to query across all planes" />
+              <span class="unit">NM</span>
+            </div>
+            <div class="quick-time-btns">
+              <button type="button" class="time-step-btn global-dme-step" data-dme-step="-5">-5</button>
+              <button type="button" class="time-step-btn global-dme-step" data-dme-step="-1">-1</button>
+              <button type="button" class="time-step-btn global-dme-step" data-dme-step="1">+1</button>
+              <button type="button" class="time-step-btn global-dme-step" data-dme-step="5">+5</button>
+            </div>
+          </div>
+          <div class="dme-finder-hint">
+            Type any distance here to set all aircraft at once, or type directly inside any aircraft's <strong>🎯 Cross @ DME</strong> box below (Transit shows both <strong>TO</strong> &amp; <strong>FROM AYT</strong>).
           </div>
         </div>
 
@@ -259,6 +293,7 @@
                 <th>10 DME FIX</th>
                 <th>EAT</th>
                 <th>Established</th>
+                <th>🎯 Cross @ DME (TO AYT)</th>
                 <th>Status</th>
                 <th>Delay</th>
                 <th></th>
@@ -285,6 +320,7 @@
                   <th>25 NM (≥MEA)</th>
                   <th>50 NM</th>
                   <th>60 NM</th>
+                  <th>🎯 Cross @ DME (FROM AYT)</th>
                   <th></th>
                 </tr>
               </thead>
@@ -294,55 +330,76 @@
             </table>
           </div>
         </div>
+
+        <!-- TRANSIT TABLE -->
+        <div id="transitSection" class="departures-sub-section hidden">
+          <h3 class="sub-table-title">✈️ Transit Traffic (Maintains FL • Enters via Waypoint → Routes through AYT VOR → Exits via Waypoint)</h3>
+          <div class="table-responsive">
+            <table class="checkpoint-table trn-table">
+              <thead>
+                <tr>
+                  <th>Aircraft</th>
+                  <th>Route (Entry → AYT VOR → Exit)</th>
+                  <th>Maint. FL</th>
+                  <th>Init Dist</th>
+                  <th>Init Time</th>
+                  <th>25 NM (TO)</th>
+                  <th>10 NM (TO)</th>
+                  <th>AYT VOR</th>
+                  <th>10 NM (FROM)</th>
+                  <th>25 NM (FROM)</th>
+                  <th>50 NM (FROM)</th>
+                  <th>🎯 Cross @ DME (TO &amp; FROM AYT)</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="transitTableBody">
+                <!-- Populated by JS -->
+              </tbody>
+            </table>
+          </div>
+        </div>
       </section>
 
-      <!-- MASTER SCENARIO SOLVER & SEPARATION ENGINE -->
+      <!-- CONFLICT FINDER ENGINE -->
       <section class="card solver-card">
         <div class="card-header">
           <div>
-            <h2>🧠 Master Scenario Solver (Altitudes, EATs &amp; Live Separation)</h2>
+            <h2>🔍 Live Conflict Finder (Head-On, Radial / &lt;15 NM VOR &amp; Approach Sequence)</h2>
             <p class="card-sub">
-              Live time-step simulation (0.2m / 1 NM intervals) solving descents/climbs (MEA → MSA @ 25 NM → Stack/3,000' @ ILS), <strong>1,000 ft VOR separation inside 15 NM</strong>, multi-aircraft holding stacks, and Departure ↔ Arrival conflicts.
+              Automatically detects Head-On conflicts (Arrivals, Departures, and Transit aircraft on the same radial), <strong>&lt;15 NM AYT VOR convergence</strong>, and ILS / EAT approach window overlaps.
             </p>
           </div>
-          <div id="liveSimBadge" class="freq-badges">
-            <!-- Populated by JS with live time-step verification stats -->
-          </div>
         </div>
 
-        <!-- SOLVED CLEARANCE CARDS PER AIRCRAFT -->
-        <div id="solverAircraftPlans" class="solver-plans-grid">
-          <!-- Populated by JS -->
-        </div>
-
-        <div class="conflicts-grid" style="margin-top: 1rem;">
-          <!-- PART 1: HEAD-ON DEPARTURE vs ARRIVAL CONFLICTS (SAME WAYPOINT) -->
+        <div class="conflicts-grid">
+          <!-- PART 1: HEAD-ON CONFLICTS (SAME WAYPOINT / RADIAL) -->
           <div class="conflict-panel">
             <div class="panel-header">
-              <h3>⚔️ Head-On Departure ↔ Arrival</h3>
-              <span class="badge-subtle">Same Waypoint</span>
+              <h3>⚔️ Head-On Conflicts</h3>
+              <span class="badge-subtle">Same Waypoint (ARR / DEP / TRN)</span>
             </div>
             <div id="depArrConflictList" class="conflict-list">
               <!-- Populated by JS -->
             </div>
           </div>
 
-          <!-- PART 2: RADIAL & VOR <15 NM CONFLICTS -->
+          <!-- PART 2: RADIAL, TRANSIT & VOR <15 NM CONFLICTS -->
           <div class="conflict-panel">
             <div class="panel-header">
               <h3>🧭 Radial &amp; VOR &lt;15 NM Conflicts</h3>
-              <span class="badge-subtle">Cross-Radial &amp; 1,000 ft Minima</span>
+              <span class="badge-subtle">Cross-Radial, AYT VOR &amp; Same-Track</span>
             </div>
             <div id="radialConflictList" class="conflict-list">
               <!-- Populated by JS -->
             </div>
           </div>
 
-          <!-- PART 3: APPROACH SEQUENCE, HOLD STACK & EAT ANALYSIS -->
+          <!-- PART 3: APPROACH SEQUENCE & EAT DELAYS -->
           <div class="conflict-panel">
             <div class="panel-header">
               <h3>⏳ Approach Sequence &amp; EAT Delays</h3>
-              <span class="badge-subtle">ILS Window &amp; Hold Stack</span>
+              <span class="badge-subtle">ILS Window &amp; Hold Times</span>
             </div>
             <div id="ilsDelayList" class="conflict-list">
               <!-- Populated by JS -->
@@ -469,35 +526,8 @@
         </div>
       </section>
     </div>
-
-    <!-- ===================================================================== -->
-    <!-- VIEW 3: SCENARIO TIME VIEW (CHRONOLOGICAL ATC SCRIPT & TIMELINE)      -->
-    <!-- ===================================================================== -->
-    <div id="viewTimeline" class="view-panel hidden">
-      <section class="card">
-        <div class="card-header">
-          <div>
-            <h2>⏱️ Master Scenario Time View &amp; Controller Script</h2>
-            <p class="card-sub">
-              Minute-by-minute controller clearances, altitude instructions, 15 NM separation checks, EAT issuances, and handoffs generated by the Master Solver.
-            </p>
-          </div>
-        </div>
-
-        <!-- VISUAL GANTT TIMELINE BARS -->
-        <div id="ganttContainer" class="gantt-container">
-          <!-- Populated by JS -->
-        </div>
-
-        <!-- MINUTE-BY-MINUTE CONTROLLER ACTION SCRIPT -->
-        <h3 class="sub-table-title" style="margin-top: 1.25rem;">🎙️ Chronological ATC Clearance &amp; Event Log</h3>
-        <div id="masterTimelineScript" class="master-script-list">
-          <!-- Populated by JS -->
-        </div>
-      </section>
-    </div>
   </main>
 
-  <script src="app.js?v=20261021b"></script>
+  <script src="app.js?v=20261103a"></script>
 </body>
 </html>
