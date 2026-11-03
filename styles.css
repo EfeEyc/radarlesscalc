@@ -1425,7 +1425,15 @@ code {
   flex-wrap: wrap;
 }
 
-.new-plane-hero-btn {
+.launcher-btn-group {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.new-plane-hero-btn,
+.json-import-hero-btn {
   display: inline-flex;
   align-items: center;
   gap: 0.6rem;
@@ -1433,26 +1441,85 @@ code {
   color: #fff;
   border: 1px solid rgba(56, 189, 248, 0.5);
   border-radius: var(--radius-sm);
-  padding: 0.72rem 1.35rem;
-  font-size: 0.98rem;
+  padding: 0.72rem 1.25rem;
+  font-size: 0.95rem;
   font-weight: 800;
   cursor: pointer;
   box-shadow: 0 4px 16px rgba(37, 99, 235, 0.35);
   transition: transform 0.12s ease, box-shadow 0.12s ease;
 }
 
-.new-plane-hero-btn:hover {
+.json-import-hero-btn {
+  background: linear-gradient(135deg, #7c3aed, #6d28d9);
+  border-color: rgba(192, 132, 252, 0.55);
+  box-shadow: 0 4px 16px rgba(124, 58, 237, 0.3);
+}
+
+.new-plane-hero-btn:hover,
+.json-import-hero-btn:hover {
   transform: translateY(-1px);
   box-shadow: 0 6px 20px rgba(56, 189, 248, 0.45);
 }
 
-.new-plane-hero-btn small {
-  font-size: 0.74rem;
+.new-plane-hero-btn small,
+.json-import-hero-btn small {
+  font-size: 0.72rem;
   font-weight: 600;
-  opacity: 0.88;
+  opacity: 0.9;
   background: rgba(255, 255, 255, 0.16);
   padding: 0.14rem 0.45rem;
   border-radius: 999px;
+}
+
+.json-quick-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.file-upload-label {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+
+.json-textarea {
+  width: 100%;
+  background: var(--bg-input);
+  border: 1px solid var(--border-highlight);
+  border-radius: var(--radius-sm);
+  color: var(--text-main);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.45;
+  padding: 0.75rem;
+  resize: vertical;
+  outline: none;
+}
+
+.json-textarea:focus {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.25);
+}
+
+.json-feedback {
+  font-size: 0.82rem;
+  font-weight: 700;
+  padding: 0.55rem 0.75rem;
+  border-radius: 6px;
+}
+
+.json-feedback.ok {
+  background: var(--accent-green-bg);
+  border: 1px solid rgba(52, 211, 153, 0.45);
+  color: var(--accent-green);
+}
+
+.json-feedback.err {
+  background: var(--accent-red-bg);
+  border: 1px solid rgba(248, 113, 113, 0.45);
+  color: var(--accent-red);
 }
 
 .launcher-meta {

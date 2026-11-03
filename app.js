@@ -130,6 +130,350 @@ function getWaypointOrVor(id) {
   return WAYPOINTS.find((w) => w.id === id) || WAYPOINTS[0];
 }
 
+// ============================================================================
+// SCENARIO JSON IMPORTER, OUTER-FIX MAPPER & GEMINI SKILL PROMPT
+// Maps both TMA Waypoints AND Whiteboard Outer Fixes (TOMBİ, KFK, HİSAR, etc.)
+// ============================================================================
+const FIX_TO_WAYPOINT_MAP = {
+  DERYA: "DERYA",
+  TOMBI: "DERYA",
+  TOMBİ: "DERYA",
+  "VA-16S": "DERYA",
+
+  KUMRU: "KUMRU",
+  KFK: "KUMRU",
+  AFYON: "KUMRU",
+
+  BRONZ: "BRONZ",
+  CRD: "BRONZ",
+  CARDAK: "BRONZ",
+  ÇARDAK: "BRONZ",
+
+  ALPAY: "ALPAY",
+  "W-79": "ALPAY",
+  W79: "ALPAY",
+
+  DAMLA: "DAMLA",
+  HISAR: "DAMLA",
+  HİSAR: "DAMLA",
+  "W-77": "DAMLA",
+  W77: "DAMLA",
+
+  KONAK: "KONAK",
+  MUT: "KONAK",
+
+  MANAV: "MANAV",
+  DOREN: "MANAV",
+  "W-83": "MANAV",
+  W83: "MANAV",
+
+  AYT: "AYT",
+  "AYT VOR": "AYT",
+  VOR: "AYT",
+};
+
+function resolveWaypointCode(raw) {
+  if (!raw) return "DERYA";
+  const cleaned = String(raw)
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, " ");
+  if (FIX_TO_WAYPOINT_MAP[cleaned]) return FIX_TO_WAYPOINT_MAP[cleaned];
+
+  // ascii fallback for Turkish İ / I / Ç / Ş
+  const ascii = cleaned
+    .replace(/İ/g, "I")
+    .replace(/İ/g, "I")
+    .replace(/Ç/g, "C")
+    .replace(/Ş/g, "S")
+    .replace(/Ğ/g, "G")
+    .replace(/Ü/g, "U")
+    .replace(/Ö/g, "O");
+  if (FIX_TO_WAYPOINT_MAP[ascii]) return FIX_TO_WAYPOINT_MAP[ascii];
+
+  for (const [key, val] of Object.entries(FIX_TO_WAYPOINT_MAP)) {
+    if (ascii.includes(key)) return val;
+  }
+  return "DERYA";
+}
+
+function normalizeImportedFl(rawFl, fallbackFl = 250) {
+  if (rawFl === undefined || rawFl === null || rawFl === "") return fallbackFl;
+  const cleaned = String(rawFl)
+    .toUpperCase()
+    .replace(/FL/g, "")
+    .replace(/FT|'|,/g, "")
+    .trim();
+  const num = parseFloat(cleaned);
+  if (Number.isNaN(num) || num <= 0) return fallbackFl;
+  if (num >= 1000) return Math.round(num / 100);
+  return Math.round(num);
+}
+
+function normalizeImportedType(rawType) {
+  const s = String(rawType || "ARR")
+    .trim()
+    .toUpperCase();
+  if (s === "DEP" || s === "DEPARTURE" || s === "OUTBOUND" || s === "↑" || s === "UP") {
+    return "DEP";
+  }
+  if (
+    s === "TRN" ||
+    s === "TRANSIT" ||
+    s === "OVERFLIGHT" ||
+    s === "U" ||
+    s === "∪" ||
+    s === "∩"
+  ) {
+    return "TRN";
+  }
+  return "ARR";
+}
+
+// Exact PR.6 RADARSIZ APP. 2026 Whiteboard Example from photo
+const PR6_BOARD_EXAMPLE = {
+  scenario: "PR.6 RADARSIZ APP. 2026",
+  rwy: "36",
+  aircraft: [
+    {
+      type: "ARR",
+      callsign: "BAW8VZ",
+      acftType: "A380",
+      fl: 260,
+      time: "10:07",
+      wpt: "KFK",
+      dist: 50,
+    },
+    {
+      type: "DEP",
+      callsign: "MSR5ZV",
+      acftType: "B747",
+      fl: 270,
+      time: "10:03",
+      wpt: "TOMBİ",
+    },
+    {
+      type: "ARR",
+      callsign: "SXS8RV",
+      acftType: "B738",
+      fl: 250,
+      time: "10:06",
+      wpt: "HİSAR",
+      dist: 55,
+    },
+    {
+      type: "DEP",
+      callsign: "PGT9TW",
+      acftType: "A321",
+      fl: 330,
+      time: "10:04",
+      wpt: "HİSAR",
+    },
+    {
+      type: "ARR",
+      callsign: "JAV5W9",
+      acftType: "A380",
+      fl: 250,
+      time: "10:02",
+      wpt: "TOMBİ",
+      dist: 60,
+    },
+    {
+      type: "DEP",
+      callsign: "KLM8VR",
+      acftType: "B747",
+      fl: 360,
+      time: "10:05",
+      wpt: "KFK",
+    },
+    {
+      type: "TRN",
+      callsign: "TCLAB",
+      acftType: "LR55",
+      fl: 140,
+      time: "10:01",
+      route: ["TOMBİ", "AYT", "KFK"],
+      dist: 60,
+    },
+    {
+      type: "TRN",
+      callsign: "TCKLA",
+      acftType: "LR35",
+      fl: 150,
+      time: "10:08",
+      route: ["ALPAY", "AYT", "HİSAR"],
+      dist: 50,
+    },
+  ],
+};
+
+const GEMINI_SKILL_PROMPT = `You are an ATC Whiteboard OCR & Scenario JSON Generator for the AYT TMA Radarless Approach Calculator (https://efeeyc.github.io/radarlesscalc/).
+
+Whenever the user sends a photo of an ATC classroom whiteboard (or text of a traffic list), extract every aircraft row and output ONLY a valid JSON code block matching the schema below.
+
+### 1. How to Read Each Whiteboard Row
+Each row starts with a symbol on the left indicating the flight type:
+
+1. **↓ (Down Arrow) = ARRIVAL ("ARR")**
+   - Typical board format: \`↓ CALLSIGN - ACFT_TYPE - FL - TIME - ENTRY_FIX - AYT - DIST NM\`
+   - Example: \`↓ BAW8VZ - A380 - FL260 - 10:07 - KFK - AYT - 50 NM\`
+   - If a Flight Level is crossed out and replaced (e.g. \`290\` crossed out with \`260\` written below/next to it), ALWAYS use the corrected number (\`260\`).
+   - Output fields: \`type: "ARR"\`, \`callsign\`, \`fl\` (integer FL, e.g. 260), \`time\` (e.g. "10:07"), \`wpt\` (mapped TMA waypoint or fix name), \`dist\` (integer NM, e.g. 50).
+
+2. **↑ (Up Arrow) = DEPARTURE ("DEP")**
+   - Typical board format: \`↑ CALLSIGN - ACFT_TYPE - 5000' - TIME - AYT (FLxxx) - EXIT_FIX\`
+   - Example: \`↑ MSR5ZV - B747 - 5000 - 10:03 - AYT (FL270) - TOMBI\`
+   - IMPORTANT: Ignore the initial \`5000\` or \`5000'\` climb altitude! Use the requested cruise Flight Level inside parentheses after AYT, e.g. \`(FL270)\` -> \`fl: 270\`.
+   - Output fields: \`type: "DEP"\`, \`callsign\`, \`fl\` (requested FL from parentheses, e.g. 270), \`time\` (departure time, e.g. "10:03"), \`wpt\` (exit waypoint/fix).
+
+3. **∪ or U (U-shaped curve) = TRANSIT ("TRN")**
+   - Typical board format: \`∪ CALLSIGN - ACFT_TYPE - FL - TIME - ENTRY_FIX - AYT - EXIT_FIX - DIST NM\`
+   - Example: \`∪ TCLAB - LR55 - FL140 - 10:01 - TOMBI - AYT - KFK - 60 NM\`
+   - Output fields: \`type: "TRN"\`, \`callsign\`, \`fl\` (maintained FL, e.g. 140), \`time\` (entry report time, e.g. "10:01"), \`route: ["ENTRY_WPT", "AYT", "EXIT_WPT"]\`, \`dist\` (entry distance in NM, e.g. 60).
+
+### 2. Outer Fix to AYT TMA Waypoint Mapping
+Convert outer fixes to canonical TMA Waypoints (or keep them, the calculator accepts both):
+- \`TOMBİ\` / \`TOMBI\` -> \`"DERYA"\`
+- \`KFK\` -> \`"KUMRU"\`
+- \`CRD\` -> \`"BRONZ"\`
+- \`W-79\` / \`ALPAY\` -> \`"ALPAY"\`
+- \`HİSAR\` / \`HISAR\` -> \`"DAMLA"\`
+- \`MUT\` -> \`"KONAK"\`
+- \`DOREN\` -> \`"MANAV"\`
+- \`AYT\` -> \`"AYT"\`
+
+### 3. Output Format
+Return ONLY a single \`\`\`json code block (no extra commentary) in this exact structure:
+\`\`\`json
+{
+  "scenario": "PR.6 RADARSIZ APP. 2026",
+  "rwy": "36",
+  "aircraft": [
+    { "type": "ARR", "callsign": "BAW8VZ", "fl": 260, "time": "10:07", "wpt": "KUMRU", "dist": 50 },
+    { "type": "DEP", "callsign": "MSR5ZV", "fl": 270, "time": "10:03", "wpt": "DERYA" },
+    { "type": "TRN", "callsign": "TCLAB", "fl": 140, "time": "10:01", "route": ["DERYA", "AYT", "KUMRU"], "dist": 60 }
+  ]
+}
+\`\`\``;
+
+function parseScenarioJsonText(rawText) {
+  if (!rawText || !String(rawText).trim()) {
+    throw new Error("JSON input is empty. Paste the JSON from your Gemini skill first.");
+  }
+
+  // Strip ```json ... ``` markdown fences if present
+  let cleaned = String(rawText).trim();
+  const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenceMatch && fenceMatch[1]) {
+    cleaned = fenceMatch[1].trim();
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (e) {
+    throw new Error(`Invalid JSON syntax: ${e.message}`);
+  }
+
+  const list = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray(parsed.aircraft)
+    ? parsed.aircraft
+    : Array.isArray(parsed.planes)
+    ? parsed.planes
+    : Array.isArray(parsed.traffic)
+    ? parsed.traffic
+    : null;
+
+  if (!list || list.length === 0) {
+    throw new Error(
+      'JSON must be an array of aircraft or an object containing an "aircraft": [...] array.'
+    );
+  }
+
+  const rwy =
+    parsed && (String(parsed.rwy) === "18" || String(parsed.runway) === "18")
+      ? "18"
+      : parsed && (String(parsed.rwy) === "36" || String(parsed.runway) === "36")
+      ? "36"
+      : null;
+
+  const normalizedAircraft = list.map((item, idx) => {
+    const type = normalizeImportedType(item.type || item.flightType || item.kind);
+    const callsign = String(item.callsign || item.cs || item.id || `ACFT${idx + 1}`)
+      .trim()
+      .toUpperCase();
+    const timeRaw = String(item.time ?? item.timeRaw ?? item.reportTime ?? "00").trim();
+
+    if (type === "TRN") {
+      let rawRoute = [];
+      if (Array.isArray(item.route) && item.route.length > 0) {
+        rawRoute = item.route;
+      } else if (typeof item.route === "string" && item.route.trim()) {
+        rawRoute = item.route.split(/\s*[-→>,/]+\s*/);
+      } else {
+        rawRoute = [
+          item.entryWpt || item.from || item.wpt || "DERYA",
+          "AYT",
+          item.exitWpt || item.to || "KUMRU",
+        ];
+      }
+
+      const mappedRoute = rawRoute.map((r) => resolveWaypointCode(r));
+      const entryWptId = mappedRoute[0] || "DERYA";
+      const exitWptId =
+        mappedRoute.length > 1 ? mappedRoute[mappedRoute.length - 1] : "KUMRU";
+
+      return {
+        type: "TRN",
+        callsign,
+        wptId: entryWptId,
+        entryWptId,
+        exitWptId,
+        route: [entryWptId, "AYT", exitWptId],
+        fl: normalizeImportedFl(item.fl ?? item.flightLevel, 150),
+        dist: Number(item.dist ?? item.distance ?? 60) || 60,
+        timeRaw,
+        holdMins: Number(item.holdMins) || 0,
+      };
+    }
+
+    const wptId = resolveWaypointCode(
+      item.wpt || item.waypoint || item.wptId || item.fix || item.exitWpt || item.entryWpt
+    );
+
+    if (type === "DEP") {
+      return {
+        type: "DEP",
+        callsign,
+        wptId,
+        fl: normalizeImportedFl(item.fl ?? item.flightLevel ?? item.reqFl, 270),
+        dist: 0,
+        timeRaw,
+        mode: "auto",
+        holdMins: 0,
+      };
+    }
+
+    return {
+      type: "ARR",
+      callsign,
+      wptId,
+      fl: normalizeImportedFl(item.fl ?? item.flightLevel, 250),
+      dist: Number(item.dist ?? item.distance ?? 60) || 60,
+      timeRaw,
+      mode: "auto",
+      holdMins: Number(item.holdMins) || 0,
+    };
+  });
+
+  return {
+    rwy,
+    scenarioName: parsed.scenario || parsed.name || null,
+    aircraft: normalizedAircraft,
+  };
+}
+
 // Application State
 const state = {
   activeView: "calc", // 'calc' | 'chart'
@@ -3141,6 +3485,205 @@ function initApp() {
     saveState();
     renderScenarioBoard();
   });
+
+  // ==========================================================================
+  // SCENARIO JSON IMPORTER & GEMINI SKILL HELPER CONTROLS
+  // ==========================================================================
+  const btnOpenJsonImporter = document.getElementById("btnOpenJsonImporter");
+  const jsonImporterPanel = document.getElementById("jsonImporterPanel");
+  const btnCloseJsonImporter = document.getElementById("btnCloseJsonImporter");
+  const jsonImportTextarea = document.getElementById("jsonImportTextarea");
+  const jsonImportFeedback = document.getElementById("jsonImportFeedback");
+  const btnPasteAndImport = document.getElementById("btnPasteAndImport");
+  const btnLoadBoardExample = document.getElementById("btnLoadBoardExample");
+  const btnExportCurrentJson = document.getElementById("btnExportCurrentJson");
+  const jsonFileInput = document.getElementById("jsonFileInput");
+  const btnCopyGeminiPrompt = document.getElementById("btnCopyGeminiPrompt");
+  const btnImportAppend = document.getElementById("btnImportAppend");
+  const btnImportReplace = document.getElementById("btnImportReplace");
+
+  function showJsonFeedback(message, isSuccess = true) {
+    if (!jsonImportFeedback) return;
+    jsonImportFeedback.className = `json-import-feedback ${isSuccess ? "success" : "error"}`;
+    jsonImportFeedback.innerHTML = message;
+    jsonImportFeedback.classList.remove("hidden");
+  }
+
+  function applyScenarioJson(rawText, mode = "replace") {
+    try {
+      const result = parseScenarioJsonText(rawText);
+      if (result.rwy) {
+        state.activeRwy = result.rwy;
+      }
+
+      if (mode === "replace") {
+        state.aircraftList = [];
+        state.nextId = 1;
+      }
+
+      const addedItems = result.aircraft.map((item) => ({
+        ...item,
+        id: state.nextId++,
+        queryDme: state.globalQueryDme,
+      }));
+
+      state.aircraftList.push(...addedItems);
+      saveState();
+      updateRwyUI();
+
+      const arrCount = addedItems.filter((a) => a.type === "ARR").length;
+      const depCount = addedItems.filter((a) => a.type === "DEP").length;
+      const trnCount = addedItems.filter((a) => a.type === "TRN").length;
+      const label = result.scenarioName ? ` (<strong>${result.scenarioName}</strong>)` : "";
+
+      showJsonFeedback(
+        `✅ Successfully ${mode === "replace" ? "imported" : "appended"} <strong>${
+          addedItems.length
+        } aircraft</strong>${label}: ${arrCount} ARR, ${depCount} DEP, ${trnCount} TRN.`,
+        true
+      );
+    } catch (err) {
+      showJsonFeedback(`❌ ${err.message}`, false);
+    }
+  }
+
+  if (btnOpenJsonImporter && jsonImporterPanel) {
+    btnOpenJsonImporter.addEventListener("click", () => {
+      const isHidden = jsonImporterPanel.classList.contains("hidden");
+      jsonImporterPanel.classList.toggle("hidden", !isHidden);
+      if (isHidden && jsonImportTextarea) {
+        jsonImportTextarea.focus();
+      }
+    });
+  }
+
+  if (btnCloseJsonImporter && jsonImporterPanel) {
+    btnCloseJsonImporter.addEventListener("click", () => {
+      jsonImporterPanel.classList.add("hidden");
+    });
+  }
+
+  if (btnPasteAndImport) {
+    btnPasteAndImport.addEventListener("click", async () => {
+      try {
+        const clipText = await navigator.clipboard.readText();
+        if (clipText && clipText.trim()) {
+          jsonImportTextarea.value = clipText.trim();
+          applyScenarioJson(clipText, "replace");
+        } else if (jsonImportTextarea && jsonImportTextarea.value.trim()) {
+          applyScenarioJson(jsonImportTextarea.value, "replace");
+        } else {
+          showJsonFeedback("Clipboard is empty. Paste your JSON into the text box below.", false);
+        }
+      } catch (_err) {
+        if (jsonImportTextarea && jsonImportTextarea.value.trim()) {
+          applyScenarioJson(jsonImportTextarea.value, "replace");
+        } else {
+          showJsonFeedback(
+            "Browser blocked automatic clipboard read. Press Ctrl+V inside the JSON box below, then click Import.",
+            false
+          );
+        }
+      }
+    });
+  }
+
+  if (btnLoadBoardExample) {
+    btnLoadBoardExample.addEventListener("click", () => {
+      const pretty = JSON.stringify(PR6_BOARD_EXAMPLE, null, 2);
+      if (jsonImportTextarea) jsonImportTextarea.value = pretty;
+      applyScenarioJson(pretty, "replace");
+    });
+  }
+
+  if (btnExportCurrentJson) {
+    btnExportCurrentJson.addEventListener("click", () => {
+      const exportPayload = {
+        scenario: "AYT TMA Custom Scenario",
+        rwy: state.activeRwy,
+        aircraft: state.aircraftList.map((a) => {
+          if (a.type === "TRN") {
+            return {
+              type: "TRN",
+              callsign: a.callsign,
+              fl: a.fl,
+              time: a.timeRaw,
+              route: [a.entryWptId || a.wptId, "AYT", a.exitWptId || "DERYA"],
+              dist: a.dist,
+            };
+          }
+          if (a.type === "DEP") {
+            return {
+              type: "DEP",
+              callsign: a.callsign,
+              fl: a.fl,
+              time: a.timeRaw,
+              wpt: a.wptId,
+            };
+          }
+          return {
+            type: "ARR",
+            callsign: a.callsign,
+            fl: a.fl,
+            time: a.timeRaw,
+            wpt: a.wptId,
+            dist: a.dist,
+          };
+        }),
+      };
+      const pretty = JSON.stringify(exportPayload, null, 2);
+      if (jsonImportTextarea) jsonImportTextarea.value = pretty;
+      showJsonFeedback(
+        `📤 Exported <strong>${state.aircraftList.length} aircraft</strong> to the JSON box below.`,
+        true
+      );
+    });
+  }
+
+  if (jsonFileInput) {
+    jsonFileInput.addEventListener("change", (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const text = String(reader.result || "");
+        if (jsonImportTextarea) jsonImportTextarea.value = text;
+        applyScenarioJson(text, "replace");
+      };
+      reader.readAsText(file);
+      jsonFileInput.value = "";
+    });
+  }
+
+  if (btnCopyGeminiPrompt) {
+    btnCopyGeminiPrompt.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(GEMINI_SKILL_PROMPT);
+        showJsonFeedback(
+          "🤖 Copied the <strong>Gemini Skill / Gem System Prompt</strong> to your clipboard! Paste it into your Gemini Gem instructions.",
+          true
+        );
+      } catch (_err) {
+        if (jsonImportTextarea) jsonImportTextarea.value = GEMINI_SKILL_PROMPT;
+        showJsonFeedback(
+          "🤖 Placed the <strong>Gemini Skill System Prompt</strong> into the box below so you can copy it.",
+          true
+        );
+      }
+    });
+  }
+
+  if (btnImportReplace) {
+    btnImportReplace.addEventListener("click", () => {
+      applyScenarioJson(jsonImportTextarea ? jsonImportTextarea.value : "", "replace");
+    });
+  }
+
+  if (btnImportAppend) {
+    btnImportAppend.addEventListener("click", () => {
+      applyScenarioJson(jsonImportTextarea ? jsonImportTextarea.value : "", "append");
+    });
+  }
 
   // Radar Chart Time Lookup, Slider & Play Animation
   const lookupTimeInput = document.getElementById("lookupTimeInput");
