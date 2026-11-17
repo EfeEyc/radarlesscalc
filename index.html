@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>AYT TMA Radarless Calculator &amp; Conflict Finder</title>
-  <link rel="stylesheet" href="styles.css?v=20261117h" />
+  <link rel="stylesheet" href="styles.css?v=20261117i" />
 </head>
 <body>
   <main class="container">
@@ -425,7 +425,7 @@
           <div>
             <h2>🔍 Live Conflict Finder (Head-to-Head &lt;45°/100 NM, VOR &lt;15 DME &amp; EAT)</h2>
             <p class="card-sub">
-              Detects <strong>Head-to-Head (&lt;45° track diff)</strong> altitude crossings within <strong>100 NM</strong> (until passing each other), <strong>VOR &lt;15 DME</strong> crossings when both are inside 15 DME (DEP↔DEP exempt), <strong>Same Route</strong> (<strong>10 DME</strong> crossing / <strong>20 DME</strong> same alt), and ILS clearance holds.
+              Uses instantaneous <strong>cleared altitudes (teleport)</strong> for procedural conflict checks while keeping gradual climbs/descents visually — catching <strong>H2H (&lt;45° / 100 NM)</strong>, <strong>VOR &lt;15 DME</strong> (DEP↔DEP exempt), and <strong>Same Route</strong> (<strong>10 DME</strong> crossing / <strong>20 DME</strong> same alt).
             </p>
           </div>
         </div>
@@ -676,6 +676,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261117h"></script>
+  <script src="app.js?v=20261117i"></script>
 </body>
 </html>
