@@ -1537,44 +1537,18 @@ function evaluateConflictPlannedAltitude(item, eatInfo, queryNormMins, refHour) 
     return { altFt: Math.round(calc.reqAltFt), entryFromFt: 1000 };
   }
 
-  // ARRIVAL Auto Procedural Profile (pre-entry holds initAltFt until tInit report time)
-  const { wpt } = item;
-  const t25 = item.norm25 ?? item.normInit;
-  const alt25 = Math.min(calc.initAltFt, wpt.meaFt);
+  // ARRIVAL Auto Procedural Profile: glides along STAR corridor until ILS clearance teleports to 3,000'
   const entryFromFt = Math.round(calc.initAltFt);
-
-  if (queryNormMins < item.normInit - 1e-6) {
-    return { altFt: entryFromFt, entryFromFt };
-  }
-
-  if (calc.straightIn) {
-    const holdFloorAlt = Math.max(4000, wpt.msaFt);
-    if (eatInfo && eatInfo.ilsCleared && queryNormMins >= eatInfo.tTurnStartNorm - 1e-6) {
-      return {
-        altFt: queryNormMins > eatInfo.effectiveEstNorm ? 0 : 3000,
-        entryFromFt,
-      };
-    }
-    if (item.norm25 !== null && queryNormMins < t25 - 1e-6) {
-      return { altFt: Math.round(alt25), entryFromFt };
-    }
-    return { altFt: Math.round(holdFloorAlt), entryFromFt };
-  }
-
-  const inner10Alt = Math.max(wpt.msaFt, 4000);
   if (eatInfo && eatInfo.ilsCleared && queryNormMins >= eatInfo.tTurnStartNorm - 1e-6) {
     return {
       altFt: queryNormMins > eatInfo.effectiveEstNorm ? 0 : 3000,
       entryFromFt,
     };
   }
-  if (queryNormMins >= item.norm10 - 1e-6) {
-    return { altFt: 4000, entryFromFt };
-  }
-  if (item.norm25 !== null && queryNormMins < t25 - 1e-6) {
-    return { altFt: Math.round(alt25), entryFromFt };
-  }
-  return { altFt: Math.round(inner10Alt), entryFromFt };
+  return {
+    altFt: Math.round(evaluatePlannedAltitude(item, eatInfo, queryNormMins, refHour)),
+    entryFromFt,
+  };
 }
 
 function getAircraftStateAtTime(item, solverData, queryNormMins) {
