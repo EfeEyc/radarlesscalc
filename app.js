@@ -1537,11 +1537,15 @@ function evaluateConflictPlannedAltitude(item, eatInfo, queryNormMins, refHour) 
     return { altFt: Math.round(calc.reqAltFt), entryFromFt: 1000 };
   }
 
-  // ARRIVAL Auto Procedural Profile
+  // ARRIVAL Auto Procedural Profile (pre-entry holds initAltFt until tInit report time)
   const { wpt } = item;
   const t25 = item.norm25 ?? item.normInit;
   const alt25 = Math.min(calc.initAltFt, wpt.meaFt);
   const entryFromFt = Math.round(calc.initAltFt);
+
+  if (queryNormMins < item.normInit - 1e-6) {
+    return { altFt: entryFromFt, entryFromFt };
+  }
 
   if (calc.straightIn) {
     const holdFloorAlt = Math.max(4000, wpt.msaFt);
@@ -1605,18 +1609,23 @@ function computeAircraftKinematics(item, eatInfo, queryNormMins, liveAltFt, altS
 
     if (queryNormMins < item.normInit) {
       const wait = +(item.normInit - queryNormMins).toFixed(1);
-      const { xNm, yNm } = polarToNm(calc.dist, entryWpt.deg);
+      const projDme = calc.hasInbound
+        ? +(calc.dist + wait * SPEED_NM_PER_MIN).toFixed(2)
+        : calc.dist;
+      const { xNm, yNm } = polarToNm(projDme, entryWpt.deg);
+      const preTrackDeg = calc.hasInbound ? (entryWpt.deg + 180) % 360 : null;
+      const preTrackRad = preTrackDeg !== null ? (preTrackDeg * Math.PI) / 180 : 0;
       return {
         visible: false,
-        underSepControl: false,
+        underSepControl: calc.hasInbound && projDme <= 120,
         phase: "pending",
-        dme: calc.dist,
+        dme: +projDme.toFixed(1),
         xNm,
         yNm,
-        vx: 0,
-        vy: 0,
+        vx: preTrackDeg !== null ? SPEED_NM_PER_MIN * Math.sin(preTrackRad) : 0,
+        vy: preTrackDeg !== null ? SPEED_NM_PER_MIN * Math.cos(preTrackRad) : 0,
         radialDeg: entryWpt.deg,
-        trackDeg: null,
+        trackDeg: preTrackDeg,
         altFt: liveAltFt,
         altStr,
         isTested,
@@ -1771,18 +1780,21 @@ function computeAircraftKinematics(item, eatInfo, queryNormMins, liveAltFt, altS
 
   if (queryNormMins < tInit) {
     const wait = +(tInit - queryNormMins).toFixed(1);
-    const { xNm, yNm } = polarToNm(d0, wpt.deg);
+    const projDme = +(d0 + wait * SPEED_NM_PER_MIN).toFixed(2);
+    const { xNm, yNm } = polarToNm(projDme, wpt.deg);
+    const inbDeg = (wpt.deg + 180) % 360;
+    const inbRad = (inbDeg * Math.PI) / 180;
     return {
       visible: false,
-      underSepControl: false,
+      underSepControl: projDme <= 120,
       phase: "pending",
-      dme: d0,
+      dme: +projDme.toFixed(1),
       xNm,
       yNm,
-      vx: 0,
-      vy: 0,
+      vx: SPEED_NM_PER_MIN * Math.sin(inbRad),
+      vy: SPEED_NM_PER_MIN * Math.cos(inbRad),
       radialDeg: wpt.deg,
-      trackDeg: null,
+      trackDeg: inbDeg,
       altFt: liveAltFt,
       altStr,
       isTested,
@@ -2208,6 +2220,15 @@ function isSameRouteCrossingAtStep(sA, sB, k, firstActiveA = false, firstActiveB
   );
 }
 
+function isContinuousLeg(st0, st1) {
+  if (!st0.underSepControl || !st1.underSepControl) return false;
+  if (st0.phase === st1.phase) return true;
+  return (
+    st0.phase === "pending" &&
+    (st1.phase === "inbound" || st1.phase === "transit-in")
+  );
+}
+
 // Evaluates instantaneous pair separation & rule violations between [stA0..stA1] and [stB0..stB1]
 // Uses cleared/teleported altitudes (`conflictAltFt` + takeoff/entry `conflictEntryFromFt`) rather than gradual climb/descent!
 function evaluatePairStepViolation(
@@ -2223,28 +2244,26 @@ function evaluatePairStepViolation(
 ) {
   if (!stA0.underSepControl || !stB0.underSepControl) return null;
 
-  // Evaluate both aircraft symmetrically: use step midpoint when both remain in the same
-  // continuous leg under control; otherwise evaluate both at exact instant t_k to avoid time-skew artifacts.
-  const sameLegMid =
-    stA1.underSepControl &&
-    stB1.underSepControl &&
-    stA1.phase === stA0.phase &&
-    stB1.phase === stB0.phase;
+  // Evaluate spatial distance symmetrically: use step midpoint along continuous inbound/outbound
+  // legs (including pending -> inbound); otherwise evaluate both at exact t_k to avoid time-skew artifacts.
+  const sameLegMid = isContinuousLeg(stA0, stA1) && isContinuousLeg(stB0, stB1);
   const sA1Eff = sameLegMid ? stA1 : stA0;
   const sB1Eff = sameLegMid ? stB1 : stB0;
 
   const startAltA = firstActiveA ? stA0.conflictEntryFromFt ?? stA0.conflictAltFt : stA0.conflictAltFt;
   const startAltB = firstActiveB ? stB0.conflictEntryFromFt ?? stB0.conflictAltFt : stB0.conflictAltFt;
+  const endAltA = stA1.underSepControl ? stA1.conflictAltFt : stA0.conflictAltFt;
+  const endAltB = stB1.underSepControl ? stB1.conflictAltFt : stB0.conflictAltFt;
 
-  const altMinA = Math.min(startAltA, stA0.conflictAltFt, sA1Eff.conflictAltFt);
-  const altMaxA = Math.max(startAltA, stA0.conflictAltFt, sA1Eff.conflictAltFt);
-  const altMinB = Math.min(startAltB, stB0.conflictAltFt, sB1Eff.conflictAltFt);
-  const altMaxB = Math.max(startAltB, stB0.conflictAltFt, sB1Eff.conflictAltFt);
+  const altMinA = Math.min(startAltA, stA0.conflictAltFt, endAltA);
+  const altMaxA = Math.max(startAltA, stA0.conflictAltFt, endAltA);
+  const altMinB = Math.min(startAltB, stB0.conflictAltFt, endAltB);
+  const altMaxB = Math.max(startAltB, stB0.conflictAltFt, endAltB);
 
   // Check if cleared/teleported altitudes cross OR share < 1000 ft separation during this step
   const minSeparatedFt = Math.min(
     Math.abs(stA0.conflictAltFt - stB0.conflictAltFt),
-    Math.abs(sA1Eff.conflictAltFt - sB1Eff.conflictAltFt)
+    Math.abs(endAltA - endAltB)
   );
   const crossesOrLacks1000 =
     Math.max(altMinA, altMinB) < Math.min(altMaxA, altMaxB) + 999.5;
@@ -2316,6 +2335,8 @@ function evaluatePairStepViolation(
     dmeB: +stB0.dme.toFixed(1),
     altA: stA0.conflictAltFt,
     altB: stB0.conflictAltFt,
+    preEntryA: stA0.phase === "pending",
+    preEntryB: stB0.phase === "pending",
     altRangeA: altMaxA > altMinA ? `${formatAltShort(altMinA)}→${formatAltShort(altMaxA)}` : null,
     altRangeB: altMaxB > altMinB ? `${formatAltShort(altMinB)}→${formatAltShort(altMaxB)}` : null,
     altDiffFt: Math.round(altDiffFt),
@@ -2414,15 +2435,17 @@ function detect4DConflicts(solver) {
     const pairKey = getPairKey(itemA.acft.id, itemB.acft.id);
     const altLabelA = best.altRangeA || formatAltShort(best.altA);
     const altLabelB = best.altRangeB || formatAltShort(best.altB);
+    const dmeLabelA = `${best.dmeA} DME${best.preEntryA ? " pre-entry" : ""}`;
+    const dmeLabelB = `${best.dmeB} DME${best.preEntryB ? " pre-entry" : ""}`;
 
     let badgeText = "";
     let detailText = "";
     if (ruleType === "HEAD_TO_HEAD") {
       badgeText = `⚔️ H2H ${best.headOnOffDeg}° • ${best.horizDistNm} NM (<100)`;
-      detailText = `<strong>${itemA.acft.callsign}</strong> (${altLabelA} @ ${best.dmeA} DME) and <strong>${itemB.acft.callsign}</strong> (${altLabelB} @ ${best.dmeB} DME) are head-to-head (<strong>${best.headOnOffDeg}°</strong> off reciprocal, <strong>${best.horizDistNm} NM &lt; 100 NM</strong>) crossing cleared FLs during <code>${windowStr}</code>.`;
+      detailText = `<strong>${itemA.acft.callsign}</strong> (${altLabelA} @ ${dmeLabelA}) and <strong>${itemB.acft.callsign}</strong> (${altLabelB} @ ${dmeLabelB}) are head-to-head (<strong>${best.headOnOffDeg}°</strong> off reciprocal, <strong>${best.horizDistNm} NM &lt; 100 NM</strong>) crossing cleared FLs during <code>${windowStr}</code>.`;
     } else if (ruleType === "VOR_15DME") {
       badgeText = `🎯 BOTH <15 DME (${best.dmeA}/${best.dmeB} NM)`;
-      detailText = `Both aircraft inside <strong>15 DME</strong> of AYT VOR crossing/sharing cleared altitude: <strong>${itemA.acft.callsign}</strong> at <strong>${best.dmeA} DME</strong> (${altLabelA}) &amp; <strong>${itemB.acft.callsign}</strong> at <strong>${best.dmeB} DME</strong> (${altLabelB}) at <code>${windowStr}</code>.`;
+      detailText = `Both aircraft inside <strong>15 DME</strong> of AYT VOR crossing/sharing cleared altitude: <strong>${itemA.acft.callsign}</strong> at <strong>${dmeLabelA}</strong> (${altLabelA}) &amp; <strong>${itemB.acft.callsign}</strong> at <strong>${dmeLabelB}</strong> (${altLabelB}) at <code>${windowStr}</code>.`;
     } else {
       const hasSameAlt = samples.some((s) => !s.sameRouteCrossing);
       const minReq = hasSameAlt ? 20 : 10;
@@ -2430,8 +2453,8 @@ function detect4DConflicts(solver) {
         ? `📏 SAME ROUTE ${best.dmeDiff} DME (<20 SAME ALT)`
         : `📏 SAME ROUTE ${best.dmeDiff} DME (<10 CROSS)`;
       detailText = hasSameAlt
-        ? `Same-route traffic maintaining/entering same cleared altitude within <strong>20 DME</strong>: <strong>${itemA.acft.callsign}</strong> (${best.dmeA} DME, ${altLabelA}) &amp; <strong>${itemB.acft.callsign}</strong> (${best.dmeB} DME, ${altLabelB}) only <strong>${best.dmeDiff} DME</strong> apart during <code>${windowStr}</code>.`
-        : `Same-route traffic crossing cleared altitudes within <strong>10 DME</strong>: <strong>${itemA.acft.callsign}</strong> (${best.dmeA} DME, ${altLabelA}) &amp; <strong>${itemB.acft.callsign}</strong> (${best.dmeB} DME, ${altLabelB}) only <strong>${best.dmeDiff} DME</strong> apart during <code>${windowStr}</code>.`;
+        ? `Same-route traffic maintaining/entering same cleared altitude within <strong>20 DME</strong>: <strong>${itemA.acft.callsign}</strong> (${dmeLabelA}, ${altLabelA}) &amp; <strong>${itemB.acft.callsign}</strong> (${dmeLabelB}, ${altLabelB}) only <strong>${best.dmeDiff} DME</strong> apart during <code>${windowStr}</code>.`
+        : `Same-route traffic crossing cleared altitudes within <strong>10 DME</strong>: <strong>${itemA.acft.callsign}</strong> (${dmeLabelA}, ${altLabelA}) &amp; <strong>${itemB.acft.callsign}</strong> (${dmeLabelB}, ${altLabelB}) only <strong>${best.dmeDiff} DME</strong> apart during <code>${windowStr}</code>.`;
       best.effectiveReqDmeMin = minReq;
     }
 
