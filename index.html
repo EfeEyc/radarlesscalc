@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>AYT TMA Radarless Calculator &amp; Conflict Finder</title>
-  <link rel="stylesheet" href="styles.css?v=20261117f" />
+  <link rel="stylesheet" href="styles.css?v=20261117h" />
 </head>
 <body>
   <main class="container">
@@ -425,7 +425,7 @@
           <div>
             <h2>🔍 Live Conflict Finder (Head-to-Head &lt;45°/100 NM, VOR &lt;15 DME &amp; EAT)</h2>
             <p class="card-sub">
-              Detects <strong>Head-to-Head (&lt;45° track diff)</strong> altitude crossings within <strong>100 NM</strong> (until passing each other), <strong>VOR &lt;15 DME</strong> crossings when both are inside 15 DME (DEP↔DEP exempt), same-radial proximity, and ILS / EAT delays.
+              Detects <strong>Head-to-Head (&lt;45° track diff)</strong> altitude crossings within <strong>100 NM</strong> (until passing each other), <strong>VOR &lt;15 DME</strong> crossings when both are inside 15 DME (DEP↔DEP exempt), <strong>Same Route</strong> (<strong>10 DME</strong> crossing / <strong>20 DME</strong> same alt), and ILS clearance holds.
             </p>
           </div>
         </div>
@@ -442,11 +442,11 @@
             </div>
           </div>
 
-          <!-- PART 2: VOR <15 DME & SAME-RADIAL CONFLICTS -->
+          <!-- PART 2: VOR <15 DME & SAME-ROUTE CONFLICTS -->
           <div class="conflict-panel">
             <div class="panel-header">
-              <h3>🎯 VOR &lt;15 DME &amp; Radial Conflicts</h3>
-              <span class="badge-subtle">Both &lt;15 DME (DEP↔DEP exempt)</span>
+              <h3>🎯 VOR &lt;15 DME &amp; Same Route</h3>
+              <span class="badge-subtle">10 DME Cross / 20 DME Same Alt</span>
             </div>
             <div id="radialConflictList" class="conflict-list">
               <!-- Populated by JS -->
@@ -676,6 +676,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261117f"></script>
+  <script src="app.js?v=20261117h"></script>
 </body>
 </html>

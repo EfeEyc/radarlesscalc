@@ -2061,33 +2061,77 @@ function getAcftCorridorShort(item) {
   return item.wpt.name;
 }
 
+// Determines if a pair lacking < 1,000 ft vertical separation at step k is actively CROSSING altitudes
+// (10 DME minimum) vs maintaining / going to maintain the SAME altitude (20 DME minimum).
+function isSameRouteCrossingAtStep(sA, sB, k) {
+  const stA0 = sA[k];
+  const stA1 = sA[k + 1];
+  const stB0 = sB[k];
+  const stB1 = sB[k + 1];
+  const rateA = Math.abs(stA1.altFt - stA0.altFt);
+  const rateB = Math.abs(stB1.altFt - stB0.altFt);
+
+  // Neither is actively climbing/descending -> maintaining same altitude (20 DME)
+  if (rateA < 30 && rateB < 30) return false;
+
+  // Look ahead while vertical movement continues (up to 3.0 min) to verify they cross >= 1,000 ft past each other
+  const limit = Math.min(sA.length - 1, k + 15);
+  for (let u = k + 1; u <= limit; u++) {
+    const aCur = sA[u];
+    const bCur = sB[u];
+    const dAlt = Math.abs(aCur.altFt - bCur.altFt);
+    if (dAlt >= 999.5) return true; // Crossed completely through (>= 1,000 ft separation reached)
+
+    const rA = Math.abs(aCur.altFt - sA[u - 1].altFt);
+    const rB = Math.abs(bCur.altFt - sB[u - 1].altFt);
+    if (rA < 30 && rB < 30) return false; // Leveled off while still < 1,000 ft -> going to maintain same alt
+    if (!aCur.underSepControl || !bCur.underSepControl) return false;
+  }
+
+  return Math.abs(sA[limit].altFt - sB[limit].altFt) > Math.abs(stA0.altFt - stB0.altFt) + 50;
+}
+
 // Evaluates instantaneous pair separation & rule violations between [stA0..stA1] and [stB0..stB1]
-function evaluatePairStepViolation(itemA, stA0, stA1, itemB, stB0, stB1) {
+function evaluatePairStepViolation(itemA, stA0, stA1, itemB, stB0, stB1, sameRouteCrossing = false) {
   if (!stA0.underSepControl || !stB0.underSepControl) return null;
 
-  const altMinA = Math.min(stA0.altFt, stA1.altFt);
-  const altMaxA = Math.max(stA0.altFt, stA1.altFt);
-  const altMinB = Math.min(stB0.altFt, stB1.altFt);
-  const altMaxB = Math.max(stB0.altFt, stB1.altFt);
+  // Evaluate both aircraft symmetrically: use step midpoint when both remain in the same
+  // continuous leg under control; otherwise evaluate both at exact instant t_k to avoid time-skew artifacts.
+  const sameLegMid =
+    stA1.underSepControl &&
+    stB1.underSepControl &&
+    stA1.phase === stA0.phase &&
+    stB1.phase === stB0.phase;
+  const sA1Eff = sameLegMid ? stA1 : stA0;
+  const sB1Eff = sameLegMid ? stB1 : stB0;
+
+  const altMinA = Math.min(stA0.altFt, sA1Eff.altFt);
+  const altMaxA = Math.max(stA0.altFt, sA1Eff.altFt);
+  const altMinB = Math.min(stB0.altFt, sB1Eff.altFt);
+  const altMaxB = Math.max(stB0.altFt, sB1Eff.altFt);
 
   // Check if altitudes cross OR share < 1000 ft separation during this step
-  const minSeparatedFt = Math.min(Math.abs(stA0.altFt - stB0.altFt), Math.abs(stA1.altFt - stB1.altFt));
+  const minSeparatedFt = Math.min(
+    Math.abs(stA0.altFt - stB0.altFt),
+    Math.abs(sA1Eff.altFt - sB1Eff.altFt)
+  );
   const crossesOrLacks1000 =
     Math.max(altMinA, altMinB) < Math.min(altMaxA, altMaxB) + 999.5;
 
   if (!crossesOrLacks1000) return null;
 
-  // Midpoint geometry
-  const xA = (stA0.xNm + stA1.xNm) / 2;
-  const yA = (stA0.yNm + stA1.yNm) / 2;
-  const xB = (stB0.xNm + stB1.xNm) / 2;
-  const yB = (stB0.yNm + stB1.yNm) / 2;
+  // Symmetric position & DME distance
+  const xA = (stA0.xNm + sA1Eff.xNm) / 2;
+  const yA = (stA0.yNm + sA1Eff.yNm) / 2;
+  const xB = (stB0.xNm + sB1Eff.xNm) / 2;
+  const yB = (stB0.yNm + sB1Eff.yNm) / 2;
   const dx = xB - xA;
   const dy = yB - yA;
   const horizDistNm = Math.hypot(dx, dy);
 
-  const dmeA = Math.min(stA0.dme, stA1.dme);
-  const dmeB = Math.min(stB0.dme, stB1.dme);
+  const dmeA = Math.min(stA0.dme, sA1Eff.dme);
+  const dmeB = Math.min(stB0.dme, sB1Eff.dme);
+  const dmeDiff = Math.abs((stA0.dme + sA1Eff.dme) / 2 - (stB0.dme + sB1Eff.dme) / 2);
   const altDiffFt = Math.min(
     minSeparatedFt,
     Math.max(0, Math.max(altMinA, altMinB) - Math.min(altMaxA, altMaxB) > 0 ? Math.max(altMinA, altMinB) - Math.min(altMaxA, altMaxB) : 0)
@@ -2109,11 +2153,17 @@ function evaluatePairStepViolation(itemA, stA0, stA1, itemB, stB0, stB1) {
     isVorViolation = true;
   }
 
-  // 3. Check SAME-RADIAL PROXIMITY (same-direction radials < 15 deg apart, < 15 NM horiz, not H2H, not DEP<->DEP)
+  // 3. Check SAME-ROUTE SEPARATION:
+  //    Crossing altitudes -> 10 DME min; Maintaining / going to maintain same altitude -> 20 DME min
   let isSameRadialViolation = false;
-  if (!bothDep && !isVorViolation && !isHeadToHeadTrack && !isHeadToHeadViolation) {
+  const reqDmeMin = sameRouteCrossing ? 10 : 20;
+  if (!isVorViolation && !isHeadToHeadTrack && !isHeadToHeadViolation) {
     const radDiff = angularDiffDeg(stA0.radialDeg, stB0.radialDeg);
-    if (radDiff < 15 && horizDistNm < 15) {
+    const sameTrackDir =
+      stA0.trackDeg !== null && stB0.trackDeg !== null
+        ? angularDiffDeg(stA0.trackDeg, stB0.trackDeg) < 30
+        : stA0.phase === "hold" || stB0.phase === "hold";
+    if (radDiff < 15 && sameTrackDir && dmeDiff < reqDmeMin - 1e-4) {
       isSameRadialViolation = true;
     }
   }
@@ -2126,6 +2176,9 @@ function evaluatePairStepViolation(itemA, stA0, stA1, itemB, stB0, stB1) {
     isHeadToHeadViolation,
     isVorViolation,
     isSameRadialViolation,
+    sameRouteCrossing,
+    reqDmeMin,
+    dmeDiff: +dmeDiff.toFixed(1),
     headOnOffDeg: headOnOffDeg !== null ? +headOnOffDeg.toFixed(0) : null,
     horizDistNm: +horizDistNm.toFixed(1),
     dmeA: +stA0.dme.toFixed(1),
@@ -2236,8 +2289,15 @@ function detect4DConflicts(solver) {
       badgeText = `🎯 BOTH <15 DME (${best.dmeA}/${best.dmeB} NM)`;
       detailText = `Both aircraft inside <strong>15 DME</strong> of AYT VOR crossing/sharing altitude: <strong>${itemA.acft.callsign}</strong> at <strong>${best.dmeA} DME</strong> (${formatAltShort(best.altA)}) &amp; <strong>${itemB.acft.callsign}</strong> at <strong>${best.dmeB} DME</strong> (${formatAltShort(best.altB)}) at <code>${windowStr}</code>.`;
     } else {
-      badgeText = `📏 SAME RADIAL (${best.horizDistNm} NM)`;
-      detailText = `Same-radial proximity without 1,000' vertical separation: <strong>${itemA.acft.callsign}</strong> (${best.dmeA} DME, ${formatAltShort(best.altA)}) and <strong>${itemB.acft.callsign}</strong> (${best.dmeB} DME, ${formatAltShort(best.altB)}) only <strong>${best.horizDistNm} NM</strong> apart at <code>${windowStr}</code>.`;
+      const hasSameAlt = samples.some((s) => !s.sameRouteCrossing);
+      const minReq = hasSameAlt ? 20 : 10;
+      badgeText = hasSameAlt
+        ? `📏 SAME ROUTE ${best.dmeDiff} DME (<20 SAME ALT)`
+        : `📏 SAME ROUTE ${best.dmeDiff} DME (<10 CROSS)`;
+      detailText = hasSameAlt
+        ? `Same-route traffic maintaining/entering same altitude within <strong>20 DME</strong>: <strong>${itemA.acft.callsign}</strong> (${best.dmeA} DME, ${formatAltShort(best.altA)}) &amp; <strong>${itemB.acft.callsign}</strong> (${best.dmeB} DME, ${formatAltShort(best.altB)}) only <strong>${best.dmeDiff} DME</strong> apart during <code>${windowStr}</code>.`
+        : `Same-route traffic crossing altitudes within <strong>10 DME</strong>: <strong>${itemA.acft.callsign}</strong> (${best.dmeA} DME, ${formatAltShort(best.altA)}) &amp; <strong>${itemB.acft.callsign}</strong> (${best.dmeB} DME, ${formatAltShort(best.altB)}) only <strong>${best.dmeDiff} DME</strong> apart during <code>${windowStr}</code>.`;
+      best.effectiveReqDmeMin = minReq;
     }
 
     const passedH2h = passedH2hTimeNorm !== null && passedH2hTimeNorm <= tStart + 0.4;
@@ -2262,6 +2322,8 @@ function detect4DConflicts(solver) {
       windowStr,
       peakStr,
       minHorizNm: best.horizDistNm,
+      dmeDiff: best.dmeDiff,
+      reqDmeMin: best.effectiveReqDmeMin || best.reqDmeMin || 20,
       headOnOffDeg: best.headOnOffDeg,
       minDmeA: best.dmeA,
       minDmeB: best.dmeB,
@@ -2317,13 +2379,15 @@ function detect4DConflicts(solver) {
           }
         }
 
+        const sameRouteCrossing = isSameRouteCrossingAtStep(sA, sB, k);
         const res = evaluatePairStepViolation(
           itemA,
           sA[k],
           sA[k + 1],
           itemB,
           sB[k],
-          sB[k + 1]
+          sB[k + 1],
+          sameRouteCrossing
         );
 
         if (res && res.isHeadToHeadViolation) {
@@ -3512,7 +3576,7 @@ function renderConflictPanels(solver) {
             <span class="badge badge-nodelay">CLEAR (AT LEAST ONE ≥15 DME)</span>
           </div>
           <div class="conflict-detail">
-            No active conflicts where both aircraft are inside 15 DME crossing altitudes (DEP↔DEP exempt) or same-radial breaches.
+            No active conflicts where both aircraft are inside 15 DME (DEP↔DEP exempt) or same-route breaches (&lt;10 DME crossing / &lt;20 DME same alt).
           </div>
         </div>
       `;
@@ -4312,7 +4376,7 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
         ? `⚔️ ${d.distNm} NM H2H`
         : d.conflict.ruleType === "VOR_15DME"
         ? `🎯 VOR <15 DME`
-        : `📏 SAME RADIAL`;
+        : `📏 ${d.conflict.dmeDiff ?? d.distNm} NM (<${d.conflict.reqDmeMin || 20})`;
       ctx.font = "800 10px JetBrains Mono, monospace";
       const tw = ctx.measureText(lbl).width + 12;
       ctx.fillStyle = isH2h ? "rgba(127, 29, 29, 0.92)" : "rgba(120, 53, 15, 0.92)";
