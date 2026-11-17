@@ -475,8 +475,11 @@ function parseScenarioJsonText(rawText) {
 }
 
 // Application State
+const VERT_RATE_FPM = 2500; // Realistic radarless vertical transition rate (25 FL / min)
+
 const state = {
   activeView: "calc", // 'calc' | 'chart'
+  chartMode: "3d", // '3d' | '2d'
   activeRwy: "36",
   wizardOpen: false,
   wizardStepIdx: 0,
@@ -492,6 +495,17 @@ const state = {
   aircraftList: [],
   nextId: 1,
   playInterval: null,
+  selectedTestAcftId: null,
+  conflictScope: "all", // 'all' | 'now'
+  cam: {
+    yawDeg: 28,
+    pitchDeg: 34,
+    zoom: 1.0,
+    panX: 0,
+    panY: 0,
+    altScale: 1.0,
+  },
+  projectedBlips3d: [], // Hitboxes from last 3D render
 };
 
 function normalizeTransitEndpoints(acft) {
@@ -512,6 +526,7 @@ function normalizeTransitEndpoints(acft) {
 function loadSavedState() {
   try {
     const saved =
+      localStorage.getItem("ayt_radarsiz_state_v5") ||
       localStorage.getItem("ayt_radarsiz_state_v4") ||
       localStorage.getItem("ayt_radarsiz_state_v3") ||
       localStorage.getItem("ayt_radarsiz_state_v2");
@@ -521,19 +536,27 @@ function loadSavedState() {
       if (typeof parsed.globalQueryDme === "number") {
         state.globalQueryDme = parsed.globalQueryDme;
       }
+      if (parsed.cam && typeof parsed.cam === "object") {
+        state.cam = { ...state.cam, ...parsed.cam };
+      }
       if (Array.isArray(parsed.aircraftList)) {
         state.aircraftList = parsed.aircraftList.map((a) => {
           const wpt = getWaypointOrVor(a.wptId || a.entryWptId);
           const type = a.type || "ARR";
           const endpoints =
             type === "TRN" ? normalizeTransitEndpoints(a) : { entryWptId: a.wptId, exitWptId: null };
+          const baseFl = a.fl || (type === "DEP" ? wpt.defaultDepFl : wpt.defaultArrFl);
           return {
             ...a,
             type,
             wptId: a.wptId || endpoints.entryWptId || "DERYA",
             entryWptId: endpoints.entryWptId,
             exitWptId: endpoints.exitWptId,
-            fl: a.fl || (type === "DEP" ? wpt.defaultDepFl : wpt.defaultArrFl),
+            fl: baseFl,
+            flMode: a.flMode === "test" ? "test" : "auto",
+            testFl: typeof a.testFl === "number" ? a.testFl : baseFl,
+            stepTimeRaw: typeof a.stepTimeRaw === "string" ? a.stepTimeRaw : "",
+            stepFl: typeof a.stepFl === "number" ? a.stepFl : null,
             queryDme: typeof a.queryDme === "number" ? a.queryDme : state.globalQueryDme,
           };
         });
@@ -548,10 +571,11 @@ function loadSavedState() {
 function saveState() {
   try {
     localStorage.setItem(
-      "ayt_radarsiz_state_v4",
+      "ayt_radarsiz_state_v5",
       JSON.stringify({
         activeRwy: state.activeRwy,
         globalQueryDme: state.globalQueryDme,
+        cam: state.cam,
         aircraftList: state.aircraftList,
         nextId: state.nextId,
       })
@@ -588,7 +612,7 @@ function formatAltShort(feet) {
   return `${f}'`;
 }
 
-// Parse flexible time input: "0", "5", "05", ":05", "10:05", "9:30", "1005"
+// Parse flexible time input: "0", "5", "05", ":05", ":07:30", "10:05", "10:07:30", "1005"
 function parseTimeInput(rawStr) {
   const s = String(rawStr ?? "").trim();
   if (!s) {
@@ -596,7 +620,16 @@ function parseTimeInput(rawStr) {
   }
 
   if (s.startsWith(":")) {
-    const m = parseFloat(s.slice(1));
+    const rest = s.slice(1);
+    const colonIdx = rest.indexOf(":");
+    if (colonIdx !== -1) {
+      const m = parseInt(rest.slice(0, colonIdx), 10);
+      const sec = parseFloat(rest.slice(colonIdx + 1)) || 0;
+      if (!Number.isNaN(m)) {
+        return { valid: true, hasHour: false, totalMinutes: m + sec / 60 };
+      }
+    }
+    const m = parseFloat(rest);
     if (!Number.isNaN(m)) {
       return { valid: true, hasHour: false, totalMinutes: m };
     }
@@ -606,11 +639,12 @@ function parseTimeInput(rawStr) {
     const parts = s.split(":");
     const hh = parseInt(parts[0], 10);
     const mm = parseFloat(parts[1]);
+    const ss = parts[2] !== undefined ? parseFloat(parts[2]) || 0 : 0;
     if (!Number.isNaN(hh) && !Number.isNaN(mm)) {
       return {
         valid: true,
         hasHour: true,
-        totalMinutes: hh * 60 + mm,
+        totalMinutes: hh * 60 + mm + ss / 60,
       };
     }
   }
@@ -1040,273 +1074,9 @@ function analyzeScenarioConflicts(aircraftList, activeRwy) {
   });
 
   // --------------------------------------------------------------------------
-  // 2. Head-On Conflicts (Opposite-Direction on Same Waypoint / Radial)
-  // Covers:
-  //   - Departure (FROM AYT) <-> Arrival (TO AYT)
-  //   - Transit Outbound (FROM AYT) <-> Arrival (TO AYT)
-  //   - Departure (FROM AYT) <-> Transit Inbound (TO AYT)
-  //   - Transit Outbound (FROM AYT) <-> Transit Inbound (TO AYT)
+  // 2. Build Base Solver Context & Run Live 4D Conflict Scanner
   // --------------------------------------------------------------------------
-  const inboundLegs = [];
-  const outboundLegs = [];
-
-  computedArrivals.forEach((arr) => {
-    inboundLegs.push({
-      kind: "ARR",
-      icon: "🛬",
-      acft: arr.acft,
-      wpt: arr.wpt,
-      tZeroNorm: arr.normRadialZero,
-      maxDist: Math.max(arr.calc.dist, 60),
-      altSummary: `Descends from ${formatAlt(arr.calc.initAltFt)} → MEA ${formatAlt(
-        arr.wpt.meaFt
-      )} → MSA ${formatAlt(arr.wpt.msaFt)}`,
-      maintAltFt: null,
-      minAltFt: arr.wpt.msaFt,
-      maxAltFt: arr.calc.initAltFt,
-    });
-  });
-
-  computedDepartures.forEach((dep) => {
-    outboundLegs.push({
-      kind: "DEP",
-      icon: "🛫",
-      acft: dep.acft,
-      wpt: dep.wpt,
-      tZeroNorm: dep.normDep,
-      maxDist: 60,
-      altSummary: `Climbs to MSA ${formatAlt(dep.wpt.msaFt)} (<10 NM) → MEA ${formatAlt(
-        dep.wpt.meaFt
-      )} (<25 NM) → Req ${formatAlt(dep.calc.reqAltFt)}`,
-      maintAltFt: null,
-      minAltFt: 0,
-      maxAltFt: dep.calc.reqAltFt,
-    });
-  });
-
-  computedTransits.forEach((trn) => {
-    if (trn.calc.hasInbound) {
-      inboundLegs.push({
-        kind: "TRN",
-        icon: "✈️",
-        acft: trn.acft,
-        wpt: trn.entryWpt,
-        tZeroNorm: trn.normVor,
-        maxDist: Math.max(trn.calc.dist, 60),
-        altSummary: `Transit maintaining ${formatAlt(trn.calc.maintAltFt)} inbound via ${
-          trn.entryWpt.name
-        }`,
-        maintAltFt: trn.calc.maintAltFt,
-        minAltFt: trn.calc.maintAltFt,
-        maxAltFt: trn.calc.maintAltFt,
-      });
-    }
-    if (trn.calc.hasOutbound) {
-      outboundLegs.push({
-        kind: "TRN",
-        icon: "✈️",
-        acft: trn.acft,
-        wpt: trn.exitWpt,
-        tZeroNorm: trn.normVor,
-        maxDist: 60,
-        altSummary: `Transit maintaining ${formatAlt(trn.calc.maintAltFt)} outbound via ${
-          trn.exitWpt.name
-        }`,
-        maintAltFt: trn.calc.maintAltFt,
-        minAltFt: trn.calc.maintAltFt,
-        maxAltFt: trn.calc.maintAltFt,
-      });
-    }
-  });
-
-  const headOnConflicts = [];
-
-  outboundLegs.forEach((outLeg) => {
-    inboundLegs.forEach((inLeg) => {
-      if (outLeg.acft.id === inLeg.acft.id) return;
-      if (outLeg.wpt.id !== inLeg.wpt.id) return;
-
-      const wpt = outLeg.wpt;
-      const tCrossNorm = (outLeg.tZeroNorm + inLeg.tZeroNorm) / 2;
-      const dCross = +(SPEED_NM_PER_MIN * (tCrossNorm - outLeg.tZeroNorm)).toFixed(1);
-      const maxCheckDist = Math.max(inLeg.maxDist, outLeg.maxDist, 60);
-      const isValidInboundConflict = dCross >= 0 && dCross <= maxCheckDist;
-
-      let zone = "";
-      if (dCross >= 25) {
-        zone = "≥ 25 NM (Enroute / MEA Zone)";
-      } else if (dCross >= 10) {
-        zone = "10–25 NM (MSA Transition Zone)";
-      } else {
-        zone = "< 10 NM (Inner VOR Zone)";
-      }
-
-      const crossTimeStr = formatTime(
-        denormalizeTime(tCrossNorm, useHasHour, refHour),
-        useHasHour
-      );
-
-      let conflictNote = "";
-      if (outLeg.kind === "TRN" && inLeg.kind === "TRN") {
-        const diff = Math.abs(outLeg.maintAltFt - inLeg.maintAltFt);
-        conflictNote =
-          diff < 1000
-            ? `CRITICAL: Both Transit aircraft maintain ${formatAlt(
-                outLeg.maintAltFt
-              )} head-on on ${wpt.name}! Cross at ${dCross} NM @ ${crossTimeStr}.`
-            : `Head-on Transit crossing on ${wpt.name} at ${dCross} NM @ ${crossTimeStr} (${
-                outLeg.acft.callsign
-              } @ ${formatAlt(outLeg.maintAltFt)} vs ${inLeg.acft.callsign} @ ${formatAlt(
-                inLeg.maintAltFt
-              )}).`;
-      } else if (outLeg.kind === "TRN" || inLeg.kind === "TRN") {
-        const trnLeg = outLeg.kind === "TRN" ? outLeg : inLeg;
-        const otherLeg = outLeg.kind === "TRN" ? inLeg : outLeg;
-        conflictNote = `Head-on with Transit ${trnLeg.acft.callsign} (maintaining ${formatAlt(
-          trnLeg.maintAltFt
-        )}) on ${wpt.name}! ${otherLeg.acft.callsign} (${
-          otherLeg.altSummary
-        }) crosses ${trnLeg.acft.callsign} at ${dCross} NM @ ${crossTimeStr}.`;
-      } else {
-        conflictNote = `Head-on Departure ↔ Arrival on ${wpt.name}: ${outLeg.acft.callsign} (outbound) and ${inLeg.acft.callsign} (inbound) cross at ${dCross} NM @ ${crossTimeStr} (${zone}).`;
-      }
-
-      headOnConflicts.push({
-        outLeg,
-        inLeg,
-        wpt,
-        tCrossNorm,
-        displayTime: crossTimeStr,
-        dCross,
-        zone,
-        isValidInboundConflict,
-        conflictNote,
-      });
-    });
-  });
-
-  // --------------------------------------------------------------------------
-  // 3. Radial, Same-Direction & <15 NM AYT VOR Convergence Conflicts
-  // --------------------------------------------------------------------------
-  const radialConflicts = [];
-
-  // 3A. Build <15 NM AYT VOR Occupancy Windows for all aircraft (ARR, DEP, TRN)
-  const vor15Occupants = [];
-
-  sequencedArrivals.forEach((arr) => {
-    const eatInfo = eatMap.get(arr.acft.id);
-    const tEnter = arr.norm15 !== null ? arr.norm15 : arr.normInit;
-    const tExit = eatInfo ? eatInfo.effectiveEstNorm : arr.norm10 + 9;
-    vor15Occupants.push({
-      kind: "ARR",
-      icon: "🛬",
-      acft: arr.acft,
-      corridorLabel: arr.wpt.name,
-      tEnter,
-      tExit,
-      altLabel: `MSA ${formatAltShort(arr.wpt.msaFt)} → ILS`,
-    });
-  });
-
-  computedDepartures.forEach((dep) => {
-    vor15Occupants.push({
-      kind: "DEP",
-      icon: "🛫",
-      acft: dep.acft,
-      corridorLabel: dep.wpt.name,
-      tEnter: dep.normDep,
-      tExit: dep.norm15,
-      altLabel: `Climb ≥${formatAltShort(dep.wpt.msaFt)} MSA`,
-    });
-  });
-
-  computedTransits.forEach((trn) => {
-    const tEnter = trn.calc.hasInbound
-      ? trn.norm15To !== null
-        ? trn.norm15To
-        : trn.normInit
-      : trn.normVor;
-    const tExit = trn.calc.hasOutbound ? trn.norm15From : trn.normVor;
-    vor15Occupants.push({
-      kind: "TRN",
-      icon: "✈️",
-      acft: trn.acft,
-      corridorLabel: `${trn.entryWpt.name}→${trn.exitWpt.name}`,
-      tEnter,
-      tExit,
-      altLabel: `Maintains ${formatAlt(trn.calc.maintAltFt)}`,
-    });
-  });
-
-  for (let i = 0; i < vor15Occupants.length; i++) {
-    for (let j = i + 1; j < vor15Occupants.length; j++) {
-      const A = vor15Occupants[i];
-      const B = vor15Occupants[j];
-      const ovStart = Math.max(A.tEnter, B.tEnter);
-      const ovEnd = Math.min(A.tExit, B.tExit);
-
-      if (ovStart < ovEnd - 1e-6) {
-        const startStr = formatTime(denormalizeTime(ovStart, useHasHour, refHour), useHasHour);
-        const endStr = formatTime(denormalizeTime(ovEnd, useHasHour, refHour), useHasHour);
-        radialConflicts.push({
-          pairLabel: `${A.icon} ${A.acft.callsign} (${A.corridorLabel}) & ${B.icon} ${B.acft.callsign} (${B.corridorLabel})`,
-          badgeText: `< 15 NM VOR OVERLAP`,
-          windowStr: `${startStr}–${endStr}`,
-          detailText: `Both aircraft are inside <strong>15 NM of AYT VOR</strong> simultaneously from <code>${startStr}</code> to <code>${endStr}</code> (${A.acft.callsign}: ${A.altLabel} • ${B.acft.callsign}: ${B.altLabel}). Maintain ≥1,000 ft vertical separation inside 15 NM.`,
-          isAlert: true,
-        });
-      }
-    }
-  }
-
-  // 3B. Same-Direction Same-Waypoint Proximity (< 3 min / 15 NM on same leg)
-  for (let i = 0; i < inboundLegs.length; i++) {
-    for (let j = i + 1; j < inboundLegs.length; j++) {
-      const A = inboundLegs[i];
-      const B = inboundLegs[j];
-      if (A.wpt.id !== B.wpt.id) continue;
-      const gapMins = Math.abs(A.tZeroNorm - B.tZeroNorm);
-      const gapNm = +(gapMins * SPEED_NM_PER_MIN).toFixed(1);
-      if (gapMins < 5) {
-        radialConflicts.push({
-          pairLabel: `${A.icon} ${A.acft.callsign} & ${B.icon} ${B.acft.callsign}`,
-          badgeText: `SAME INBOUND (${A.wpt.name})`,
-          windowStr: `${gapNm} NM (${+gapMins.toFixed(1)}m) spacing`,
-          detailText: `Both flying inbound (TO AYT) on <strong>${A.wpt.name}</strong> with <strong>${gapNm} NM (${+gapMins.toFixed(
-            1
-          )} min)</strong> spacing (${A.acft.callsign}: ${A.altSummary} • ${B.acft.callsign}: ${
-            B.altSummary
-          }).`,
-          isAlert: true,
-        });
-      }
-    }
-  }
-
-  for (let i = 0; i < outboundLegs.length; i++) {
-    for (let j = i + 1; j < outboundLegs.length; j++) {
-      const A = outboundLegs[i];
-      const B = outboundLegs[j];
-      if (A.wpt.id !== B.wpt.id) continue;
-      const gapMins = Math.abs(A.tZeroNorm - B.tZeroNorm);
-      const gapNm = +(gapMins * SPEED_NM_PER_MIN).toFixed(1);
-      if (gapMins < 5) {
-        radialConflicts.push({
-          pairLabel: `${A.icon} ${A.acft.callsign} & ${B.icon} ${B.acft.callsign}`,
-          badgeText: `SAME OUTBOUND (${A.wpt.name})`,
-          windowStr: `${gapNm} NM (${+gapMins.toFixed(1)}m) spacing`,
-          detailText: `Both flying outbound (FROM AYT) on <strong>${A.wpt.name}</strong> with <strong>${gapNm} NM (${+gapMins.toFixed(
-            1
-          )} min)</strong> spacing (${A.acft.callsign}: ${A.altSummary} • ${B.acft.callsign}: ${
-            B.altSummary
-          }).`,
-          isAlert: true,
-        });
-      }
-    }
-  }
-
-  return {
+  const baseSolver = {
     refHour,
     useHasHour,
     computedArrivals,
@@ -1314,95 +1084,299 @@ function analyzeScenarioConflicts(aircraftList, activeRwy) {
     computedTransits,
     sequencedArrivals,
     eatMap,
-    headOnConflicts,
-    radialConflicts,
+  };
+
+  const scanResult = detect4DConflicts(baseSolver);
+
+  return {
+    ...baseSolver,
+    tMin: scanResult.tMin,
+    tMax: scanResult.tMax,
+    headOnConflicts: scanResult.headOnConflicts,
+    radialConflicts: scanResult.radialConflicts,
+    conflicts4d: scanResult.conflicts4d,
+    heatmapBins: scanResult.heatmapBins,
+    conflictAcftIds: scanResult.conflictAcftIds,
   };
 }
 
 // ============================================================================
-// LIVE POSITION, ALTITUDE & SVG COORDINATE ESTIMATOR AT TIME T
-// Supports Arrivals (ARR), Departures (DEP), and Transit (TRN) aircraft!
+// 4D TRAJECTORY ENGINE & REAL-TIME SEPARATION CONFLICT DETECTOR
+// Implements:
+//  1. VOR Separation: BOTH aircraft must be >= 15 DME when crossing/sharing alt
+//     (Rule exempts DEP <-> DEP pairs only; applies to all other pairs!)
+//  2. Head-to-Head Routes: Tracks within <45° of reciprocal (180° ± 45°)
+//     while closing are NOT allowed to cross/share altitudes within 100 NM!
+//  3. Same-Radial Proximity: Non-(DEP<->DEP) aircraft on same radial (<15°)
+//     within <15 NM horizontally without 1,000 ft vertical separation.
 // ============================================================================
-function polarToSvg(dmeNm, deg) {
+function polarToNm(dmeNm, deg) {
   const rad = (deg * Math.PI) / 180;
-  const rPx = dmeNm * PX_PER_NM;
   return {
-    x: +(SVG_CENTER_X + rPx * Math.sin(rad)).toFixed(1),
-    y: +(SVG_CENTER_Y - rPx * Math.cos(rad)).toFixed(1),
+    xNm: dmeNm * Math.sin(rad),
+    yNm: dmeNm * Math.cos(rad),
   };
+}
+
+function polarToSvg(dmeNm, deg) {
+  const { xNm, yNm } = polarToNm(dmeNm, deg);
+  return {
+    x: +(SVG_CENTER_X + xNm * PX_PER_NM).toFixed(1),
+    y: +(SVG_CENTER_Y - yNm * PX_PER_NM).toFixed(1),
+  };
+}
+
+function nmToSvg(xNm, yNm) {
+  return {
+    x: +(SVG_CENTER_X + xNm * PX_PER_NM).toFixed(1),
+    y: +(SVG_CENTER_Y - yNm * PX_PER_NM).toFixed(1),
+  };
+}
+
+function stepTowardAlt(startAlt, targetAlt, dtMins, rateFpm = VERT_RATE_FPM) {
+  const delta = Math.max(0, dtMins) * rateFpm;
+  if (targetAlt >= startAlt) return Math.min(targetAlt, startAlt + delta);
+  return Math.max(targetAlt, startAlt - delta);
+}
+
+function evalPiecewiseAlt(anchors, tQuery) {
+  if (!anchors || anchors.length === 0) return 10000;
+  if (tQuery <= anchors[0].t) return anchors[0].alt;
+  const last = anchors[anchors.length - 1];
+  if (tQuery >= last.t) return last.alt;
+
+  for (let i = 0; i < anchors.length - 1; i++) {
+    const a = anchors[i];
+    const b = anchors[i + 1];
+    if (tQuery >= a.t && tQuery <= b.t) {
+      const span = b.t - a.t;
+      if (span <= 1e-6) return b.alt;
+      const frac = (tQuery - a.t) / span;
+      return a.alt + (b.alt - a.alt) * frac;
+    }
+  }
+  return last.alt;
+}
+
+function evaluatePlannedAltitude(item, eatInfo, queryNormMins, refHour) {
+  const { acft, calc } = item;
+  const isTest = acft.flMode === "test";
+  const target1Ft = isTest
+    ? flInputToFeet(acft.testFl ?? acft.fl)
+    : null;
+
+  function evalBasePhase1(t) {
+    // TRANSIT
+    if (acft.type === "TRN") {
+      return isTest ? target1Ft : calc.maintAltFt;
+    }
+
+    // DEPARTURE
+    if (acft.type === "DEP") {
+      const { wpt } = item;
+      const tDep = item.normDep;
+      if (t <= tDep) return 1000;
+
+      const finalTargetFt = isTest ? target1Ft : calc.reqAltFt;
+      const msaCap = isTest ? Math.min(finalTargetFt, wpt.msaFt) : Math.min(calc.reqAltFt, wpt.msaFt);
+      const meaCap = isTest
+        ? Math.min(finalTargetFt, Math.max(wpt.msaFt, wpt.meaFt))
+        : Math.min(calc.reqAltFt, Math.max(wpt.msaFt, wpt.meaFt));
+
+      if (t <= item.norm10) {
+        return evalPiecewiseAlt(
+          [
+            { t: tDep, alt: 1000 },
+            { t: item.norm10, alt: msaCap },
+          ],
+          t
+        );
+      }
+      if (t <= item.norm25) {
+        return evalPiecewiseAlt(
+          [
+            { t: item.norm10, alt: msaCap },
+            { t: item.norm25, alt: meaCap },
+          ],
+          t
+        );
+      }
+      return stepTowardAlt(meaCap, finalTargetFt, t - item.norm25, VERT_RATE_FPM);
+    }
+
+    // ARRIVAL
+    const { wpt } = item;
+    if (isTest) {
+      if (t <= item.normInit) return calc.initAltFt;
+      return stepTowardAlt(calc.initAltFt, target1Ft, t - item.normInit, VERT_RATE_FPM);
+    }
+
+    const t25 = item.norm25 ?? item.normInit;
+    const alt25 = Math.min(calc.initAltFt, wpt.meaFt);
+
+    if (calc.straightIn) {
+      const inner10Alt = eatInfo && eatInfo.willDelay ? Math.max(4000, wpt.msaFt) : 3000;
+      const estNorm = eatInfo ? eatInfo.effectiveEstNorm : item.norm10;
+      const anchors = [
+        { t: item.normInit, alt: calc.initAltFt },
+        { t: t25, alt: alt25 },
+        { t: item.norm10, alt: inner10Alt },
+      ];
+      if (estNorm > item.norm10 + 0.05) {
+        anchors.push({ t: estNorm - 0.1, alt: 4000 });
+        anchors.push({ t: estNorm, alt: 3000 });
+      }
+      anchors.push({ t: estNorm + 2, alt: 0 });
+      return evalPiecewiseAlt(anchors, t);
+    }
+
+    const inner10Alt = Math.max(wpt.msaFt, 4000);
+    const estNorm = eatInfo ? eatInfo.effectiveEstNorm : item.norm10 + 9;
+    const fixNorm = eatInfo ? eatInfo.effectiveFixNorm : item.normFixBase;
+    const anchors = [
+      { t: item.normInit, alt: calc.initAltFt },
+      { t: t25, alt: alt25 },
+      { t: item.norm10, alt: inner10Alt },
+      { t: item.normVor, alt: 4000 },
+      { t: fixNorm, alt: 4000 },
+      { t: estNorm, alt: 3000 },
+      { t: estNorm + 2, alt: 0 },
+    ];
+    return evalPiecewiseAlt(anchors, t);
+  }
+
+  // Optional 2nd Clearance Step (after stepTimeRaw -> stepFl)
+  const rawStepT = String(acft.stepTimeRaw || "").trim();
+  if (isTest && rawStepT !== "" && acft.stepFl !== null && acft.stepFl !== undefined) {
+    const pStep = parseTimeInput(rawStepT);
+    if (pStep.valid) {
+      const tStep2Norm = normalizeTime(pStep.totalMinutes, pStep.hasHour, refHour);
+      if (queryNormMins > tStep2Norm) {
+        const altAtStep2 = evalBasePhase1(tStep2Norm);
+        const target2Ft = flInputToFeet(acft.stepFl);
+        return Math.round(
+          stepTowardAlt(altAtStep2, target2Ft, queryNormMins - tStep2Norm, VERT_RATE_FPM)
+        );
+      }
+    }
+  }
+
+  return Math.round(evalBasePhase1(queryNormMins));
 }
 
 function getAircraftStateAtTime(item, solverData, queryNormMins) {
   const { acft, calc } = item;
+  const eatInfo = acft.type === "ARR" || !acft.type ? solverData.eatMap.get(acft.id) : null;
+  const liveAltFt = evaluatePlannedAltitude(item, eatInfo, queryNormMins, solverData.refHour);
+  const altStr = formatAltShort(liveAltFt);
+  const isTested = acft.flMode === "test";
 
   // 1. TRANSIT AIRCRAFT ('TRN')
   if (acft.type === "TRN") {
     const { entryWpt, exitWpt } = item;
-    const altStr = formatAltShort(calc.maintAltFt);
 
     if (queryNormMins < item.normInit) {
       const wait = +(item.normInit - queryNormMins).toFixed(1);
+      const { xNm, yNm } = polarToNm(calc.dist, entryWpt.deg);
       return {
         visible: false,
+        underSepControl: false,
         phase: "pending",
         dme: calc.dist,
-        altFt: calc.maintAltFt,
+        xNm,
+        yNm,
+        vx: 0,
+        vy: 0,
+        radialDeg: entryWpt.deg,
+        trackDeg: null,
+        altFt: liveAltFt,
         altStr,
-        text: `Transit enters ${entryWpt.name} (${calc.dist} NM) in ${wait}m @ ${altStr}`,
-        color: "var(--text-muted)",
+        isTested,
+        text: `Enters ${entryWpt.name} (${calc.dist} NM) in ${wait}m @ ${altStr}`,
+        color: "#64748b",
       };
     }
 
     // Inbound leg TO AYT VOR
     if (calc.hasInbound && queryNormMins <= item.normVor) {
-      const dme = Math.max(0, +((item.normVor - queryNormMins) * SPEED_NM_PER_MIN).toFixed(1));
-      const pos = polarToSvg(dme, entryWpt.deg);
-      const tip = polarToSvg(Math.max(0, dme - 4), entryWpt.deg);
+      const dme = Math.max(0, +((item.normVor - queryNormMins) * SPEED_NM_PER_MIN).toFixed(2));
+      const { xNm, yNm } = polarToNm(dme, entryWpt.deg);
+      const svgPos = nmToSvg(xNm, yNm);
+      const tipPos = polarToSvg(Math.max(0, dme - 4), entryWpt.deg);
+      const trackDeg = (entryWpt.deg + 180) % 360;
+      const trackRad = (trackDeg * Math.PI) / 180;
       return {
-        visible: dme <= 72,
+        visible: dme <= 74,
+        underSepControl: dme <= 74,
         phase: "transit-in",
-        x: pos.x,
-        y: pos.y,
-        tipX: tip.x,
-        tipY: tip.y,
-        dme,
-        altFt: calc.maintAltFt,
+        x: svgPos.x,
+        y: svgPos.y,
+        tipX: tipPos.x,
+        tipY: tipPos.y,
+        xNm,
+        yNm,
+        vx: SPEED_NM_PER_MIN * Math.sin(trackRad),
+        vy: SPEED_NM_PER_MIN * Math.cos(trackRad),
+        radialDeg: entryWpt.deg,
+        trackDeg,
+        dme: +dme.toFixed(1),
+        altFt: liveAltFt,
         altStr,
-        text: `${dme} NM TO AYT (${entryWpt.name} → ${exitWpt.name}) @ ${altStr}`,
-        color: "#34d399",
+        isTested,
+        text: `${+dme.toFixed(1)} NM TO AYT (${entryWpt.name} → ${exitWpt.name}) @ ${altStr}`,
+        color: isTested ? "#c084fc" : "#34d399",
       };
     }
 
     // Outbound leg FROM AYT VOR
     if (calc.hasOutbound) {
-      const dme = +((queryNormMins - item.normVor) * SPEED_NM_PER_MIN).toFixed(1);
+      const dme = +((queryNormMins - item.normVor) * SPEED_NM_PER_MIN).toFixed(2);
       if (dme <= 72) {
-        const pos = polarToSvg(dme, exitWpt.deg);
-        const tip = polarToSvg(Math.min(76, dme + 4), exitWpt.deg);
+        const { xNm, yNm } = polarToNm(dme, exitWpt.deg);
+        const svgPos = nmToSvg(xNm, yNm);
+        const tipPos = polarToSvg(Math.min(76, dme + 4), exitWpt.deg);
+        const trackDeg = exitWpt.deg;
+        const trackRad = (trackDeg * Math.PI) / 180;
         return {
           visible: true,
+          underSepControl: true,
           phase: "transit-out",
-          x: pos.x,
-          y: pos.y,
-          tipX: tip.x,
-          tipY: tip.y,
-          dme,
-          altFt: calc.maintAltFt,
+          x: svgPos.x,
+          y: svgPos.y,
+          tipX: tipPos.x,
+          tipY: tipPos.y,
+          xNm,
+          yNm,
+          vx: SPEED_NM_PER_MIN * Math.sin(trackRad),
+          vy: SPEED_NM_PER_MIN * Math.cos(trackRad),
+          radialDeg: exitWpt.deg,
+          trackDeg,
+          dme: +dme.toFixed(1),
+          altFt: liveAltFt,
           altStr,
-          text: `${dme} NM FROM AYT (toward ${exitWpt.name}) @ ${altStr}`,
-          color: "#34d399",
+          isTested,
+          text: `${+dme.toFixed(1)} NM FROM AYT (→ ${exitWpt.name}) @ ${altStr}`,
+          color: isTested ? "#c084fc" : "#34d399",
         };
       }
     }
 
     return {
       visible: false,
+      underSepControl: false,
       phase: "exited",
-      dme: 0,
-      altFt: calc.maintAltFt,
+      dme: 72,
+      xNm: 0,
+      yNm: 0,
+      vx: 0,
+      vy: 0,
+      radialDeg: exitWpt.deg,
+      trackDeg: null,
+      altFt: liveAltFt,
       altStr,
-      text: `Completed transit (${entryWpt.name} → ${exitWpt.name})`,
-      color: "var(--text-muted)",
+      isTested,
+      text: `Exited TMA (${entryWpt.name} → ${exitWpt.name})`,
+      color: "#64748b",
     };
   }
 
@@ -1414,192 +1388,276 @@ function getAircraftStateAtTime(item, solverData, queryNormMins) {
       const wait = +(tDep - queryNormMins).toFixed(1);
       return {
         visible: false,
+        underSepControl: false,
         phase: "ground",
         dme: 0,
+        xNm: 0,
+        yNm: 0,
+        vx: 0,
+        vy: 0,
+        radialDeg: wpt.deg,
+        trackDeg: null,
         altFt: 0,
         altStr: "GND",
+        isTested,
         text: `On ground (Departs in ${wait}m)`,
-        color: "var(--text-muted)",
+        color: "#64748b",
       };
     }
 
     const elapsed = queryNormMins - tDep;
-    const dme = +(elapsed * SPEED_NM_PER_MIN).toFixed(1);
-    const currentAltFt =
-      dme < 10 ? wpt.msaFt : dme < 25 ? Math.max(wpt.msaFt, wpt.meaFt) : calc.reqAltFt;
-
-    const pos = polarToSvg(Math.min(dme, 72), wpt.deg);
-    const tip = polarToSvg(Math.min(dme + 4, 76), wpt.deg);
+    const dme = +(elapsed * SPEED_NM_PER_MIN).toFixed(2);
+    const clampedDme = Math.min(dme, 72);
+    const { xNm, yNm } = polarToNm(clampedDme, wpt.deg);
+    const svgPos = nmToSvg(xNm, yNm);
+    const tipPos = polarToSvg(Math.min(dme + 4, 76), wpt.deg);
+    const trackDeg = wpt.deg;
+    const trackRad = (trackDeg * Math.PI) / 180;
 
     return {
       visible: dme <= 72,
-      phase: "outbound",
-      x: pos.x,
-      y: pos.y,
-      tipX: tip.x,
-      tipY: tip.y,
-      dme,
-      altFt: currentAltFt,
-      altStr: formatAltShort(currentAltFt),
-      text: `${dme} NM FROM AYT on ${wpt.name} @ ${formatAltShort(currentAltFt)}`,
-      color: "#fbbf24",
+      underSepControl: dme <= 72,
+      phase: dme <= 72 ? "outbound" : "exited",
+      x: svgPos.x,
+      y: svgPos.y,
+      tipX: tipPos.x,
+      tipY: tipPos.y,
+      xNm,
+      yNm,
+      vx: SPEED_NM_PER_MIN * Math.sin(trackRad),
+      vy: SPEED_NM_PER_MIN * Math.cos(trackRad),
+      radialDeg: wpt.deg,
+      trackDeg,
+      dme: +dme.toFixed(1),
+      altFt: liveAltFt,
+      altStr,
+      isTested,
+      text: `${+dme.toFixed(1)} NM FROM AYT on ${wpt.name} @ ${altStr}`,
+      color: isTested ? "#c084fc" : "#fbbf24",
     };
   }
 
   // 3. ARRIVAL AIRCRAFT ('ARR')
-  const eatInfo = solverData.eatMap.get(acft.id);
   const tInit = item.normInit;
   const d0 = calc.dist;
 
   if (queryNormMins < tInit) {
     const wait = +(tInit - queryNormMins).toFixed(1);
+    const { xNm, yNm } = polarToNm(d0, wpt.deg);
     return {
       visible: false,
+      underSepControl: false,
       phase: "pending",
       dme: d0,
-      altFt: calc.initAltFt,
-      altStr: formatAltShort(calc.initAltFt),
-      text: `Reports ${d0} NM in ${wait}m (@ ${formatAltShort(calc.initAltFt)})`,
-      color: "var(--text-muted)",
+      xNm,
+      yNm,
+      vx: 0,
+      vy: 0,
+      radialDeg: wpt.deg,
+      trackDeg: null,
+      altFt: liveAltFt,
+      altStr,
+      isTested,
+      text: `Reports ${d0} NM in ${wait}m (@ ${altStr})`,
+      color: "#64748b",
     };
   }
 
-  const currentAltFt =
-    queryNormMins < (item.norm25 ?? tInit)
-      ? wpt.meaFt
-      : queryNormMins < item.norm10
-      ? calc.straightIn && !eatInfo.willDelay
-        ? 3000
-        : wpt.msaFt
-      : 3000;
+  const inbTrackDeg = (wpt.deg + 180) % 360;
+  const inbTrackRad = (inbTrackDeg * Math.PI) / 180;
+  const inbVx = SPEED_NM_PER_MIN * Math.sin(inbTrackRad);
+  const inbVy = SPEED_NM_PER_MIN * Math.cos(inbTrackRad);
 
   // Straight-In Arrival Geometry
   if (calc.straightIn) {
     if (queryNormMins <= item.norm10) {
       const elapsed = queryNormMins - tInit;
-      const dme = Math.max(10, +(d0 - elapsed * SPEED_NM_PER_MIN).toFixed(1));
-      const pos = polarToSvg(dme, wpt.deg);
-      const tip = polarToSvg(Math.max(0, dme - 4), wpt.deg);
+      const dme = Math.max(10, +(d0 - elapsed * SPEED_NM_PER_MIN).toFixed(2));
+      const { xNm, yNm } = polarToNm(dme, wpt.deg);
+      const svgPos = nmToSvg(xNm, yNm);
+      const tipPos = polarToSvg(Math.max(0, dme - 4), wpt.deg);
       return {
         visible: true,
+        underSepControl: true,
         phase: "inbound",
-        x: pos.x,
-        y: pos.y,
-        tipX: tip.x,
-        tipY: tip.y,
-        dme,
-        altFt: currentAltFt,
-        altStr: formatAltShort(currentAltFt),
-        text: `${dme} NM TO AYT ${wpt.name} (Str-In) @ ${formatAltShort(currentAltFt)}`,
+        x: svgPos.x,
+        y: svgPos.y,
+        tipX: tipPos.x,
+        tipY: tipPos.y,
+        xNm,
+        yNm,
+        vx: inbVx,
+        vy: inbVy,
+        radialDeg: wpt.deg,
+        trackDeg: inbTrackDeg,
+        dme: +dme.toFixed(1),
+        altFt: liveAltFt,
+        altStr,
+        isTested,
+        text: `${+dme.toFixed(1)} NM TO AYT ${wpt.name} (Str-In) @ ${altStr}`,
         color: "#c084fc",
       };
     }
 
     if (queryNormMins <= eatInfo.effectiveEstNorm) {
-      const pos = polarToSvg(10, wpt.deg);
+      const { xNm, yNm } = polarToNm(10, wpt.deg);
+      const svgPos = nmToSvg(xNm, yNm);
       return {
         visible: true,
+        underSepControl: true,
         phase: "hold",
-        x: pos.x,
-        y: pos.y,
-        tipX: pos.x,
-        tipY: pos.y,
+        x: svgPos.x,
+        y: svgPos.y,
+        tipX: svgPos.x,
+        tipY: svgPos.y,
+        xNm,
+        yNm,
+        vx: 0,
+        vy: 0,
+        radialDeg: wpt.deg,
+        trackDeg: null,
         dme: 10,
-        altFt: 4000,
-        altStr: "4000' HLD",
-        text: `10 NM (${wpt.name}) — Holding until EAT ${eatInfo.eatDisplay}`,
+        altFt: liveAltFt,
+        altStr: `${altStr} HLD`,
+        isTested,
+        text: `10 NM (${wpt.name}) — Holding until EAT ${eatInfo.eatDisplay} @ ${altStr}`,
         color: "#34d399",
       };
     }
 
-    const afterEst = +(queryNormMins - eatInfo.effectiveEstNorm).toFixed(1);
+    const afterEst = +(queryNormMins - eatInfo.effectiveEstNorm).toFixed(2);
     if (afterEst <= 2) {
-      const finalDme = Math.max(0, +(10 - afterEst * SPEED_NM_PER_MIN).toFixed(1));
-      const pos = polarToSvg(finalDme, wpt.deg);
-      const tip = polarToSvg(Math.max(0, finalDme - 3), wpt.deg);
+      const finalDme = Math.max(0, +(10 - afterEst * SPEED_NM_PER_MIN).toFixed(2));
+      const { xNm, yNm } = polarToNm(finalDme, wpt.deg);
+      const svgPos = nmToSvg(xNm, yNm);
+      const tipPos = polarToSvg(Math.max(0, finalDme - 3), wpt.deg);
       return {
         visible: true,
+        underSepControl: false, // Handed off to AYT TWR 118.1 once Full Established
         phase: "twr",
-        x: pos.x,
-        y: pos.y,
-        tipX: tip.x,
-        tipY: tip.y,
-        dme: finalDme,
-        altFt: 1500,
+        x: svgPos.x,
+        y: svgPos.y,
+        tipX: tipPos.x,
+        tipY: tipPos.y,
+        xNm,
+        yNm,
+        vx: inbVx,
+        vy: inbVy,
+        radialDeg: wpt.deg,
+        trackDeg: null,
+        dme: +finalDme.toFixed(1),
+        altFt: liveAltFt,
         altStr: "TWR",
-        text: `Established w/ TWR (${finalDme} NM final)`,
+        isTested,
+        text: `Established w/ TWR 118.1 (${+finalDme.toFixed(1)} NM final)`,
         color: "#34d399",
       };
     }
 
     return {
       visible: false,
+      underSepControl: false,
       phase: "landed",
       dme: 0,
+      xNm: 0,
+      yNm: 0,
+      vx: 0,
+      vy: 0,
+      radialDeg: wpt.deg,
+      trackDeg: null,
       altFt: 0,
       altStr: "LND",
-      text: `Established ${afterEst}m ago (Landed)`,
-      color: "var(--text-muted)",
+      isTested,
+      text: `Established ${+afterEst.toFixed(1)}m ago (Landed)`,
+      color: "#64748b",
     };
   }
 
   // Normal Arrival Geometry:
   if (queryNormMins <= item.normVor) {
     const elapsed = queryNormMins - tInit;
-    const dme = Math.max(0, +(d0 - elapsed * SPEED_NM_PER_MIN).toFixed(1));
-    const pos = polarToSvg(dme, wpt.deg);
-    const tip = polarToSvg(Math.max(0, dme - 4), wpt.deg);
+    const dme = Math.max(0, +(d0 - elapsed * SPEED_NM_PER_MIN).toFixed(2));
+    const { xNm, yNm } = polarToNm(dme, wpt.deg);
+    const svgPos = nmToSvg(xNm, yNm);
+    const tipPos = polarToSvg(Math.max(0, dme - 4), wpt.deg);
     return {
       visible: true,
+      underSepControl: true,
       phase: "inbound",
-      x: pos.x,
-      y: pos.y,
-      tipX: tip.x,
-      tipY: tip.y,
-      dme,
-      altFt: currentAltFt,
-      altStr: formatAltShort(currentAltFt),
-      text: `${dme} NM TO AYT ${wpt.name} @ ${formatAltShort(currentAltFt)}`,
-      color: "#38bdf8",
+      x: svgPos.x,
+      y: svgPos.y,
+      tipX: tipPos.x,
+      tipY: tipPos.y,
+      xNm,
+      yNm,
+      vx: inbVx,
+      vy: inbVy,
+      radialDeg: wpt.deg,
+      trackDeg: inbTrackDeg,
+      dme: +dme.toFixed(1),
+      altFt: liveAltFt,
+      altStr,
+      isTested,
+      text: `${+dme.toFixed(1)} NM TO AYT ${wpt.name} @ ${altStr}`,
+      color: isTested ? "#c084fc" : "#38bdf8",
     };
   }
 
   const procDeg = state.activeRwy === "36" ? 170 : 350;
+  const procRad = (procDeg * Math.PI) / 180;
 
   if (queryNormMins <= item.normFixBase) {
     const outElapsed = queryNormMins - item.normVor;
-    const dme = +(outElapsed * SPEED_NM_PER_MIN).toFixed(1);
-    const pos = polarToSvg(dme, procDeg);
-    const tip = polarToSvg(dme + 3.5, procDeg);
+    const dme = +(outElapsed * SPEED_NM_PER_MIN).toFixed(2);
+    const { xNm, yNm } = polarToNm(dme, procDeg);
+    const svgPos = nmToSvg(xNm, yNm);
+    const tipPos = polarToSvg(dme + 3.5, procDeg);
     return {
       visible: true,
+      underSepControl: true,
       phase: "outbound-fix",
-      x: pos.x,
-      y: pos.y,
-      tipX: tip.x,
-      tipY: tip.y,
-      dme,
-      altFt: 4000,
-      altStr: "4000'",
-      text: `${dme} NM outbound to 10 DME FIX`,
-      color: "#fbbf24",
+      x: svgPos.x,
+      y: svgPos.y,
+      tipX: tipPos.x,
+      tipY: tipPos.y,
+      xNm,
+      yNm,
+      vx: SPEED_NM_PER_MIN * Math.sin(procRad),
+      vy: SPEED_NM_PER_MIN * Math.cos(procRad),
+      radialDeg: procDeg,
+      trackDeg: procDeg,
+      dme: +dme.toFixed(1),
+      altFt: liveAltFt,
+      altStr,
+      isTested,
+      text: `${+dme.toFixed(1)} NM outbound to 10 DME FIX @ ${altStr}`,
+      color: isTested ? "#c084fc" : "#fbbf24",
     };
   }
 
   if (queryNormMins <= eatInfo.effectiveFixNorm) {
     const remHold = +(eatInfo.effectiveFixNorm - queryNormMins).toFixed(1);
-    const pos = polarToSvg(10, procDeg);
+    const { xNm, yNm } = polarToNm(10, procDeg);
+    const svgPos = nmToSvg(xNm, yNm);
     return {
       visible: true,
+      underSepControl: true,
       phase: "hold",
-      x: +(pos.x + 12).toFixed(1),
-      y: +(pos.y + 8).toFixed(1),
-      tipX: pos.x,
-      tipY: pos.y,
+      x: +(svgPos.x + 12).toFixed(1),
+      y: +(svgPos.y + 8).toFixed(1),
+      tipX: svgPos.x,
+      tipY: svgPos.y,
+      xNm,
+      yNm,
+      vx: 0,
+      vy: 0,
+      radialDeg: procDeg,
+      trackDeg: null,
       dme: 10,
-      altFt: 4000,
-      altStr: "4000' HLD",
-      text: `HOLDING at 10 DME FIX (${remHold}m to EAT)`,
+      altFt: liveAltFt,
+      altStr: `${altStr} HLD`,
+      isTested,
+      text: `HOLDING at 10 DME FIX (${remHold}m to EAT) @ ${altStr}`,
       color: "#f87171",
     };
   }
@@ -1609,51 +1667,394 @@ function getAircraftStateAtTime(item, solverData, queryNormMins) {
     const remTurn = +(eatInfo.effectiveEstNorm - queryNormMins).toFixed(1);
     const arcDme = 10 + 3 * Math.sin(turnProgress * Math.PI);
     const arcDeg = procDeg + 12 * Math.sin(turnProgress * Math.PI);
-    const pos = polarToSvg(arcDme, arcDeg);
-    const tip = polarToSvg(Math.max(0, arcDme - 3), procDeg);
+    const { xNm, yNm } = polarToNm(arcDme, arcDeg);
+    const svgPos = nmToSvg(xNm, yNm);
+    const tipPos = polarToSvg(Math.max(0, arcDme - 3), procDeg);
     return {
       visible: true,
+      underSepControl: true,
       phase: "turn",
-      x: pos.x,
-      y: pos.y,
-      tipX: tip.x,
-      tipY: tip.y,
+      x: svgPos.x,
+      y: svgPos.y,
+      tipX: tipPos.x,
+      tipY: tipPos.y,
+      xNm,
+      yNm,
+      vx: 0,
+      vy: 0,
+      radialDeg: arcDeg,
+      trackDeg: null,
       dme: +arcDme.toFixed(1),
-      altFt: 3000,
-      altStr: "3000' ILS",
-      text: `In 5-min ILS turn (${remTurn}m to Establish) @ 3,000'`,
+      altFt: liveAltFt,
+      altStr: `${altStr} ILS`,
+      isTested,
+      text: `In 5m ILS turn (${remTurn}m to Est) @ ${altStr}`,
       color: "#34d399",
     };
   }
 
-  const afterEst = +(queryNormMins - eatInfo.effectiveEstNorm).toFixed(1);
+  const afterEst = +(queryNormMins - eatInfo.effectiveEstNorm).toFixed(2);
   if (afterEst <= 2) {
-    const finalDme = Math.max(0, +(10 - afterEst * SPEED_NM_PER_MIN).toFixed(1));
-    const pos = polarToSvg(finalDme, procDeg);
-    const tip = polarToSvg(Math.max(0, finalDme - 3), procDeg);
+    const finalDme = Math.max(0, +(10 - afterEst * SPEED_NM_PER_MIN).toFixed(2));
+    const { xNm, yNm } = polarToNm(finalDme, procDeg);
+    const svgPos = nmToSvg(xNm, yNm);
+    const tipPos = polarToSvg(Math.max(0, finalDme - 3), procDeg);
+    const finalTrack = (procDeg + 180) % 360;
+    const finalTrackRad = (finalTrack * Math.PI) / 180;
     return {
       visible: true,
+      underSepControl: false, // Handed off to AYT TWR 118.1
       phase: "twr",
-      x: pos.x,
-      y: pos.y,
-      tipX: tip.x,
-      tipY: tip.y,
-      dme: finalDme,
-      altFt: 1500,
+      x: svgPos.x,
+      y: svgPos.y,
+      tipX: tipPos.x,
+      tipY: tipPos.y,
+      xNm,
+      yNm,
+      vx: SPEED_NM_PER_MIN * Math.sin(finalTrackRad),
+      vy: SPEED_NM_PER_MIN * Math.cos(finalTrackRad),
+      radialDeg: procDeg,
+      trackDeg: null,
+      dme: +finalDme.toFixed(1),
+      altFt: liveAltFt,
       altStr: "EST/TWR",
-      text: `Established w/ TWR 118.1 (${finalDme} NM final)`,
+      isTested,
+      text: `Established w/ TWR 118.1 (${+finalDme.toFixed(1)} NM final)`,
       color: "#34d399",
     };
   }
 
   return {
     visible: false,
+    underSepControl: false,
     phase: "landed",
     dme: 0,
+    xNm: 0,
+    yNm: 0,
+    vx: 0,
+    vy: 0,
+    radialDeg: wpt.deg,
+    trackDeg: null,
     altFt: 0,
     altStr: "LND",
-    text: `Established ${afterEst}m ago (Sent to TWR)`,
-    color: "var(--text-muted)",
+    isTested,
+    text: `Established ${+afterEst.toFixed(1)}m ago (Sent to TWR)`,
+    color: "#64748b",
+  };
+}
+
+function getAllItemsFromSolver(solver) {
+  return [
+    ...solver.computedArrivals,
+    ...solver.computedDepartures,
+    ...solver.computedTransits,
+  ];
+}
+
+function getScenarioTimeBounds(solver) {
+  const allItems = getAllItemsFromSolver(solver);
+  if (allItems.length === 0) return { tMin: 0, tMax: 30 };
+
+  const tMin = Math.min(
+    ...allItems.map((it) => (it.acft.type === "DEP" ? it.normDep : it.normInit))
+  );
+  const tMax = Math.max(
+    ...allItems.map((it) =>
+      it.acft.type === "DEP"
+        ? it.normDep + 15
+        : it.acft.type === "TRN"
+        ? it.norm60From || it.normVor + 14
+        : (solver.eatMap.get(it.acft.id)?.effectiveEstNorm || it.normInit + 20) + 2
+    )
+  );
+  return { tMin: Math.floor(tMin), tMax: Math.ceil(tMax) };
+}
+
+function angularDiffDeg(a, b) {
+  let d = Math.abs(a - b) % 360;
+  if (d > 180) d = 360 - d;
+  return d;
+}
+
+function getAcftIcon(type) {
+  if (type === "DEP") return "🛫";
+  if (type === "TRN") return "✈️";
+  return "🛬";
+}
+
+function getAcftCorridorShort(item) {
+  if (item.acft.type === "TRN") return `${item.entryWpt.name}→${item.exitWpt.name}`;
+  return item.wpt.name;
+}
+
+// Evaluates instantaneous pair separation & rule violations between [stA0..stA1] and [stB0..stB1]
+function evaluatePairStepViolation(itemA, stA0, stA1, itemB, stB0, stB1) {
+  if (!stA0.underSepControl || !stB0.underSepControl) return null;
+
+  const altMinA = Math.min(stA0.altFt, stA1.altFt);
+  const altMaxA = Math.max(stA0.altFt, stA1.altFt);
+  const altMinB = Math.min(stB0.altFt, stB1.altFt);
+  const altMaxB = Math.max(stB0.altFt, stB1.altFt);
+
+  // Check if altitudes cross OR share < 1000 ft separation during this step
+  const minSeparatedFt = Math.min(Math.abs(stA0.altFt - stB0.altFt), Math.abs(stA1.altFt - stB1.altFt));
+  const crossesOrLacks1000 =
+    Math.max(altMinA, altMinB) < Math.min(altMaxA, altMaxB) + 999.5;
+
+  if (!crossesOrLacks1000) return null;
+
+  // Midpoint geometry
+  const xA = (stA0.xNm + stA1.xNm) / 2;
+  const yA = (stA0.yNm + stA1.yNm) / 2;
+  const xB = (stB0.xNm + stB1.xNm) / 2;
+  const yB = (stB0.yNm + stB1.yNm) / 2;
+  const dx = xB - xA;
+  const dy = yB - yA;
+  const horizDistNm = Math.hypot(dx, dy);
+
+  const dmeA = Math.min(stA0.dme, stA1.dme);
+  const dmeB = Math.min(stB0.dme, stB1.dme);
+  const altDiffFt = Math.min(
+    minSeparatedFt,
+    Math.max(0, Math.max(altMinA, altMinB) - Math.min(altMaxA, altMaxB) > 0 ? Math.max(altMinA, altMinB) - Math.min(altMaxA, altMaxB) : 0)
+  );
+
+  const bothDep = itemA.acft.type === "DEP" && itemB.acft.type === "DEP";
+
+  // 1. Check HEAD-TO-HEAD (< 45 deg off reciprocal) & < 100 NM while closing
+  let isHeadToHeadViolation = false;
+  let headOnOffDeg = null;
+  if (stA0.trackDeg !== null && stB0.trackDeg !== null) {
+    const recipA = (stA0.trackDeg + 180) % 360;
+    headOnOffDeg = angularDiffDeg(recipA, stB0.trackDeg);
+    if (headOnOffDeg < 45 - 1e-6) {
+      const dvx = stB0.vx - stA0.vx;
+      const dvy = stB0.vy - stA0.vy;
+      // Closing rate toward each other in NM/min (positive = approaching, negative = diverging)
+      const closingRate =
+        horizDistNm > 0.05 ? -(dx * dvx + dy * dvy) / horizDistNm : bothDep ? -10 : 10;
+      if (closingRate > 0.1 && horizDistNm < 100 - 1e-4) {
+        isHeadToHeadViolation = true;
+      }
+    }
+  }
+
+  // 2. Check VOR SEPARATION (< 15 DME) — Exempt ONLY for DEP <-> DEP!
+  let isVorViolation = false;
+  if (!bothDep && (dmeA < 15 - 1e-4 || dmeB < 15 - 1e-4)) {
+    isVorViolation = true;
+  }
+
+  // 3. Check SAME-RADIAL PROXIMITY (radials < 15 deg apart on same side, < 15 NM horiz, not DEP<->DEP)
+  let isSameRadialViolation = false;
+  if (!bothDep && dmeA >= 15 && dmeB >= 15 && !isHeadToHeadViolation) {
+    const radDiff = angularDiffDeg(stA0.radialDeg, stB0.radialDeg);
+    if (radDiff < 15 && horizDistNm < 15) {
+      isSameRadialViolation = true;
+    }
+  }
+
+  if (!isHeadToHeadViolation && !isVorViolation && !isSameRadialViolation) {
+    return null;
+  }
+
+  return {
+    isHeadToHeadViolation,
+    isVorViolation,
+    isSameRadialViolation,
+    headOnOffDeg: headOnOffDeg !== null ? +headOnOffDeg.toFixed(0) : null,
+    horizDistNm: +horizDistNm.toFixed(1),
+    dmeA: +stA0.dme.toFixed(1),
+    dmeB: +stB0.dme.toFixed(1),
+    altA: stA0.altFt,
+    altB: stB0.altFt,
+    altDiffFt: Math.round(altDiffFt),
+  };
+}
+
+function detect4DConflicts(solver) {
+  const { refHour, useHasHour } = solver;
+  const allItems = getAllItemsFromSolver(solver);
+  const { tMin, tMax } = getScenarioTimeBounds(solver);
+
+  const DT = 0.2; // 12-second precision
+  const times = [];
+  for (let t = tMin; t <= tMax + 1e-6; t = +(t + DT).toFixed(4)) {
+    times.push(t);
+  }
+
+  if (allItems.length < 2 || times.length < 2) {
+    return {
+      tMin,
+      tMax,
+      headOnConflicts: [],
+      radialConflicts: [],
+      conflicts4d: [],
+      heatmapBins: times.map((t) => ({ t, severity: "safe" })),
+      conflictAcftIds: new Set(),
+    };
+  }
+
+  // Precompute states per item across all sample steps
+  const seriesMap = new Map();
+  allItems.forEach((item) => {
+    seriesMap.set(
+      item.acft.id,
+      times.map((t) => getAircraftStateAtTime(item, solver, t))
+    );
+  });
+
+  const conflicts4d = [];
+  const conflictAcftIds = new Set();
+
+  // Track heatmap severity at every sample index
+  const binSeverity = new Array(times.length - 1).fill("safe");
+
+  function pushEpisode(itemA, itemB, ruleType, samples) {
+    if (samples.length === 0) return;
+    conflictAcftIds.add(itemA.acft.id);
+    conflictAcftIds.add(itemB.acft.id);
+
+    const tStart = samples[0].t;
+    const tEnd = samples[samples.length - 1].tEnd;
+    let best = samples[0];
+    samples.forEach((s) => {
+      if (ruleType === "HEAD_TO_HEAD") {
+        if (s.horizDistNm < best.horizDistNm) best = s;
+      } else {
+        if (Math.min(s.dmeA, s.dmeB) < Math.min(best.dmeA, best.dmeB)) best = s;
+      }
+    });
+
+    const startStr = formatTime(denormalizeTime(tStart, useHasHour, refHour), useHasHour);
+    const endStr = formatTime(denormalizeTime(tEnd, useHasHour, refHour), useHasHour);
+    const peakStr = formatTime(denormalizeTime(best.t, useHasHour, refHour), useHasHour);
+    const windowStr = tEnd - tStart < 0.35 ? peakStr : `${startStr}–${endStr}`;
+
+    const iconA = getAcftIcon(itemA.acft.type);
+    const iconB = getAcftIcon(itemB.acft.type);
+    const corrA = getAcftCorridorShort(itemA);
+    const corrB = getAcftCorridorShort(itemB);
+
+    let badgeText = "";
+    let detailText = "";
+    if (ruleType === "HEAD_TO_HEAD") {
+      badgeText = `⚔️ H2H ${best.headOnOffDeg}° • ${best.horizDistNm} NM (<100)`;
+      detailText = `<strong>${itemA.acft.callsign}</strong> (${formatAltShort(best.altA)} @ ${best.dmeA} DME) and <strong>${itemB.acft.callsign}</strong> (${formatAltShort(best.altB)} @ ${best.dmeB} DME) are head-to-head (<strong>${best.headOnOffDeg}°</strong> off reciprocal, <strong>${best.horizDistNm} NM &lt; 100 NM</strong>) crossing altitudes during <code>${windowStr}</code>.`;
+    } else if (ruleType === "VOR_15DME") {
+      const minDme = Math.min(best.dmeA, best.dmeB);
+      badgeText = `🎯 VOR <15 DME (${minDme} NM)`;
+      detailText = `Crossing/sharing altitude inside <strong>15 DME</strong> of AYT VOR (both must be ≥15 DME): <strong>${itemA.acft.callsign}</strong> at <strong>${best.dmeA} DME</strong> (${formatAltShort(best.altA)}) vs <strong>${itemB.acft.callsign}</strong> at <strong>${best.dmeB} DME</strong> (${formatAltShort(best.altB)}) at <code>${windowStr}</code>.`;
+    } else {
+      badgeText = `📏 SAME RADIAL (${best.horizDistNm} NM)`;
+      detailText = `Same-radial proximity without 1,000' vertical separation: <strong>${itemA.acft.callsign}</strong> (${best.dmeA} DME, ${formatAltShort(best.altA)}) and <strong>${itemB.acft.callsign}</strong> (${best.dmeB} DME, ${formatAltShort(best.altB)}) only <strong>${best.horizDistNm} NM</strong> apart at <code>${windowStr}</code>.`;
+    }
+
+    conflicts4d.push({
+      id: `${itemA.acft.id}-${itemB.acft.id}-${ruleType}-${tStart}`,
+      ruleType,
+      itemA,
+      itemB,
+      pairIds: [itemA.acft.id, itemB.acft.id],
+      pairLabel: `${iconA} ${itemA.acft.callsign} (${corrA}) ↔ ${iconB} ${itemB.acft.callsign} (${corrB})`,
+      badgeText,
+      tStart,
+      tEnd,
+      tPeak: best.t,
+      windowStr,
+      peakStr,
+      minHorizNm: best.horizDistNm,
+      headOnOffDeg: best.headOnOffDeg,
+      minDmeA: best.dmeA,
+      minDmeB: best.dmeB,
+      altA: best.altA,
+      altB: best.altB,
+      detailText,
+    });
+  }
+
+  for (let i = 0; i < allItems.length; i++) {
+    for (let j = i + 1; j < allItems.length; j++) {
+      const itemA = allItems[i];
+      const itemB = allItems[j];
+      const sA = seriesMap.get(itemA.acft.id);
+      const sB = seriesMap.get(itemB.acft.id);
+
+      let activeH2h = [];
+      let activeVor = [];
+      let activeSame = [];
+
+      for (let k = 0; k < times.length - 1; k++) {
+        const res = evaluatePairStepViolation(
+          itemA,
+          sA[k],
+          sA[k + 1],
+          itemB,
+          sB[k],
+          sB[k + 1]
+        );
+
+        if (res && res.isHeadToHeadViolation) {
+          activeH2h.push({ t: times[k], tEnd: times[k + 1], ...res });
+          binSeverity[k] = "h2h";
+        } else if (activeH2h.length > 0) {
+          pushEpisode(itemA, itemB, "HEAD_TO_HEAD", activeH2h);
+          activeH2h = [];
+        }
+
+        if (res && res.isVorViolation) {
+          activeVor.push({ t: times[k], tEnd: times[k + 1], ...res });
+          if (binSeverity[k] !== "h2h") binSeverity[k] = "vor";
+        } else if (activeVor.length > 0) {
+          pushEpisode(itemA, itemB, "VOR_15DME", activeVor);
+          activeVor = [];
+        }
+
+        if (res && res.isSameRadialViolation) {
+          activeSame.push({ t: times[k], tEnd: times[k + 1], ...res });
+          if (binSeverity[k] === "safe") binSeverity[k] = "vor";
+        } else if (activeSame.length > 0) {
+          pushEpisode(itemA, itemB, "SAME_RADIAL", activeSame);
+          activeSame = [];
+        }
+      }
+
+      if (activeH2h.length > 0) pushEpisode(itemA, itemB, "HEAD_TO_HEAD", activeH2h);
+      if (activeVor.length > 0) pushEpisode(itemA, itemB, "VOR_15DME", activeVor);
+      if (activeSame.length > 0) pushEpisode(itemA, itemB, "SAME_RADIAL", activeSame);
+    }
+  }
+
+  conflicts4d.sort((a, b) => a.tStart - b.tStart);
+
+  // Downsample heatmap bins into ~50 crisp visual bars
+  const TARGET_BINS = 54;
+  const stepBin = Math.max(1, Math.floor(binSeverity.length / TARGET_BINS));
+  const heatmapBins = [];
+  for (let b = 0; b < binSeverity.length; b += stepBin) {
+    let sev = "safe";
+    for (let u = b; u < Math.min(binSeverity.length, b + stepBin); u++) {
+      if (binSeverity[u] === "h2h") {
+        sev = "h2h";
+        break;
+      }
+      if (binSeverity[u] === "vor") sev = "vor";
+    }
+    heatmapBins.push({
+      t: times[b],
+      tEnd: times[Math.min(times.length - 1, b + stepBin)],
+      severity: sev,
+    });
+  }
+
+  return {
+    tMin,
+    tMax,
+    headOnConflicts: conflicts4d.filter((c) => c.ruleType === "HEAD_TO_HEAD"),
+    radialConflicts: conflicts4d.filter((c) => c.ruleType !== "HEAD_TO_HEAD"),
+    conflicts4d,
+    heatmapBins,
+    conflictAcftIds,
   };
 }
 
@@ -2482,80 +2883,110 @@ function renderScenarioBoard() {
   renderRadarChartView(solver);
 }
 
-// Render the 3 Conflict Finder Panels (Head-On, Radial/<15 NM VOR, and Approach Sequence/EAT)
+// Jump the 3D/2D radar timeline cleanly to any normalized minute
+function jumpChartToTime(normMins, solverHint = null) {
+  const solver = solverHint || analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+  const disp = denormalizeTime(normMins, solver.useHasHour, solver.refHour);
+  const formatted = solver.useHasHour
+    ? formatTime(disp, true)
+    : String(+disp.toFixed(1));
+  state.lookupTimeRaw = formatted;
+
+  const lookupTimeInput = document.getElementById("lookupTimeInput");
+  const radarTimeSlider = document.getElementById("radarTimeSlider");
+  if (lookupTimeInput) lookupTimeInput.value = formatted;
+  if (radarTimeSlider) radarTimeSlider.value = normMins;
+
+  if (state.activeView !== "chart") {
+    state.activeView = "chart";
+    const viewTabs = document.querySelectorAll(".view-tab");
+    const viewCalc = document.getElementById("viewCalc");
+    const viewChart = document.getElementById("viewChart");
+    viewTabs.forEach((t) => {
+      const isChart = t.getAttribute("data-view") === "chart";
+      t.classList.toggle("active", isChart);
+      t.setAttribute("aria-selected", isChart ? "true" : "false");
+    });
+    if (viewCalc) viewCalc.classList.add("hidden");
+    if (viewChart) viewChart.classList.remove("hidden");
+  }
+
+  requestAnimationFrame(() => renderRadarChartView(solver));
+}
+
+// Render the 3 Conflict Finder Panels on Calculator Tab (Powered by Live 4D Engine)
 function renderConflictPanels(solver) {
   const depArrListEl = document.getElementById("depArrConflictList");
   const radialConflictListEl = document.getElementById("radialConflictList");
   const ilsDelayListEl = document.getElementById("ilsDelayList");
 
-  // 1. Head-On Conflicts (Same Waypoint — ARR / DEP / TRN)
-  if (solver.headOnConflicts.length === 0) {
-    depArrListEl.innerHTML = `
-      <div class="conflict-box">
-        <div class="conflict-detail">
-          No Head-On opposite-direction traffic pairs on the same waypoint.
+  // 1. Head-to-Head (<45 deg off reciprocal) & <100 NM Conflicts
+  if (depArrListEl) {
+    if (solver.headOnConflicts.length === 0) {
+      depArrListEl.innerHTML = `
+        <div class="conflict-box alert-safe">
+          <div class="conflict-top">
+            <span class="conflict-pair">✅ Clear Head-to-Head</span>
+            <span class="badge badge-nodelay">NO H2H &lt;100 NM BREACH</span>
+          </div>
+          <div class="conflict-detail">
+            No aircraft pairs with &lt;45° head-to-head track alignment cross altitudes within 100 NM.
+          </div>
         </div>
-      </div>
-    `;
-  } else {
-    depArrListEl.innerHTML = "";
-    solver.headOnConflicts.forEach((c) => {
-      const box = document.createElement("div");
-      if (c.isValidInboundConflict) {
+      `;
+    } else {
+      depArrListEl.innerHTML = "";
+      solver.headOnConflicts.forEach((c) => {
+        const box = document.createElement("div");
         box.className = "conflict-box alert-danger";
         box.innerHTML = `
           <div class="conflict-top">
-            <span class="conflict-pair">${c.outLeg.icon} ${c.outLeg.acft.callsign} ↔ ${c.inLeg.icon} ${c.inLeg.acft.callsign}</span>
-            <span class="badge badge-delayed">${c.wpt.name} (${c.zone})</span>
+            <span class="conflict-pair">${c.pairLabel}</span>
+            <span class="badge badge-delayed">${c.badgeText}</span>
           </div>
           <div class="conflict-metrics">
-            <div class="metric-pill where-pill">📍 WHERE: <strong>${c.dCross} NM (${c.wpt.name})</strong></div>
-            <div class="metric-pill when-pill">⏰ WHEN: <strong>${c.displayTime}</strong></div>
+            <div class="metric-pill where-pill">📍 DIST: <strong>${c.minHorizNm} NM</strong> (&lt;100)</div>
+            <div class="metric-pill when-pill">⏰ WHEN: <strong>${c.windowStr}</strong></div>
+            <button type="button" class="conflict-jump-btn" data-jump-t="${c.tPeak}">📡 View in 3D</button>
           </div>
           <div class="conflict-detail" style="color:var(--text-main);">
-            ${c.conflictNote}
+            ${c.detailText}
           </div>
         `;
-      } else {
-        box.className = "conflict-box alert-safe";
-        box.innerHTML = `
-          <div class="conflict-top">
-            <span class="conflict-pair">${c.outLeg.icon} ${c.outLeg.acft.callsign} ↔ ${c.inLeg.icon} ${c.inLeg.acft.callsign}</span>
-            <span class="badge badge-nodelay">${c.wpt.name} — CLEAR</span>
-          </div>
-          <div class="conflict-detail">
-            No head-on radial crossing within the active TMA segment.
-          </div>
-        `;
-      }
-      depArrListEl.appendChild(box);
-    });
+        depArrListEl.appendChild(box);
+      });
+    }
   }
 
-  // 2. Radial, Same-Direction & <15 NM AYT VOR Conflicts
+  // 2. VOR <15 DME (DEP<->DEP Exempt) & Same-Radial Conflicts
   if (radialConflictListEl) {
     radialConflictListEl.innerHTML = "";
     const radList = solver.radialConflicts || [];
 
     if (radList.length === 0) {
       radialConflictListEl.innerHTML = `
-        <div class="conflict-box">
+        <div class="conflict-box alert-safe">
+          <div class="conflict-top">
+            <span class="conflict-pair">✅ Clear VOR &amp; Radial Sep</span>
+            <span class="badge badge-nodelay">BOTH ≥15 DME / SEPARATED</span>
+          </div>
           <div class="conflict-detail">
-            No cross-radial &lt;15 NM VOR or same-corridor spacing conflicts detected.
+            No VOR &lt;15 DME altitude-crossing violations (DEP↔DEP exempt) or same-radial breaches detected.
           </div>
         </div>
       `;
     } else {
       radList.forEach((rc) => {
         const box = document.createElement("div");
-        box.className = `conflict-box ${rc.isAlert ? "alert-warn" : "alert-safe"}`;
+        box.className = "conflict-box alert-warn";
         box.innerHTML = `
           <div class="conflict-top">
             <span class="conflict-pair">${rc.pairLabel}</span>
             <span class="badge badge-eat">${rc.badgeText}</span>
           </div>
           <div class="conflict-metrics">
-            <div class="metric-pill when-pill">⏰ WINDOW / SPACING: <strong>${rc.windowStr}</strong></div>
+            <div class="metric-pill when-pill">⏰ WINDOW: <strong>${rc.windowStr}</strong></div>
+            <button type="button" class="conflict-jump-btn" data-jump-t="${rc.tPeak}">📡 View in 3D</button>
           </div>
           <div class="conflict-detail" style="color:var(--text-main);">
             ${rc.detailText}
@@ -2566,61 +2997,71 @@ function renderConflictPanels(solver) {
     }
   }
 
-  // 3. Approach Sequence & EAT Delays
-  ilsDelayListEl.innerHTML = "";
-  const delayedArrs = solver.sequencedArrivals.filter(
-    (item) => solver.eatMap.get(item.acft.id)?.willDelay
-  );
-  if (solver.sequencedArrivals.length === 0) {
-    ilsDelayListEl.innerHTML = `
-      <div class="conflict-box">
-        <div class="conflict-detail">Add arriving aircraft to see approach sequencing and EAT calculations.</div>
-      </div>
-    `;
-  } else if (delayedArrs.length === 0) {
-    ilsDelayListEl.innerHTML = `
-      <div class="conflict-box alert-safe">
-        <div class="conflict-top">
-          <span class="conflict-pair">✅ All Arrivals On Time</span>
-          <span class="badge badge-nodelay">NO EAT DELAY</span>
-        </div>
-        <div class="conflict-detail">
-          Every arriving aircraft reaches its ILS clearance point after the preceding aircraft is already Established.
-        </div>
-      </div>
-    `;
-  } else {
-    delayedArrs.forEach((item) => {
-      const eatInfo = solver.eatMap.get(item.acft.id);
-      const box = document.createElement("div");
-      box.className = "conflict-box alert-danger";
+  // Wire Jump to 3D buttons inside Conflict Finder
+  document.querySelectorAll(".conflict-jump-btn[data-jump-t]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const tVal = parseFloat(btn.getAttribute("data-jump-t"));
+      if (!Number.isNaN(tVal)) jumpChartToTime(tVal, solver);
+    });
+  });
 
-      box.innerHTML = `
-        <div class="conflict-top">
-          <span class="conflict-pair">⏳ ${item.acft.callsign} (${item.wpt.name}) — EAT: ${eatInfo.eatDisplay}</span>
-          <span class="badge badge-delayed">${
-            eatInfo.autoHoldMins > 0 ? `HOLDS ${eatInfo.autoHoldMins}m` : "NO HOLD NEEDED"
-          }</span>
-        </div>
-        <div class="conflict-detail" style="color:var(--text-main);">
-          Reaches ILS clearance point at <code>${formatTime(
-            item.calc.tClearBase,
-            item.calc.hasHour
-          )}</code>, while <strong>#${eatInfo.seqNum - 1} ${
-        eatInfo.blockedBy.acft.callsign
-      }</strong> is not established until <code>${eatInfo.eatDisplay}</code>.<br/>
-          → <strong>EAT = ${eatInfo.eatDisplay}</strong> (${
-        eatInfo.clearancePhaseNote
-      }) → Established at <code>${eatInfo.effectiveEstDisplay}</code>.
+  // 3. Approach Sequence & EAT Delays
+  if (ilsDelayListEl) {
+    ilsDelayListEl.innerHTML = "";
+    const delayedArrs = solver.sequencedArrivals.filter(
+      (item) => solver.eatMap.get(item.acft.id)?.willDelay
+    );
+    if (solver.sequencedArrivals.length === 0) {
+      ilsDelayListEl.innerHTML = `
+        <div class="conflict-box">
+          <div class="conflict-detail">Add arriving aircraft to see approach sequencing and EAT calculations.</div>
         </div>
       `;
-      ilsDelayListEl.appendChild(box);
-    });
+    } else if (delayedArrs.length === 0) {
+      ilsDelayListEl.innerHTML = `
+        <div class="conflict-box alert-safe">
+          <div class="conflict-top">
+            <span class="conflict-pair">✅ All Arrivals On Time</span>
+            <span class="badge badge-nodelay">NO EAT DELAY</span>
+          </div>
+          <div class="conflict-detail">
+            Every arriving aircraft reaches its ILS clearance point after the preceding aircraft is already Established.
+          </div>
+        </div>
+      `;
+    } else {
+      delayedArrs.forEach((item) => {
+        const eatInfo = solver.eatMap.get(item.acft.id);
+        const box = document.createElement("div");
+        box.className = "conflict-box alert-danger";
+
+        box.innerHTML = `
+          <div class="conflict-top">
+            <span class="conflict-pair">⏳ ${item.acft.callsign} (${item.wpt.name}) — EAT: ${eatInfo.eatDisplay}</span>
+            <span class="badge badge-delayed">${
+              eatInfo.autoHoldMins > 0 ? `HOLDS ${eatInfo.autoHoldMins}m` : "NO HOLD NEEDED"
+            }</span>
+          </div>
+          <div class="conflict-detail" style="color:var(--text-main);">
+            Reaches ILS clearance point at <code>${formatTime(
+              item.calc.tClearBase,
+              item.calc.hasHour
+            )}</code>, while <strong>#${eatInfo.seqNum - 1} ${
+          eatInfo.blockedBy.acft.callsign
+        }</strong> is not established until <code>${eatInfo.eatDisplay}</code>.<br/>
+            → <strong>EAT = ${eatInfo.eatDisplay}</strong> (${
+          eatInfo.clearancePhaseNote
+        }) → Established at <code>${eatInfo.effectiveEstDisplay}</code>.
+          </div>
+        `;
+        ilsDelayListEl.appendChild(box);
+      });
+    }
   }
 }
 
 // ============================================================================
-// VIEW 2: STATIC SVG CORRIDORS + DYNAMIC LIVE AIRCRAFT BLIPS
+// VIEW 2A: STATIC 2D SVG CORRIDORS + NON-OVERLAPPING TAGS
 // ============================================================================
 function renderStaticSvgCorridors() {
   const layer = document.getElementById("svgCorridorsLayer");
@@ -2848,41 +3289,1021 @@ function computeNonOverlappingTagPositions(visibleBlips) {
   return placedTags;
 }
 
+// ============================================================================
+// VIEW 2B: INTERACTIVE 3D AIRSPACE CANVAS ENGINE (MOBILE-FRIENDLY)
+// ============================================================================
+function roundRectPath(ctx, x, y, w, h, r) {
+  const rad = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rad, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rad);
+  ctx.arcTo(x + w, y + h, x, y + h, rad);
+  ctx.arcTo(x, y + h, x, y, rad);
+  ctx.arcTo(x, y, x + w, y, rad);
+  ctx.closePath();
+}
+
+function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
+  const canvas = document.getElementById("radar3dCanvas");
+  if (!canvas) return;
+  const stage = document.getElementById("chart3dStage");
+  if (!stage) return;
+
+  const rect = stage.getBoundingClientRect();
+  const W = rect.width || 600;
+  const H = rect.height || 460;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+  if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+  }
+
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  const yawRad = (state.cam.yawDeg * Math.PI) / 180;
+  const pitchDeg = Math.max(8, Math.min(89.5, state.cam.pitchDeg));
+  const pitchRad = (pitchDeg * Math.PI) / 180;
+  const cosYaw = Math.cos(yawRad);
+  const sinYaw = Math.sin(yawRad);
+  const sinPhi = Math.sin(pitchRad);
+  const cosPhi = Math.cos(pitchRad);
+
+  const camDist = 260;
+  const baseScale = (Math.min(W, H) * 0.41) / 68 * state.cam.zoom;
+  const centerX = W / 2 + state.cam.panX;
+  const centerY = H * (0.5 + 0.11 * cosPhi) + state.cam.panY;
+  const zPerFt = (40 / 40000) * state.cam.altScale; // FL400 -> 40 NM visual height * altScale
+
+  function project(xNm, yNm, altFt) {
+    const x1 = xNm * cosYaw - yNm * sinYaw;
+    const y1 = xNm * sinYaw + yNm * cosYaw;
+    const z = (altFt || 0) * zPerFt;
+    const viewAway = y1 * cosPhi - z * sinPhi;
+    const persp = camDist / Math.max(40, camDist + viewAway);
+    const sx = centerX + x1 * persp * baseScale;
+    const sy = centerY - (y1 * sinPhi + z * cosPhi) * persp * baseScale;
+    return { x: sx, y: sy, depth: viewAway, scale: persp };
+  }
+
+  function drawCircle3d(radiusNm, altFt, strokeStyle, lineWidth = 1, dash = []) {
+    ctx.save();
+    ctx.strokeStyle = strokeStyle;
+    ctx.lineWidth = lineWidth;
+    ctx.setLineDash(dash);
+    ctx.beginPath();
+    const steps = 72;
+    for (let s = 0; s <= steps; s++) {
+      const a = (s / steps) * Math.PI * 2;
+      const p = project(radiusNm * Math.sin(a), radiusNm * Math.cos(a), altFt);
+      if (s === 0) ctx.moveTo(p.x, p.y);
+      else ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // 1. Subtle floor fill for 50 NM TMA Disc
+  ctx.save();
+  ctx.beginPath();
+  for (let s = 0; s <= 72; s++) {
+    const a = (s / 72) * Math.PI * 2;
+    const p = project(50 * Math.sin(a), 50 * Math.cos(a), 0);
+    if (s === 0) ctx.moveTo(p.x, p.y);
+    else ctx.lineTo(p.x, p.y);
+  }
+  ctx.closePath();
+  ctx.fillStyle = "rgba(30, 52, 92, 0.22)";
+  ctx.fill();
+  ctx.restore();
+
+  // Distance rings on floor (0 ft)
+  drawCircle3d(60, 0, "rgba(71, 104, 158, 0.25)", 1, [4, 6]);
+  drawCircle3d(50, 0, "rgba(71, 104, 158, 0.65)", 1.8, []);
+  drawCircle3d(25, 0, "rgba(56, 189, 248, 0.35)", 1.2, [5, 4]);
+  drawCircle3d(10, 0, "rgba(52, 211, 153, 0.28)", 1, [2, 4]);
+
+  // 2. 15 DME VOR SEPARATION CYLINDER (Highlights RED if active VOR < 15 DME breach!)
+  const hasVorBreachNow = activeNowConflicts.some(
+    (c) => c.ruleType === "VOR_15DME"
+  );
+  const cylTopAlt = 36000;
+  const cylColor = hasVorBreachNow
+    ? "rgba(248, 113, 113, 0.65)"
+    : "rgba(251, 191, 36, 0.38)";
+  const cylFill = hasVorBreachNow
+    ? "rgba(248, 113, 113, 0.09)"
+    : "rgba(251, 191, 36, 0.045)";
+
+  // Translucent cylinder wall quads (front + back simplified)
+  if (cosPhi > 0.12) {
+    ctx.save();
+    const cylSegs = 36;
+    for (let s = 0; s < cylSegs; s++) {
+      const a0 = (s / cylSegs) * Math.PI * 2;
+      const a1 = ((s + 1) / cylSegs) * Math.PI * 2;
+      const b0 = project(15 * Math.sin(a0), 15 * Math.cos(a0), 0);
+      const b1 = project(15 * Math.sin(a1), 15 * Math.cos(a1), 0);
+      const t1 = project(15 * Math.sin(a1), 15 * Math.cos(a1), cylTopAlt);
+      const t0 = project(15 * Math.sin(a0), 15 * Math.cos(a0), cylTopAlt);
+      ctx.beginPath();
+      ctx.moveTo(b0.x, b0.y);
+      ctx.lineTo(b1.x, b1.y);
+      ctx.lineTo(t1.x, t1.y);
+      ctx.lineTo(t0.x, t0.y);
+      ctx.closePath();
+      ctx.fillStyle = cylFill;
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  drawCircle3d(15, 0, cylColor, 1.5, [3, 3]);
+  if (cosPhi > 0.15) {
+    drawCircle3d(15, 10000, hasVorBreachNow ? "rgba(248, 113, 113, 0.3)" : "rgba(251, 191, 36, 0.18)", 1, [3, 4]);
+    drawCircle3d(15, 20000, hasVorBreachNow ? "rgba(248, 113, 113, 0.28)" : "rgba(251, 191, 36, 0.15)", 1, [3, 4]);
+    drawCircle3d(15, cylTopAlt, cylColor, 1.1, [3, 4]);
+    for (let deg = 0; deg < 360; deg += 90) {
+      const rad = (deg * Math.PI) / 180;
+      const pBot = project(15 * Math.sin(rad), 15 * Math.cos(rad), 0);
+      const pTop = project(15 * Math.sin(rad), 15 * Math.cos(rad), cylTopAlt);
+      ctx.strokeStyle = hasVorBreachNow
+        ? "rgba(248, 113, 113, 0.28)"
+        : "rgba(251, 191, 36, 0.16)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(pBot.x, pBot.y);
+      ctx.lineTo(pTop.x, pTop.y);
+      ctx.stroke();
+    }
+  }
+
+  // Label for 15 DME VOR Cylinder
+  const p15Lbl = project(0, 15, cylTopAlt * 0.92);
+  ctx.fillStyle = hasVorBreachNow ? "#fca5a5" : "rgba(251, 191, 36, 0.8)";
+  ctx.font = "700 10px JetBrains Mono, monospace";
+  ctx.textAlign = "center";
+  ctx.fillText(hasVorBreachNow ? "⚠ 15 DME VOR BREACH" : "15 DME VOR SEP", p15Lbl.x, p15Lbl.y - 4);
+
+  // 3. Radial Airways & Waypoints on Floor
+  WAYPOINTS.forEach((wpt) => {
+    const pOuter = polarToNm(66, wpt.deg);
+    const pTma = polarToNm(50, wpt.deg);
+    const pCenter = { xNm: 0, yNm: 0 };
+
+    const sOuter = project(pOuter.xNm, pOuter.yNm, 0);
+    const sTma = project(pTma.xNm, pTma.yNm, 0);
+    const sCtr = project(pCenter.xNm, pCenter.yNm, 0);
+
+    // Outer dotted
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.35)";
+    ctx.lineWidth = 1.1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(sOuter.x, sOuter.y);
+    ctx.lineTo(sTma.x, sTma.y);
+    ctx.stroke();
+
+    // Inner TMA track
+    ctx.strokeStyle = "rgba(248, 113, 113, 0.42)";
+    ctx.lineWidth = 1.4;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.moveTo(sTma.x, sTma.y);
+    ctx.lineTo(sCtr.x, sCtr.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Waypoint diamond + label
+    ctx.fillStyle = "#38bdf8";
+    ctx.beginPath();
+    ctx.arc(sTma.x, sTma.y, 3.2, 0, Math.PI * 2);
+    ctx.fill();
+
+    const pLbl = polarToNm(57, wpt.deg);
+    const sLbl = project(pLbl.xNm, pLbl.yNm, 0);
+    ctx.fillStyle = "#e2e8f0";
+    ctx.font = "800 10px JetBrains Mono, monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(wpt.name, sLbl.x, sLbl.y + 3);
+
+    const pEntryLbl = polarToNm(69, wpt.deg);
+    const sEntryLbl = project(pEntryLbl.xNm, pEntryLbl.yNm, 0);
+    ctx.fillStyle = "rgba(251, 191, 36, 0.8)";
+    ctx.font = "700 9px JetBrains Mono, monospace";
+    ctx.fillText(wpt.entryWpt, sEntryLbl.x, sEntryLbl.y + 3);
+  });
+
+  // 4. Center AYT VOR Marker & Vertical Altitude Scale Post
+  const sVor = project(0, 0, 0);
+  ctx.fillStyle = "#38bdf8";
+  ctx.strokeStyle = "#38bdf8";
+  ctx.lineWidth = 1.8;
+  ctx.strokeRect(sVor.x - 5, sVor.y - 5, 10, 10);
+  ctx.beginPath();
+  ctx.arc(sVor.x, sVor.y, 2, 0, Math.PI * 2);
+  ctx.fill();
+
+  if (cosPhi > 0.12) {
+    const sPoleTop = project(0, 0, 36000);
+    ctx.strokeStyle = "rgba(56, 189, 248, 0.35)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 3]);
+    ctx.beginPath();
+    ctx.moveTo(sVor.x, sVor.y);
+    ctx.lineTo(sPoleTop.x, sPoleTop.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    [10000, 20000, 30000].forEach((alt) => {
+      const pTick = project(0, 0, alt);
+      ctx.fillStyle = "rgba(148, 163, 184, 0.72)";
+      ctx.font = "700 9px JetBrains Mono, monospace";
+      ctx.textAlign = "left";
+      ctx.fillText(`FL${alt / 100}`, pTick.x + 5, pTick.y + 3);
+    });
+  }
+
+  // Runway 36/18 Centerline indicator on VOR floor
+  const rwyDeg = state.activeRwy === "36" ? 0 : 180;
+  const rwyP1 = polarToNm(8, rwyDeg);
+  const rwyP2 = polarToNm(8, (rwyDeg + 180) % 360);
+  const sr1 = project(rwyP1.xNm, rwyP1.yNm, 0);
+  const sr2 = project(rwyP2.xNm, rwyP2.yNm, 0);
+  ctx.strokeStyle = "rgba(52, 211, 153, 0.75)";
+  ctx.lineWidth = 2.4;
+  ctx.beginPath();
+  ctx.moveTo(sr2.x, sr2.y);
+  ctx.lineTo(sr1.x, sr1.y);
+  ctx.stroke();
+
+  // 5. Build 3D Trajectories & Aircraft Blip Items for Depth Sorting
+  const allItems = getAllItemsFromSolver(solver);
+  const { tMin, tMax } = getScenarioTimeBounds(solver);
+  const drawables = [];
+  const stateAtNow = new Map();
+
+  // Conflicting pairs happening right at queryNorm
+  const nowConflictAcftIds = new Set();
+  activeNowConflicts.forEach((c) => {
+    nowConflictAcftIds.add(c.itemA.acft.id);
+    nowConflictAcftIds.add(c.itemB.acft.id);
+  });
+
+  allItems.forEach((item) => {
+    const stNow = getAircraftStateAtTime(item, solver, queryNorm);
+    stateAtNow.set(item.acft.id, stNow);
+
+    const isSelected = state.selectedTestAcftId === item.acft.id;
+    const isTested = item.acft.flMode === "test";
+    const inConflictNow = nowConflictAcftIds.has(item.acft.id);
+
+    // Build full trajectory ribbon samples for selected, tested, conflicting, or visible aircraft
+    const trajSamples = [];
+    const startT = item.acft.type === "DEP" ? item.normDep : item.normInit;
+    const endT =
+      item.acft.type === "DEP"
+        ? item.normDep + 14
+        : item.acft.type === "TRN"
+        ? item.normVor + 14
+        : (solver.eatMap.get(item.acft.id)?.effectiveEstNorm || startT + 20) + 1;
+
+    const span = Math.max(2, endT - startT);
+    const steps = 28;
+    for (let s = 0; s <= steps; s++) {
+      const ts = startT + (span * s) / steps;
+      const stS = getAircraftStateAtTime(item, solver, ts);
+      if (stS.visible) {
+        trajSamples.push({ t: ts, st: stS });
+      }
+    }
+
+    if (trajSamples.length >= 2) {
+      const midSample = trajSamples[Math.floor(trajSamples.length / 2)];
+      const midProj = project(midSample.st.xNm, midSample.st.yNm, midSample.st.altFt);
+      drawables.push({
+        kind: "trajectory",
+        depth: midProj.depth + 5, // Slightly behind plane blips
+        item,
+        trajSamples,
+        color: inConflictNow
+          ? "#f87171"
+          : isSelected || isTested
+          ? stNow.color
+          : item.acft.type === "DEP"
+          ? "#fbbf24"
+          : item.acft.type === "TRN"
+          ? "#34d399"
+          : "#38bdf8",
+        emphasis: isSelected || inConflictNow || stNow.visible,
+      });
+    }
+
+    if (stNow.visible) {
+      const proj3d = project(stNow.xNm, stNow.yNm, stNow.altFt);
+      const projFloor = project(stNow.xNm, stNow.yNm, 0);
+      drawables.push({
+        kind: "aircraft",
+        depth: proj3d.depth - 0.5,
+        item,
+        st: stNow,
+        proj3d,
+        projFloor,
+        isSelected,
+        inConflictNow,
+      });
+    }
+  });
+
+  // Draw active 3D conflict laser lines at current Time T
+  activeNowConflicts.forEach((c) => {
+    const stA = stateAtNow.get(c.itemA.acft.id);
+    const stB = stateAtNow.get(c.itemB.acft.id);
+    if (!stA || !stB || !stA.visible || !stB.visible) return;
+    const pA = project(stA.xNm, stA.yNm, stA.altFt);
+    const pB = project(stB.xNm, stB.yNm, stB.altFt);
+    const dx = stB.xNm - stA.xNm;
+    const dy = stB.yNm - stA.yNm;
+    const distNm = Math.hypot(dx, dy).toFixed(1);
+    drawables.push({
+      kind: "conflict-beam",
+      depth: (pA.depth + pB.depth) / 2 - 2,
+      conflict: c,
+      pA,
+      pB,
+      distNm,
+    });
+  });
+
+  // Sort back-to-front (largest `depth` = furthest away -> draw first)
+  drawables.sort((a, b) => b.depth - a.depth);
+
+  const projectedBlips3d = [];
+  const labelQueue = [];
+
+  drawables.forEach((d) => {
+    if (d.kind === "trajectory") {
+      const alpha = d.emphasis ? 0.55 : 0.18;
+      ctx.save();
+      ctx.strokeStyle = d.color;
+      ctx.globalAlpha = alpha;
+      ctx.lineWidth = state.selectedTestAcftId === d.item.acft.id ? 2.4 : 1.4;
+      ctx.beginPath();
+      d.trajSamples.forEach((sp, idx) => {
+        const p = project(sp.st.xNm, sp.st.yNm, sp.st.altFt);
+        if (idx === 0) ctx.moveTo(p.x, p.y);
+        else ctx.lineTo(p.x, p.y);
+      });
+      ctx.stroke();
+
+      // Subtle vertical curtain ribs down to floor for highlighted planes
+      if (d.emphasis && cosPhi > 0.15) {
+        ctx.globalAlpha = state.selectedTestAcftId === d.item.acft.id ? 0.24 : 0.1;
+        ctx.lineWidth = 1;
+        for (let k = 0; k < d.trajSamples.length; k += 4) {
+          const sp = d.trajSamples[k];
+          const pTop = project(sp.st.xNm, sp.st.yNm, sp.st.altFt);
+          const pBot = project(sp.st.xNm, sp.st.yNm, 0);
+          ctx.beginPath();
+          ctx.moveTo(pTop.x, pTop.y);
+          ctx.lineTo(pBot.x, pBot.y);
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+      return;
+    }
+
+    if (d.kind === "conflict-beam") {
+      const isH2h = d.conflict.ruleType === "HEAD_TO_HEAD";
+      const beamColor = isH2h ? "#f87171" : "#fbbf24";
+      ctx.save();
+      ctx.strokeStyle = beamColor;
+      ctx.lineWidth = 2.6;
+      ctx.setLineDash([6, 4]);
+      ctx.beginPath();
+      ctx.moveTo(d.pA.x, d.pA.y);
+      ctx.lineTo(d.pB.x, d.pB.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Midpoint distance pill
+      const mx = (d.pA.x + d.pB.x) / 2;
+      const my = (d.pA.y + d.pB.y) / 2;
+      const lbl = isH2h ? `⚔️ ${d.distNm} NM H2H` : `🎯 VOR <15 DME`;
+      ctx.font = "800 10px JetBrains Mono, monospace";
+      const tw = ctx.measureText(lbl).width + 12;
+      ctx.fillStyle = isH2h ? "rgba(127, 29, 29, 0.92)" : "rgba(120, 53, 15, 0.92)";
+      ctx.strokeStyle = beamColor;
+      ctx.lineWidth = 1.2;
+      roundRectPath(ctx, mx - tw / 2, my - 9, tw, 18, 5);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = "#fff";
+      ctx.textAlign = "center";
+      ctx.fillText(lbl, mx, my + 3.5);
+      ctx.restore();
+      return;
+    }
+
+    if (d.kind === "aircraft") {
+      const { item, st, proj3d, projFloor, isSelected, inConflictNow } = d;
+      const blipColor = inConflictNow ? "#f87171" : st.color;
+
+      // Ground shadow dot & vertical plumb line stalk
+      ctx.save();
+      ctx.fillStyle = blipColor;
+      ctx.globalAlpha = 0.45;
+      ctx.beginPath();
+      ctx.arc(projFloor.x, projFloor.y, 3, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = blipColor;
+      ctx.globalAlpha = isSelected ? 0.85 : 0.48;
+      ctx.lineWidth = isSelected ? 1.8 : 1.1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(projFloor.x, projFloor.y);
+      ctx.lineTo(proj3d.x, proj3d.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+
+      // Highlight ring if Selected or Conflicting
+      if (isSelected || inConflictNow) {
+        ctx.save();
+        ctx.strokeStyle = inConflictNow ? "#f87171" : "#ffffff";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(proj3d.x, proj3d.y, isSelected ? 11 : 10, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // 3D Aircraft Diamond Marker
+      ctx.save();
+      ctx.translate(proj3d.x, proj3d.y);
+      ctx.rotate(Math.PI / 4);
+      ctx.fillStyle = "#0b111e";
+      ctx.strokeStyle = blipColor;
+      ctx.lineWidth = 2.4;
+      ctx.fillRect(-5.5, -5.5, 11, 11);
+      ctx.strokeRect(-5.5, -5.5, 11, 11);
+      ctx.restore();
+
+      // Heading vector nose tip in 3D
+      if (st.trackDeg !== null) {
+        const noseRad = (st.trackDeg * Math.PI) / 180;
+        const tip3d = project(
+          st.xNm + 3.8 * Math.sin(noseRad),
+          st.yNm + 3.8 * Math.cos(noseRad),
+          st.altFt
+        );
+        ctx.strokeStyle = blipColor;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(proj3d.x, proj3d.y);
+        ctx.lineTo(tip3d.x, tip3d.y);
+        ctx.stroke();
+      }
+
+      // Queue Callsign & FL / DME Label Tag for collision separation pass
+      const line1 = `${item.acft.callsign}${item.acft.flMode === "test" ? " ★" : ""}`;
+      const line2 = `${st.altStr} • ${st.dme}NM`;
+      ctx.font = "800 10.5px JetBrains Mono, monospace";
+      const w1 = ctx.measureText(line1).width;
+      ctx.font = "700 9.5px JetBrains Mono, monospace";
+      const w2 = ctx.measureText(line2).width;
+      const tagW = Math.max(w1, w2) + 12;
+      const tagH = 29;
+      const tx = Math.max(6, Math.min(W - tagW - 6, proj3d.x + 12));
+      const ty = Math.max(44, Math.min(H - tagH - 36, proj3d.y - 16));
+
+      labelQueue.push({
+        id: item.acft.id,
+        sx: proj3d.x,
+        sy: proj3d.y,
+        tx,
+        ty,
+        tw: tagW,
+        th: tagH,
+        line1,
+        line2,
+        blipColor,
+        isSelected,
+      });
+    }
+  });
+
+  // Fast iterative 2D tag de-overlap pass on projected 3D labels
+  for (let iter = 0; iter < 24; iter++) {
+    let moved = false;
+    for (let i = 0; i < labelQueue.length; i++) {
+      for (let j = i + 1; j < labelQueue.length; j++) {
+        const A = labelQueue[i];
+        const B = labelQueue[j];
+        const pad = 5;
+        const ovX = (A.tw + B.tw) / 2 + pad - Math.abs(A.tx + A.tw / 2 - (B.tx + B.tw / 2));
+        const ovY = (A.th + B.th) / 2 + pad - Math.abs(A.ty + A.th / 2 - (B.ty + B.th / 2));
+        if (ovX > 0 && ovY > 0) {
+          moved = true;
+          if (ovY <= ovX * 1.4) {
+            const dir = A.ty <= B.ty ? -1 : 1;
+            A.ty = Math.max(44, Math.min(H - A.th - 36, A.ty + (dir * ovY) / 2));
+            B.ty = Math.max(44, Math.min(H - B.th - 36, B.ty - (dir * ovY) / 2));
+          } else {
+            const dir = A.tx <= B.tx ? -1 : 1;
+            A.tx = Math.max(6, Math.min(W - A.tw - 6, A.tx + (dir * ovX) / 2));
+            B.tx = Math.max(6, Math.min(W - B.tw - 6, B.tx - (dir * ovX) / 2));
+          }
+        }
+      }
+    }
+    if (!moved) break;
+  }
+
+  // Draw leader lines & de-overlapped 3D labels
+  labelQueue.forEach((lbl) => {
+    const anchor = getRectPerimeterAnchor(lbl.sx, lbl.sy, lbl.tx, lbl.ty, lbl.tw, lbl.th);
+    ctx.save();
+    ctx.strokeStyle = lbl.blipColor;
+    ctx.globalAlpha = 0.72;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(lbl.sx, lbl.sy);
+    ctx.lineTo(anchor.x, anchor.y);
+    ctx.stroke();
+
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = lbl.isSelected ? "rgba(30, 58, 138, 0.94)" : "rgba(9, 14, 26, 0.9)";
+    ctx.strokeStyle = lbl.blipColor;
+    ctx.lineWidth = lbl.isSelected ? 1.8 : 1.1;
+    roundRectPath(ctx, lbl.tx, lbl.ty, lbl.tw, lbl.th, 5);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = lbl.blipColor;
+    ctx.font = "800 10.5px JetBrains Mono, monospace";
+    ctx.textAlign = "left";
+    ctx.fillText(lbl.line1, lbl.tx + 6, lbl.ty + 12);
+    ctx.fillStyle = "#e2e8f0";
+    ctx.font = "700 9.5px JetBrains Mono, monospace";
+    ctx.fillText(lbl.line2, lbl.tx + 6, lbl.ty + 23.5);
+    ctx.restore();
+
+    projectedBlips3d.push({
+      id: lbl.id,
+      sx: lbl.sx,
+      sy: lbl.sy,
+      tx: lbl.tx,
+      ty: lbl.ty,
+      tw: lbl.tw,
+      th: lbl.th,
+    });
+  });
+
+  state.projectedBlips3d = projectedBlips3d;
+
+  // Floating 3D Canvas Conflict Alert Banner
+  const bannerEl = document.getElementById("canvas3dConflictBanner");
+  if (bannerEl) {
+    if (activeNowConflicts.length === 0) {
+      bannerEl.classList.add("hidden");
+    } else {
+      bannerEl.classList.remove("hidden");
+      bannerEl.innerHTML = activeNowConflicts
+        .slice(0, 2)
+        .map((c) => `<div>${c.badgeText}: ${c.pairLabel}</div>`)
+        .join("");
+    }
+  }
+}
+
+// ============================================================================
+// VIEW 2C: INTERACTIVE FLIGHT LEVEL TESTER + CONFLICT DETECTOR FEED + HEATMAP
+// ============================================================================
+function renderConflictHeatmapBar(solver, queryNorm) {
+  const bar = document.getElementById("conflictHeatmapBar");
+  if (!bar) return;
+  const bins = solver.heatmapBins || [];
+  if (bins.length === 0) {
+    bar.innerHTML = "";
+    return;
+  }
+
+  bar.innerHTML = bins
+    .map((b) => {
+      const isNow = queryNorm >= b.t && queryNorm <= b.tEnd + 0.15;
+      const tDisp = formatTime(
+        denormalizeTime(b.t, solver.useHasHour, solver.refHour),
+        solver.useHasHour
+      );
+      return `<div class="heatmap-cell ${b.severity} ${
+        isNow ? "active-now" : ""
+      }" data-heat-t="${b.t}" title="${tDisp} (${b.severity.toUpperCase()})"></div>`;
+    })
+    .join("");
+
+  bar.querySelectorAll(".heatmap-cell").forEach((cell) => {
+    cell.addEventListener("click", () => {
+      const tVal = parseFloat(cell.getAttribute("data-heat-t"));
+      if (!Number.isNaN(tVal)) jumpChartToTime(tVal, solver);
+    });
+  });
+}
+
+function renderFlTesterPanel(solver, queryNorm) {
+  const pillsEl = document.getElementById("flTesterPlanePills");
+  const editorEl = document.getElementById("flTesterEditor");
+  if (!pillsEl || !editorEl) return;
+
+  const allItems = getAllItemsFromSolver(solver);
+  if (allItems.length === 0) {
+    pillsEl.innerHTML = "";
+    editorEl.innerHTML = `<div style="font-size:0.8rem;color:var(--text-muted);">Add aircraft or import a scenario to test Flight Levels and detect separation conflicts live.</div>`;
+    return;
+  }
+
+  if (
+    !state.selectedTestAcftId ||
+    !allItems.some((it) => it.acft.id === state.selectedTestAcftId)
+  ) {
+    state.selectedTestAcftId = allItems[0].acft.id;
+  }
+
+  const conflictIds = solver.conflictAcftIds || new Set();
+
+  pillsEl.innerHTML = allItems
+    .map((it) => {
+      const st = getAircraftStateAtTime(it, solver, queryNorm);
+      const isSel = it.acft.id === state.selectedTestAcftId;
+      const hasConf = conflictIds.has(it.acft.id);
+      const isTested = it.acft.flMode === "test";
+      const dot = hasConf ? "🔴" : st.visible ? "🟢" : "⚪";
+      return `
+        <button type="button" class="fl-plane-pill ${isSel ? "selected" : ""} ${
+        hasConf ? "has-conflict" : ""
+      } ${isTested ? "tested-badge" : ""}" data-select-acft="${it.acft.id}">
+          <span>${dot}</span>
+          <span>${it.acft.callsign}</span>
+          <span style="color:var(--text-muted)">${st.altStr}</span>
+        </button>
+      `;
+    })
+    .join("");
+
+  pillsEl.querySelectorAll("[data-select-acft]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.selectedTestAcftId = Number(btn.getAttribute("data-select-acft"));
+      renderRadarChartView(solver);
+    });
+  });
+
+  const selItem = allItems.find((it) => it.acft.id === state.selectedTestAcftId);
+  if (!selItem) return;
+  const acft = selItem.acft;
+  const stNow = getAircraftStateAtTime(selItem, solver, queryNorm);
+  const corr = getAcftCorridorShort(selItem);
+  const wptObj = selItem.wpt || selItem.entryWpt || WAYPOINTS[0];
+  const currentTestFl = Number(acft.testFl ?? acft.fl) || 150;
+  const isTestMode = acft.flMode === "test";
+
+  const presetValues =
+    acft.type === "DEP"
+      ? [
+          { lbl: `MSA (${Math.round(wptObj.msaFt / 100)})`, val: Math.round(wptObj.msaFt / 100) },
+          { lbl: `MEA (${Math.round(wptObj.meaFt / 100)})`, val: Math.round(wptObj.meaFt / 100) },
+          { lbl: "FL130", val: 130 },
+          { lbl: "FL150", val: 150 },
+          { lbl: `Req FL${acft.fl}`, val: acft.fl },
+        ]
+      : acft.type === "TRN"
+      ? [
+          { lbl: `Orig FL${acft.fl}`, val: acft.fl },
+          { lbl: "FL130", val: 130 },
+          { lbl: "FL140", val: 140 },
+          { lbl: "FL150", val: 150 },
+          { lbl: "FL160", val: 160 },
+        ]
+      : [
+          { lbl: `Init FL${acft.fl}`, val: acft.fl },
+          { lbl: `MEA (${Math.round(wptObj.meaFt / 100)})`, val: Math.round(wptObj.meaFt / 100) },
+          { lbl: "FL150", val: 150 },
+          { lbl: "FL140", val: 140 },
+          { lbl: `MSA (${Math.round(wptObj.msaFt / 100)})`, val: Math.round(wptObj.msaFt / 100) },
+          { lbl: "4,000'", val: 40 },
+          { lbl: "3,000'", val: 30 },
+        ];
+
+  const hasStep2 = String(acft.stepTimeRaw || "").trim() !== "" && acft.stepFl !== null;
+  const nowDisp = formatTime(
+    denormalizeTime(queryNorm, solver.useHasHour, solver.refHour),
+    solver.useHasHour
+  );
+
+  editorEl.innerHTML = `
+    <div class="fl-editor-top">
+      <div>
+        <strong>${getAcftIcon(acft.type)} ${acft.callsign}</strong>
+        <span class="step-delta" id="flEditorNowInfo">(${corr}) • Now: <strong>${stNow.altStr}</strong> @ ${stNow.dme} DME</span>
+      </div>
+      <div class="fl-mode-switch">
+        <button type="button" class="fl-mode-btn ${!isTestMode ? "active" : ""}" data-flmode="auto">Auto Proc</button>
+        <button type="button" class="fl-mode-btn ${isTestMode ? "active" : ""}" data-flmode="test">🧪 Test FL</button>
+      </div>
+    </div>
+
+    <div class="fl-step-control-row">
+      <button type="button" class="fl-big-step-btn" data-fl-delta="-20">-20</button>
+      <button type="button" class="fl-big-step-btn" data-fl-delta="-10">-10</button>
+      <div class="fl-input-wrap" style="flex:1;min-width:94px;">
+        <span class="fl-prefix">FL</span>
+        <input type="number" id="testerFlInput" value="${currentTestFl}" min="30" max="420" step="10" aria-label="Test Flight Level" />
+      </div>
+      <button type="button" class="fl-big-step-btn" data-fl-delta="10">+10</button>
+      <button type="button" class="fl-big-step-btn" data-fl-delta="20">+20</button>
+    </div>
+
+    <input type="range" id="testerFlSlider" class="fl-test-slider" min="30" max="400" step="10" value="${Math.max(
+      30,
+      Math.min(400, currentTestFl)
+    )}" aria-label="Test Flight Level Slider" />
+
+    <div class="fl-quick-presets">
+      ${presetValues
+        .map(
+          (p) =>
+            `<button type="button" class="small-btn tester-preset-btn" data-preset-fl="${p.val}">${p.lbl}</button>`
+        )
+        .join("")}
+    </div>
+
+    <div class="fl-step2-box">
+      <div class="fl-step2-row">
+        <span><strong>Step 2 Clearance</strong> (optional): After time</span>
+        <input type="text" id="testerStepTimeInput" class="inline-input inline-time" value="${
+          acft.stepTimeRaw || ""
+        }" placeholder="${nowDisp}" title="Time when next FL clearance starts" />
+        <span>→ FL</span>
+        <input type="number" id="testerStepFlInput" class="inline-input inline-fl" value="${
+          acft.stepFl ?? acft.fl
+        }" min="30" max="420" step="10" />
+        <button type="button" id="btnSetStep2Now" class="small-btn" title="Set Step 2 trigger to current scrub time ${nowDisp}">@ Now (${nowDisp})</button>
+        ${
+          hasStep2
+            ? `<button type="button" id="btnClearStep2" class="small-btn danger-btn">✕</button>`
+            : ""
+        }
+      </div>
+    </div>
+  `;
+
+  function applyFlUpdate(nextFl, forceTestMode = true) {
+    acft.testFl = Math.max(30, Math.min(450, Number(nextFl) || 100));
+    if (forceTestMode) acft.flMode = "test";
+    saveState();
+    const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+    renderConflictPanels(newSolver);
+    renderRadarChartView(newSolver);
+  }
+
+  editorEl.querySelectorAll("[data-flmode]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      acft.flMode = btn.getAttribute("data-flmode");
+      if (acft.flMode === "test" && (acft.testFl === undefined || acft.testFl === null)) {
+        acft.testFl = acft.fl;
+      }
+      saveState();
+      const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+      renderConflictPanels(newSolver);
+      renderRadarChartView(newSolver);
+    });
+  });
+
+  editorEl.querySelectorAll("[data-fl-delta]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const delta = Number(btn.getAttribute("data-fl-delta"));
+      applyFlUpdate(currentTestFl + delta, true);
+    });
+  });
+
+  editorEl.querySelectorAll("[data-preset-fl]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const val = Number(btn.getAttribute("data-preset-fl"));
+      applyFlUpdate(val, true);
+    });
+  });
+
+  const testerFlInput = document.getElementById("testerFlInput");
+  const testerFlSlider = document.getElementById("testerFlSlider");
+  if (testerFlInput) {
+    testerFlInput.addEventListener("change", () => applyFlUpdate(testerFlInput.value, true));
+  }
+  if (testerFlSlider) {
+    testerFlSlider.addEventListener("input", () => {
+      const v = Number(testerFlSlider.value);
+      if (testerFlInput) testerFlInput.value = v;
+      acft.testFl = v;
+      acft.flMode = "test";
+      saveState();
+      const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+      renderConflictPanels(newSolver);
+      renderRadarChartOnlyVisuals(newSolver);
+    });
+  }
+
+  const testerStepTimeInput = document.getElementById("testerStepTimeInput");
+  const testerStepFlInput = document.getElementById("testerStepFlInput");
+  const btnSetStep2Now = document.getElementById("btnSetStep2Now");
+  const btnClearStep2 = document.getElementById("btnClearStep2");
+
+  if (testerStepTimeInput) {
+    testerStepTimeInput.addEventListener("change", () => {
+      acft.stepTimeRaw = testerStepTimeInput.value.trim();
+      if (acft.stepTimeRaw && (acft.stepFl === null || acft.stepFl === undefined)) {
+        acft.stepFl = Number(testerStepFlInput?.value) || acft.fl;
+      }
+      if (acft.stepTimeRaw) acft.flMode = "test";
+      saveState();
+      const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+      renderConflictPanels(newSolver);
+      renderRadarChartView(newSolver);
+    });
+  }
+
+  if (testerStepFlInput) {
+    testerStepFlInput.addEventListener("change", () => {
+      acft.stepFl = Number(testerStepFlInput.value) || acft.fl;
+      if (acft.stepTimeRaw) acft.flMode = "test";
+      saveState();
+      const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+      renderConflictPanels(newSolver);
+      renderRadarChartView(newSolver);
+    });
+  }
+
+  if (btnSetStep2Now) {
+    btnSetStep2Now.addEventListener("click", () => {
+      acft.stepTimeRaw = nowDisp;
+      acft.stepFl = Number(testerStepFlInput?.value) || acft.fl;
+      acft.flMode = "test";
+      saveState();
+      const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+      renderConflictPanels(newSolver);
+      renderRadarChartView(newSolver);
+    });
+  }
+
+  if (btnClearStep2) {
+    btnClearStep2.addEventListener("click", () => {
+      acft.stepTimeRaw = "";
+      acft.stepFl = null;
+      saveState();
+      const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+      renderConflictPanels(newSolver);
+      renderRadarChartView(newSolver);
+    });
+  }
+}
+
+function renderChartConflictFeed(solver, queryNorm, activeNowConflicts) {
+  const feedEl = document.getElementById("chartConflictFeed");
+  const pillEl = document.getElementById("liveConflictBadge");
+  const list = solver.conflicts4d || [];
+
+  if (pillEl) {
+    if (list.length === 0) {
+      pillEl.className = "live-conflict-pill clear";
+      pillEl.textContent = "✅ 0 Conflicts";
+    } else {
+      pillEl.className = "live-conflict-pill danger";
+      pillEl.textContent = `🚨 ${list.length} Conflict${list.length > 1 ? "s" : ""}${
+        activeNowConflicts.length > 0 ? ` (${activeNowConflicts.length} NOW)` : ""
+      }`;
+    }
+  }
+
+  if (!feedEl) return;
+  const shown = state.conflictScope === "now" ? activeNowConflicts : list;
+
+  if (shown.length === 0) {
+    feedEl.innerHTML = `
+      <div class="conflict-box alert-safe">
+        <div class="conflict-detail">
+          ${
+            state.conflictScope === "now"
+              ? "✅ No conflicts occurring at this exact timestamp."
+              : "✅ No Head-to-Head (<45° & <100 NM) or VOR (<15 DME) conflicts detected!"
+          }
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  feedEl.innerHTML = shown
+    .map(
+      (c) => `
+      <div class="conflict-box ${c.ruleType === "HEAD_TO_HEAD" ? "alert-danger" : "alert-warn"}">
+        <div class="conflict-top">
+          <span class="conflict-pair">${c.pairLabel}</span>
+          <span class="badge ${c.ruleType === "HEAD_TO_HEAD" ? "badge-delayed" : "badge-eat"}">${
+        c.badgeText
+      }</span>
+        </div>
+        <div class="conflict-metrics">
+          <div class="metric-pill when-pill">⏰ <strong>${c.windowStr}</strong></div>
+          <button type="button" class="conflict-jump-btn" data-feed-jump-t="${c.tPeak}">📍 Go @ ${c.peakStr}</button>
+        </div>
+        <div class="conflict-detail" style="color:var(--text-main);">${c.detailText}</div>
+      </div>
+    `
+    )
+    .join("");
+
+  feedEl.querySelectorAll("[data-feed-jump-t]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const tVal = parseFloat(btn.getAttribute("data-feed-jump-t"));
+      if (!Number.isNaN(tVal)) jumpChartToTime(tVal, solver);
+    });
+  });
+}
+
+// Fast visual refresh used while dragging the FL slider smoothly without destroying focus
+function renderRadarChartOnlyVisuals(solver) {
+  const slider = document.getElementById("radarTimeSlider");
+  const parsedQuery = parseTimeInput(state.lookupTimeRaw);
+  let queryNorm = parsedQuery.totalMinutes;
+  if (solver.refHour !== null && !parsedQuery.hasHour && queryNorm < 120) {
+    queryNorm = solver.refHour * 60 + queryNorm;
+  }
+  const activeNowConflicts = (solver.conflicts4d || []).filter(
+    (c) => queryNorm >= c.tStart - 0.12 && queryNorm <= c.tEnd + 0.12
+  );
+  if (slider) {
+    slider.min = solver.tMin;
+    slider.max = solver.tMax;
+    slider.value = queryNorm;
+  }
+  if (state.chartMode === "3d") {
+    render3dRadarChart(solver, queryNorm, activeNowConflicts);
+  }
+  renderConflictHeatmapBar(solver, queryNorm);
+  renderChartConflictFeed(solver, queryNorm, activeNowConflicts);
+
+  // Sync live status labels inside FL Tester without rebuilding slider DOM
+  const allItems = getAllItemsFromSolver(solver);
+  const conflictIds = solver.conflictAcftIds || new Set();
+  allItems.forEach((it) => {
+    const st = getAircraftStateAtTime(it, solver, queryNorm);
+    const pill = document.querySelector(`[data-select-acft="${it.acft.id}"]`);
+    if (pill) {
+      const hasConf = conflictIds.has(it.acft.id);
+      pill.classList.toggle("has-conflict", hasConf);
+      pill.classList.toggle("tested-badge", it.acft.flMode === "test");
+      const spans = pill.querySelectorAll("span");
+      if (spans[0]) spans[0].textContent = hasConf ? "🔴" : st.visible ? "🟢" : "⚪";
+      if (spans[2]) spans[2].textContent = st.altStr;
+    }
+    if (it.acft.id === state.selectedTestAcftId) {
+      const infoEl = document.getElementById("flEditorNowInfo");
+      if (infoEl) {
+        infoEl.innerHTML = `(${getAcftCorridorShort(it)}) • Now: <strong>${st.altStr}</strong> @ ${st.dme} DME`;
+      }
+      document.querySelectorAll("[data-flmode]").forEach((btn) => {
+        btn.classList.toggle("active", btn.getAttribute("data-flmode") === it.acft.flMode);
+      });
+    }
+  });
+}
+
 function renderRadarChartView(solver) {
   const blipsLayer = document.getElementById("svgBlipsLayer");
   const listEl = document.getElementById("positionSnapshotList");
   const sidebarTimeLabel = document.getElementById("sidebarTimeLabel");
   const slider = document.getElementById("radarTimeSlider");
+  const stage3d = document.getElementById("chart3dStage");
+  const stage2d = document.getElementById("chart2dStage");
 
-  if (!blipsLayer || !listEl) return;
+  if (!listEl) return;
 
-  const allItems = [
-    ...solver.computedArrivals,
-    ...solver.computedDepartures,
-    ...solver.computedTransits,
-  ];
+  if (stage3d) stage3d.classList.toggle("hidden", state.chartMode !== "3d");
+  if (stage2d) stage2d.classList.toggle("hidden", state.chartMode !== "2d");
 
-  if (allItems.length > 0 && slider) {
-    const minT = Math.min(
-      ...allItems.map((it) => (it.acft.type === "DEP" ? it.normDep : it.normInit))
-    );
-    const maxT = Math.max(
-      ...allItems.map((it) =>
-        it.acft.type === "DEP"
-          ? it.norm60
-          : it.acft.type === "TRN"
-          ? it.norm60From || it.normVor + 12
-          : solver.eatMap.get(it.acft.id)?.effectiveEstNorm + 2 || it.normInit + 25
-      )
-    );
-    slider.min = Math.floor(minT);
-    slider.max = Math.ceil(maxT);
-  }
+  const allItems = getAllItemsFromSolver(solver);
 
   const parsedQuery = parseTimeInput(state.lookupTimeRaw);
   let queryNorm = parsedQuery.totalMinutes;
   if (solver.refHour !== null && !parsedQuery.hasHour && queryNorm < 120) {
     queryNorm = solver.refHour * 60 + queryNorm;
+  }
+
+  if (allItems.length > 0 && slider) {
+    slider.min = solver.tMin;
+    slider.max = solver.tMax;
+    slider.value = queryNorm;
   }
 
   if (sidebarTimeLabel) {
@@ -2892,11 +4313,24 @@ function renderRadarChartView(solver) {
     );
   }
 
-  blipsLayer.innerHTML = "";
+  const activeNowConflicts = (solver.conflicts4d || []).filter(
+    (c) => queryNorm >= c.tStart - 0.12 && queryNorm <= c.tEnd + 0.12
+  );
+
+  // Render 3D interactive chart, Heatmap, FL Tester, Conflict Feed, & 2D SVG
+  if (state.chartMode === "3d") {
+    render3dRadarChart(solver, queryNorm, activeNowConflicts);
+  }
+  renderConflictHeatmapBar(solver, queryNorm);
+  renderFlTesterPanel(solver, queryNorm);
+  renderChartConflictFeed(solver, queryNorm, activeNowConflicts);
+
+  // Snapshot List
+  if (blipsLayer) blipsLayer.innerHTML = "";
   listEl.innerHTML = "";
 
   if (allItems.length === 0) {
-    listEl.innerHTML = `<div class="snapshot-item" style="color:var(--text-muted)">Add aircraft in the Calculator tab to visualize them as live radar blips.</div>`;
+    listEl.innerHTML = `<div class="snapshot-item" style="color:var(--text-muted)">Add aircraft in the Calculator tab to visualize them in 3D and test Flight Levels.</div>`;
     return;
   }
 
@@ -2904,10 +4338,7 @@ function renderRadarChartView(solver) {
 
   allItems.forEach((item) => {
     const st = getAircraftStateAtTime(item, solver, queryNorm);
-    const wptLabel =
-      item.acft.type === "TRN"
-        ? `${item.entryWpt.name}→${item.exitWpt.name}`
-        : item.wpt.name;
+    const wptLabel = getAcftCorridorShort(item);
 
     const badgeClass =
       item.acft.type === "DEP"
@@ -2920,6 +4351,7 @@ function renderRadarChartView(solver) {
 
     const row = document.createElement("div");
     row.className = "snapshot-item";
+    row.style.cursor = "pointer";
     row.innerHTML = `
       <div class="snapshot-top">
         <span class="callsign-cell">${item.acft.callsign}</span>
@@ -2927,6 +4359,10 @@ function renderRadarChartView(solver) {
       </div>
       <div class="snapshot-status" style="color: ${st.color}">${st.text}</div>
     `;
+    row.addEventListener("click", () => {
+      state.selectedTestAcftId = item.acft.id;
+      renderRadarChartView(solver);
+    });
     listEl.appendChild(row);
 
     if (st.visible && st.x !== undefined && st.y !== undefined) {
@@ -2939,30 +4375,148 @@ function renderRadarChartView(solver) {
     }
   });
 
-  const tagPlacements = computeNonOverlappingTagPositions(visibleBlips);
+  if (blipsLayer && state.chartMode === "2d") {
+    const tagPlacements = computeNonOverlappingTagPositions(visibleBlips);
 
-  visibleBlips.forEach(({ st }, i) => {
-    const tag = tagPlacements[i];
-    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
-    g.innerHTML = `
-      <line x1="${st.x}" y1="${st.y}" x2="${tag.anchorX}" y2="${tag.anchorY}" stroke="${st.color}" stroke-width="1.5" opacity="0.9" />
-      <circle cx="${tag.anchorX}" cy="${tag.anchorY}" r="2.2" fill="${st.color}" />
-      <line x1="${st.x}" y1="${st.y}" x2="${st.tipX}" y2="${st.tipY}" stroke="${st.color}" stroke-width="2.2" />
-      <rect x="${st.x - 5}" y="${st.y - 5}" width="10" height="10" fill="#0b111e" stroke="${st.color}" stroke-width="2.2" transform="rotate(45 ${st.x} ${st.y})" />
-      <circle cx="${st.x}" cy="${st.y}" r="2" fill="${st.color}" />
-    `;
-    blipsLayer.appendChild(g);
+    visibleBlips.forEach(({ st }, i) => {
+      const tag = tagPlacements[i];
+      const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      g.innerHTML = `
+        <line x1="${st.x}" y1="${st.y}" x2="${tag.anchorX}" y2="${tag.anchorY}" stroke="${st.color}" stroke-width="1.5" opacity="0.9" />
+        <circle cx="${tag.anchorX}" cy="${tag.anchorY}" r="2.2" fill="${st.color}" />
+        <line x1="${st.x}" y1="${st.y}" x2="${st.tipX}" y2="${st.tipY}" stroke="${st.color}" stroke-width="2.2" />
+        <rect x="${st.x - 5}" y="${st.y - 5}" width="10" height="10" fill="#0b111e" stroke="${st.color}" stroke-width="2.2" transform="rotate(45 ${st.x} ${st.y})" />
+        <circle cx="${st.x}" cy="${st.y}" r="2" fill="${st.color}" />
+      `;
+      blipsLayer.appendChild(g);
+    });
+
+    visibleBlips.forEach(({ item, st }, i) => {
+      const tag = tagPlacements[i];
+      const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      g.innerHTML = `
+        <rect x="${tag.tx}" y="${tag.ty}" width="${tag.w}" height="${tag.h}" class="blip-tag-bg" stroke="${st.color}" />
+        <text x="${tag.tx + 5}" y="${tag.ty + 12}" class="blip-tag-title" fill="${st.color}">${item.acft.callsign}</text>
+        <text x="${tag.tx + 5}" y="${tag.ty + 24}" class="blip-tag-sub">${st.altStr} • ${st.dme}NM</text>
+      `;
+      blipsLayer.appendChild(g);
+    });
+  }
+}
+
+// Wire up 3D Touch/Mouse Orbit, Pinch Zoom, and Tap-to-Select Plane
+function setup3dCanvasInteractions() {
+  const canvas = document.getElementById("radar3dCanvas");
+  if (!canvas) return;
+
+  const activePointers = new Map();
+  let lastPinchDist = null;
+  let dragStartPos = null;
+  let hasDragged = false;
+
+  function redrawOnly3d() {
+    const solver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+    renderRadarChartOnlyVisuals(solver);
+  }
+
+  function pickAirplaneAt(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const cx = clientX - rect.left;
+    const cy = clientY - rect.top;
+    let bestId = null;
+    let bestDist = 34; // Generous 34px mobile finger tap radius!
+
+    (state.projectedBlips3d || []).forEach((b) => {
+      const distBlip = Math.hypot(cx - b.sx, cy - b.sy);
+      const insideTag =
+        cx >= b.tx - 6 && cx <= b.tx + b.tw + 6 && cy >= b.ty - 6 && cy <= b.ty + b.th + 6;
+      const eff = insideTag ? Math.min(distBlip, 12) : distBlip;
+      if (eff < bestDist) {
+        bestDist = eff;
+        bestId = b.id;
+      }
+    });
+
+    if (bestId !== null) {
+      state.selectedTestAcftId = bestId;
+      const solver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+      renderRadarChartView(solver);
+    }
+  }
+
+  canvas.addEventListener("pointerdown", (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (activePointers.size === 1) {
+      dragStartPos = { x: e.clientX, y: e.clientY };
+      hasDragged = false;
+      lastPinchDist = null;
+    } else if (activePointers.size === 2) {
+      const pts = Array.from(activePointers.values());
+      lastPinchDist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      hasDragged = true;
+    }
   });
 
-  visibleBlips.forEach(({ item, st }, i) => {
-    const tag = tagPlacements[i];
-    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
-    g.innerHTML = `
-      <rect x="${tag.tx}" y="${tag.ty}" width="${tag.w}" height="${tag.h}" class="blip-tag-bg" stroke="${st.color}" />
-      <text x="${tag.tx + 5}" y="${tag.ty + 12}" class="blip-tag-title" fill="${st.color}">${item.acft.callsign}</text>
-      <text x="${tag.tx + 5}" y="${tag.ty + 24}" class="blip-tag-sub">${st.altStr} • ${st.dme}NM</text>
-    `;
-    blipsLayer.appendChild(g);
+  canvas.addEventListener("pointermove", (e) => {
+    const prev = activePointers.get(e.pointerId);
+    if (!prev) return;
+    const dx = e.clientX - prev.x;
+    const dy = e.clientY - prev.y;
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (activePointers.size === 1) {
+      if (
+        dragStartPos &&
+        Math.hypot(e.clientX - dragStartPos.x, e.clientY - dragStartPos.y) > 6
+      ) {
+        hasDragged = true;
+      }
+      if (hasDragged) {
+        state.cam.yawDeg = (state.cam.yawDeg - dx * 0.42 + 360) % 360;
+        state.cam.pitchDeg = Math.max(8, Math.min(89.5, state.cam.pitchDeg + dy * 0.35));
+        document.querySelectorAll(".cam-btn[data-cam]").forEach((b) => b.classList.remove("active"));
+        redrawOnly3d();
+      }
+    } else if (activePointers.size === 2) {
+      const pts = Array.from(activePointers.values());
+      const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      if (lastPinchDist && dist > 10) {
+        const factor = dist / lastPinchDist;
+        state.cam.zoom = Math.max(0.5, Math.min(3.2, state.cam.zoom * factor));
+        redrawOnly3d();
+      }
+      lastPinchDist = dist;
+    }
+  });
+
+  const endPointer = (e) => {
+    const wasSingleTap = activePointers.size === 1 && !hasDragged;
+    activePointers.delete(e.pointerId);
+    if (activePointers.size < 2) lastPinchDist = null;
+    if (wasSingleTap) {
+      pickAirplaneAt(e.clientX, e.clientY);
+    }
+  };
+
+  canvas.addEventListener("pointerup", endPointer);
+  canvas.addEventListener("pointercancel", endPointer);
+
+  canvas.addEventListener(
+    "wheel",
+    (e) => {
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.1 : 0.91;
+      state.cam.zoom = Math.max(0.5, Math.min(3.2, state.cam.zoom * factor));
+      redrawOnly3d();
+    },
+    { passive: false }
+  );
+
+  window.addEventListener("resize", () => {
+    if (state.activeView === "chart" && state.chartMode === "3d") {
+      redrawOnly3d();
+    }
   });
 }
 
@@ -2988,9 +4542,135 @@ function initApp() {
       });
       viewCalc.classList.toggle("hidden", targetView !== "calc");
       viewChart.classList.toggle("hidden", targetView !== "chart");
+
+      if (targetView === "chart" && state.aircraftList.length > 0) {
+        const solver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+        const pCur = parseTimeInput(state.lookupTimeRaw);
+        const curNorm = normalizeTime(pCur.totalMinutes, pCur.hasHour, solver.refHour);
+        if (curNorm < solver.tMin - 0.5 || curNorm > solver.tMax + 0.5) {
+          const initialT = Math.min(solver.tMax, solver.tMin + 5);
+          const disp = denormalizeTime(initialT, solver.useHasHour, solver.refHour);
+          state.lookupTimeRaw = solver.useHasHour
+            ? formatTime(disp, true)
+            : String(+disp.toFixed(1));
+          const lookupInp = document.getElementById("lookupTimeInput");
+          if (lookupInp) lookupInp.value = state.lookupTimeRaw;
+        }
+        requestAnimationFrame(() => renderScenarioBoard());
+        return;
+      }
       renderScenarioBoard();
     });
   });
+
+  // 3D Chart Mode, Camera Presets, Z-Scale & Live Tester Event Listeners
+  setup3dCanvasInteractions();
+
+  const btnMode3d = document.getElementById("btnMode3d");
+  const btnMode2d = document.getElementById("btnMode2d");
+  if (btnMode3d && btnMode2d) {
+    btnMode3d.addEventListener("click", () => {
+      state.chartMode = "3d";
+      btnMode3d.classList.add("active");
+      btnMode2d.classList.remove("active");
+      requestAnimationFrame(() =>
+        renderRadarChartView(analyzeScenarioConflicts(state.aircraftList, state.activeRwy))
+      );
+    });
+    btnMode2d.addEventListener("click", () => {
+      state.chartMode = "2d";
+      btnMode2d.classList.add("active");
+      btnMode3d.classList.remove("active");
+      renderRadarChartView(analyzeScenarioConflicts(state.aircraftList, state.activeRwy));
+    });
+  }
+
+  document.querySelectorAll(".cam-btn[data-cam]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const preset = btn.getAttribute("data-cam");
+      document.querySelectorAll(".cam-btn[data-cam]").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      if (preset === "iso") {
+        state.cam.yawDeg = 28;
+        state.cam.pitchDeg = 34;
+        state.cam.zoom = 1.0;
+      } else if (preset === "top") {
+        state.cam.yawDeg = 0;
+        state.cam.pitchDeg = 89.5;
+        state.cam.zoom = 1.05;
+      } else if (preset === "side") {
+        state.cam.yawDeg = 12;
+        state.cam.pitchDeg = 13;
+        state.cam.zoom = 1.08;
+      }
+      state.cam.panX = 0;
+      state.cam.panY = 0;
+      saveState();
+      renderRadarChartOnlyVisuals(analyzeScenarioConflicts(state.aircraftList, state.activeRwy));
+    });
+  });
+
+  const btnResetCam = document.getElementById("btnResetCam");
+  if (btnResetCam) {
+    btnResetCam.addEventListener("click", () => {
+      state.cam = { ...state.cam, yawDeg: 28, pitchDeg: 34, zoom: 1.0, panX: 0, panY: 0 };
+      document.querySelectorAll(".cam-btn[data-cam]").forEach((b) => {
+        b.classList.toggle("active", b.getAttribute("data-cam") === "iso");
+      });
+      saveState();
+      renderRadarChartOnlyVisuals(analyzeScenarioConflicts(state.aircraftList, state.activeRwy));
+    });
+  }
+
+  document.querySelectorAll(".zscale-btn[data-zscale]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.cam.altScale = parseFloat(btn.getAttribute("data-zscale")) || 1.0;
+      document.querySelectorAll(".zscale-btn").forEach((b) => b.classList.toggle("active", b === btn));
+      saveState();
+      renderRadarChartOnlyVisuals(analyzeScenarioConflicts(state.aircraftList, state.activeRwy));
+    });
+  });
+
+  const btnResetAllTestFl = document.getElementById("btnResetAllTestFl");
+  if (btnResetAllTestFl) {
+    btnResetAllTestFl.addEventListener("click", () => {
+      state.aircraftList.forEach((a) => {
+        a.flMode = "auto";
+        a.testFl = a.fl;
+        a.stepTimeRaw = "";
+        a.stepFl = null;
+      });
+      saveState();
+      const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+      renderConflictPanels(newSolver);
+      renderRadarChartView(newSolver);
+    });
+  }
+
+  const btnScopeAll = document.getElementById("btnScopeAll");
+  const btnScopeNow = document.getElementById("btnScopeNow");
+  if (btnScopeAll && btnScopeNow) {
+    btnScopeAll.addEventListener("click", () => {
+      state.conflictScope = "all";
+      btnScopeAll.classList.add("active");
+      btnScopeNow.classList.remove("active");
+      renderRadarChartOnlyVisuals(analyzeScenarioConflicts(state.aircraftList, state.activeRwy));
+    });
+    btnScopeNow.addEventListener("click", () => {
+      state.conflictScope = "now";
+      btnScopeNow.classList.add("active");
+      btnScopeAll.classList.remove("active");
+      renderRadarChartOnlyVisuals(analyzeScenarioConflicts(state.aircraftList, state.activeRwy));
+    });
+  }
+
+  const liveConflictBadge = document.getElementById("liveConflictBadge");
+  if (liveConflictBadge) {
+    liveConflictBadge.addEventListener("click", () => {
+      const feed = document.getElementById("chartConflictFeed");
+      if (feed) feed.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+  }
 
   const btnRwy36 = document.getElementById("btnRwy36");
   const btnRwy18 = document.getElementById("btnRwy18");
@@ -3107,6 +4787,7 @@ function initApp() {
 
     if (isTrn) {
       const endpoints = normalizeTransitEndpoints({ route: state.transitRoute });
+      const initFl = Number(inputFl.value) || state.selectedFl || 150;
       state.aircraftList.push({
         id: state.nextId++,
         type: "TRN",
@@ -3115,19 +4796,28 @@ function initApp() {
         entryWptId: endpoints.entryWptId,
         exitWptId: endpoints.exitWptId,
         route: [endpoints.entryWptId, "AYT", endpoints.exitWptId],
-        fl: Number(inputFl.value) || state.selectedFl || 150,
+        fl: initFl,
+        flMode: "auto",
+        testFl: initFl,
+        stepTimeRaw: "",
+        stepFl: null,
         dist: Number(inputDist.value) || 60,
         timeRaw: inputTime.value.trim() || "00",
         queryDme: state.globalQueryDme,
         holdMins: 0,
       });
     } else {
+      const initFl = Number(inputFl.value) || state.selectedFl || 250;
       state.aircraftList.push({
         id: state.nextId++,
         type: state.flightType,
         callsign,
         wptId: state.selectedWpt,
-        fl: Number(inputFl.value) || state.selectedFl || 250,
+        fl: initFl,
+        flMode: "auto",
+        testFl: initFl,
+        stepTimeRaw: "",
+        stepFl: null,
         dist: isDep ? 0 : Number(inputDist.value) || 60,
         timeRaw: inputTime.value.trim() || "00",
         mode: "auto",
@@ -3524,6 +5214,10 @@ function initApp() {
       const addedItems = result.aircraft.map((item) => ({
         ...item,
         id: state.nextId++,
+        flMode: "auto",
+        testFl: item.fl,
+        stepTimeRaw: "",
+        stepFl: null,
         queryDme: state.globalQueryDme,
       }));
 
@@ -3696,7 +5390,7 @@ function initApp() {
     if (solver.useHasHour) {
       lookupTimeInput.value = formatTime(disp, true);
     } else {
-      lookupTimeInput.value = String(Math.round(disp)).padStart(2, "0");
+      lookupTimeInput.value = formatTime(disp, false);
     }
     state.lookupTimeRaw = lookupTimeInput.value;
     if (radarTimeSlider) radarTimeSlider.value = normMins;
@@ -3724,7 +5418,7 @@ function initApp() {
       const solver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
       const parsed = parseTimeInput(lookupTimeInput.value);
       const norm = normalizeTime(parsed.totalMinutes, parsed.hasHour, solver.refHour);
-      setRadarTimeFromMinutes(Math.max(0, norm + step));
+      setRadarTimeFromMinutes(Math.max(0, +(norm + step).toFixed(2)));
     });
   });
 

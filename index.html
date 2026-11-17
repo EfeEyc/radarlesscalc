@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>AYT TMA Radarless Calculator &amp; Conflict Finder</title>
-  <link rel="stylesheet" href="styles.css?v=20261103b" />
+  <link rel="stylesheet" href="styles.css?v=20261117b" />
 </head>
 <body>
   <main class="container">
@@ -25,7 +25,7 @@
           🧮 Calculator &amp; Conflicts
         </button>
         <button type="button" class="view-tab" data-view="chart" role="tab" aria-selected="false">
-          📡 Chart &amp; Blips View
+          🧊 3D Chart &amp; FL Tester
         </button>
       </div>
     </div>
@@ -423,30 +423,30 @@
       <section class="card solver-card">
         <div class="card-header">
           <div>
-            <h2>🔍 Live Conflict Finder (Head-On, Radial / &lt;15 NM VOR &amp; Approach Sequence)</h2>
+            <h2>🔍 Live Conflict Finder (Head-to-Head &lt;45°/100 NM, VOR &lt;15 DME &amp; EAT)</h2>
             <p class="card-sub">
-              Automatically detects Head-On conflicts (Arrivals, Departures, and Transit aircraft on the same radial), <strong>&lt;15 NM AYT VOR convergence</strong>, and ILS / EAT approach window overlaps.
+              Detects <strong>Head-to-Head (&lt;45° track diff)</strong> altitude crossings within <strong>100 NM</strong>, <strong>VOR &lt;15 DME</strong> crossings (exempting DEP↔DEP only), same-radial proximity, and ILS / EAT delays — including any active Test FLs.
             </p>
           </div>
         </div>
 
         <div class="conflicts-grid">
-          <!-- PART 1: HEAD-ON CONFLICTS (SAME WAYPOINT / RADIAL) -->
+          <!-- PART 1: HEAD-TO-HEAD (<45° & <100 NM) CONFLICTS -->
           <div class="conflict-panel">
             <div class="panel-header">
-              <h3>⚔️ Head-On Conflicts</h3>
-              <span class="badge-subtle">Same Waypoint (ARR / DEP / TRN)</span>
+              <h3>⚔️ Head-to-Head (&lt;45° / 100 NM)</h3>
+              <span class="badge-subtle">Alt Crossings &lt;100 NM</span>
             </div>
             <div id="depArrConflictList" class="conflict-list">
               <!-- Populated by JS -->
             </div>
           </div>
 
-          <!-- PART 2: RADIAL, TRANSIT & VOR <15 NM CONFLICTS -->
+          <!-- PART 2: VOR <15 DME & SAME-RADIAL CONFLICTS -->
           <div class="conflict-panel">
             <div class="panel-header">
-              <h3>🧭 Radial &amp; VOR &lt;15 NM Conflicts</h3>
-              <span class="badge-subtle">Cross-Radial, AYT VOR &amp; Same-Track</span>
+              <h3>🎯 VOR &lt;15 DME &amp; Radial Conflicts</h3>
+              <span class="badge-subtle">Both ≥15 DME (DEP↔DEP exempt)</span>
             </div>
             <div id="radialConflictList" class="conflict-list">
               <!-- Populated by JS -->
@@ -468,117 +468,188 @@
     </div>
 
     <!-- ===================================================================== -->
-    <!-- VIEW 2: INTERACTIVE CHART & LIVE RADAR BLIPS VIEW                     -->
+    <!-- VIEW 2: 3D INTERACTIVE CHART, FL TESTER & LIVE CONFLICT DETECTOR       -->
     <!-- ===================================================================== -->
     <div id="viewChart" class="view-panel hidden">
       <section class="card native-chart-card">
-        <div class="card-header">
+        <div class="card-header chart-top-header">
           <div>
-            <h2>📡 AYT TMA Live Situation &amp; Blip Visualizer</h2>
-            <p class="card-sub">Scrub time or press Play to watch all Arrivals and Departures move across AYT TMA with live solved altitudes and DMEs.</p>
+            <h2>🧊 AYT TMA 3D Chart, FL Tester &amp; Conflict Detector</h2>
+            <p class="card-sub">Drag to orbit in 3D, pinch/scroll to zoom, tap any aircraft to test Flight Levels and catch <strong>VOR &lt;15 DME</strong> or <strong>Head-to-Head &lt;100 NM</strong> conflicts live.</p>
           </div>
-          <div class="freq-badges">
-            <span class="freq-pill">ANK ACC: <strong>131.05</strong></span>
-            <span class="freq-pill">ERCAN ACC: <strong>126.7</strong></span>
-            <span class="freq-pill twr-pill">AYT TWR: <strong>118.1</strong></span>
+          <div class="chart-header-right">
+            <span id="liveConflictBadge" class="live-conflict-pill clear">✅ 0 Conflicts</span>
+            <div class="chart-mode-toggle" role="group" aria-label="Chart Dimension Mode">
+              <button type="button" id="btnMode3d" class="mode-toggle-btn active">🧊 3D</button>
+              <button type="button" id="btnMode2d" class="mode-toggle-btn">🗺️ 2D Top</button>
+            </div>
           </div>
         </div>
 
-        <!-- TIME SCRUBBER BAR FOR CHART -->
+        <!-- TIME SCRUBBER + CONFLICT TIMELINE HEATMAP -->
         <div class="radar-time-bar">
           <div class="radar-time-left">
-            <label for="lookupTimeInput">Scenario Time:</label>
+            <label for="lookupTimeInput">Time:</label>
             <input type="text" id="lookupTimeInput" value="00" placeholder="00 or 10:00" />
             <button type="button" class="time-step-btn lookup-step" data-step="-5">-5m</button>
             <button type="button" class="time-step-btn lookup-step" data-step="-1">-1m</button>
+            <button type="button" class="time-step-btn lookup-step" data-step="-0.5">-30s</button>
+            <button type="button" id="btnPlayRadar" class="time-step-btn play-btn">▶ Play</button>
+            <button type="button" class="time-step-btn lookup-step" data-step="0.5">+30s</button>
             <button type="button" class="time-step-btn lookup-step" data-step="1">+1m</button>
             <button type="button" class="time-step-btn lookup-step" data-step="5">+5m</button>
-            <button type="button" id="btnPlayRadar" class="time-step-btn play-btn">▶ Play</button>
           </div>
-          <div class="radar-slider-wrap">
-            <input type="range" id="radarTimeSlider" min="0" max="40" step="0.2" value="0" aria-label="Scenario Time Slider" />
+          <div class="radar-slider-col">
+            <div class="radar-slider-wrap">
+              <input type="range" id="radarTimeSlider" min="0" max="40" step="0.2" value="0" aria-label="Scenario Time Slider" />
+            </div>
+            <div id="conflictHeatmapBar" class="conflict-heatmap-bar" title="Timeline Conflict Heatmap — Red/Amber = Conflict">
+              <!-- Populated by JS -->
+            </div>
           </div>
         </div>
 
         <div class="chart-and-sidebar">
-          <div class="svg-chart-container">
-            <svg viewBox="0 0 860 860" class="ayt-svg-chart" id="aytRadarSvg" aria-label="AYT TMA Live Radar Chart">
-              <defs>
-                <marker id="arrowRed" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-                  <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#f87171" />
-                </marker>
-                <marker id="arrowCyan" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-                  <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#38bdf8" />
-                </marker>
-              </defs>
+          <!-- LEFT / TOP: 3D STAGE (or 2D SVG STAGE) -->
+          <div class="chart-visual-column">
+            <!-- 3D INTERACTIVE CANVAS -->
+            <div id="chart3dStage" class="chart-3d-stage">
+              <canvas id="radar3dCanvas" aria-label="Interactive 3D AYT TMA Airspace"></canvas>
 
-              <!-- Distance Rings: 10 NM (r=42), 15 NM (r=63), 25 NM (r=105), 50 NM TMA (r=210), 60 NM (r=252) -->
-              <circle cx="430" cy="430" r="252" class="dme-ring-outer" />
-              <circle cx="430" cy="430" r="210" class="tma-boundary-circle" />
-              <circle cx="430" cy="430" r="105" class="dme-ring-25" />
-              <circle cx="430" cy="430" r="63" class="dme-ring-15" />
-              <circle cx="430" cy="430" r="42" class="dme-ring-10" />
+              <!-- 3D Camera & Vertical Scale Controls -->
+              <div class="cam-controls-overlay">
+                <button type="button" class="cam-btn active" data-cam="iso">🧊 3D Iso</button>
+                <button type="button" class="cam-btn" data-cam="top">⬆️ Top</button>
+                <button type="button" class="cam-btn" data-cam="side">📐 Low</button>
+                <button type="button" class="cam-btn" id="btnResetCam">↻</button>
+              </div>
 
-              <!-- Ring Labels -->
-              <text x="436" y="184" class="ring-label">60 NM</text>
-              <text x="436" y="226" class="ring-label">50 NM (TMA)</text>
-              <text x="436" y="330" class="ring-label">25 NM (MSA)</text>
-              <text x="436" y="372" class="ring-label">15 NM (VOR Sep)</text>
+              <!-- Active Conflict Floating Alert inside 3D Canvas -->
+              <div id="canvas3dConflictBanner" class="canvas3d-conflict-banner hidden"></div>
 
-              <!-- MSA Boxes inside TMA -->
-              <g class="msa-group">
-                <rect x="295" y="275" width="76" height="38" rx="4" class="msa-box" />
-                <text x="333" y="291" class="msa-title">MSA (NW)</text>
-                <text x="333" y="306" class="msa-val">10,000'</text>
+              <!-- Bottom Hint / Selected Blip Quick Readout -->
+              <div class="canvas3d-bottom-bar">
+                <span class="cam-touch-hint">1-finger drag: Rotate • Pinch/Wheel: Zoom • Tap plane: Test FL</span>
+                <div class="vert-scale-toggle">
+                  <span>Alt Z:</span>
+                  <button type="button" class="zscale-btn active" data-zscale="1">1x</button>
+                  <button type="button" class="zscale-btn" data-zscale="1.6">1.6x</button>
+                  <button type="button" class="zscale-btn" data-zscale="2.4">2.4x</button>
+                </div>
+              </div>
+            </div>
 
-                <rect x="502" y="295" width="76" height="38" rx="4" class="msa-box" />
-                <text x="540" y="311" class="msa-title">MSA (NE)</text>
-                <text x="540" y="326" class="msa-val">9,000'</text>
+            <!-- 2D CLASSIC SVG CHART (Hidden by default unless toggled) -->
+            <div id="chart2dStage" class="svg-chart-container hidden">
+              <svg viewBox="0 0 860 860" class="ayt-svg-chart" id="aytRadarSvg" aria-label="AYT TMA Live Radar Chart">
+                <defs>
+                  <marker id="arrowRed" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#f87171" />
+                  </marker>
+                  <marker id="arrowCyan" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+                    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#38bdf8" />
+                  </marker>
+                </defs>
 
-                <rect x="480" y="505" width="76" height="38" rx="4" class="msa-box" />
-                <text x="518" y="521" class="msa-title">MSA (SE)</text>
-                <text x="518" y="536" class="msa-val">3,000'</text>
+                <!-- Distance Rings: 10 NM (r=42), 15 NM (r=63), 25 NM (r=105), 50 NM TMA (r=210), 60 NM (r=252) -->
+                <circle cx="430" cy="430" r="252" class="dme-ring-outer" />
+                <circle cx="430" cy="430" r="210" class="tma-boundary-circle" />
+                <circle cx="430" cy="430" r="105" class="dme-ring-25" />
+                <circle cx="430" cy="430" r="63" class="dme-ring-15" />
+                <circle cx="430" cy="430" r="42" class="dme-ring-10" />
 
-                <rect x="285" y="485" width="76" height="38" rx="4" class="msa-box" />
-                <text x="323" y="501" class="msa-title">MSA (W/SW)</text>
-                <text x="323" y="516" class="msa-val">12,000'</text>
-              </g>
+                <!-- Ring Labels -->
+                <text x="436" y="184" class="ring-label">60 NM</text>
+                <text x="436" y="226" class="ring-label">50 NM (TMA)</text>
+                <text x="436" y="330" class="ring-label">25 NM (MSA)</text>
+                <text x="436" y="372" class="ring-label">15 NM (VOR Sep)</text>
 
-              <!-- Static Airway Corridors Group (Populated/Rendered with exact radial math by JS) -->
-              <g id="svgCorridorsLayer"></g>
+                <!-- MSA Boxes inside TMA -->
+                <g class="msa-group">
+                  <rect x="295" y="275" width="76" height="38" rx="4" class="msa-box" />
+                  <text x="333" y="291" class="msa-title">MSA (NW)</text>
+                  <text x="333" y="306" class="msa-val">10,000'</text>
 
-              <!-- 10 DME FIX Hold & KNK FIX Hold -->
-              <g class="holds-layer">
-                <!-- 10 DME FIX on R-170 (r=42 at 170 deg -> x=437.3, y=471.4) -->
-                <polygon points="437,466 432,476 442,476" class="wpt-triangle-fix" />
-                <text x="478" y="474" class="chart-fix-label">10 DME FIX</text>
-                <rect x="437" y="471" width="18" height="38" rx="9" class="hold-racetrack-red" />
-                <text x="492" y="492" class="chart-hold-min">1 dk</text>
+                  <rect x="502" y="295" width="76" height="38" rx="4" class="msa-box" />
+                  <text x="540" y="311" class="msa-title">MSA (NE)</text>
+                  <text x="540" y="326" class="msa-val">9,000'</text>
 
-                <!-- KNK FIX on R-090 (r=55 at 90 deg -> x=485, y=430) -->
-                <circle cx="485" cy="430" r="3.5" fill="#38bdf8" />
-                <text x="488" y="420" class="chart-fix-label">KNK FIX</text>
-                <rect x="485" y="430" width="38" height="16" rx="8" class="hold-racetrack" />
-              </g>
+                  <rect x="480" y="505" width="76" height="38" rx="4" class="msa-box" />
+                  <text x="518" y="521" class="msa-title">MSA (SE)</text>
+                  <text x="518" y="536" class="msa-val">3,000'</text>
 
-              <!-- CENTER: AYT VOR (430, 430) -->
-              <g class="vor-center">
-                <rect x="420" y="420" width="20" height="20" fill="#0b111e" stroke="#38bdf8" stroke-width="2" />
-                <polygon points="430,423 422,436 438,436" fill="none" stroke="#38bdf8" stroke-width="1.6" />
-                <circle cx="430" cy="431" r="2" fill="#38bdf8" />
-                <text x="396" y="454" class="vor-label">AYT VOR</text>
-              </g>
+                  <rect x="285" y="485" width="76" height="38" rx="4" class="msa-box" />
+                  <text x="323" y="501" class="msa-title">MSA (W/SW)</text>
+                  <text x="323" y="516" class="msa-val">12,000'</text>
+                </g>
 
-              <!-- DYNAMIC AIRCRAFT BLIPS LAYER -->
-              <g id="svgBlipsLayer"></g>
-            </svg>
+                <!-- Static Airway Corridors Group -->
+                <g id="svgCorridorsLayer"></g>
+
+                <!-- 10 DME FIX Hold & KNK FIX Hold -->
+                <g class="holds-layer">
+                  <polygon points="437,466 432,476 442,476" class="wpt-triangle-fix" />
+                  <text x="478" y="474" class="chart-fix-label">10 DME FIX</text>
+                  <rect x="437" y="471" width="18" height="38" rx="9" class="hold-racetrack-red" />
+                  <text x="492" y="492" class="chart-hold-min">1 dk</text>
+
+                  <circle cx="485" cy="430" r="3.5" fill="#38bdf8" />
+                  <text x="488" y="420" class="chart-fix-label">KNK FIX</text>
+                  <rect x="485" y="430" width="38" height="16" rx="8" class="hold-racetrack" />
+                </g>
+
+                <!-- CENTER: AYT VOR (430, 430) -->
+                <g class="vor-center">
+                  <rect x="420" y="420" width="20" height="20" fill="#0b111e" stroke="#38bdf8" stroke-width="2" />
+                  <polygon points="430,423 422,436 438,436" fill="none" stroke="#38bdf8" stroke-width="1.6" />
+                  <circle cx="430" cy="431" r="2" fill="#38bdf8" />
+                  <text x="396" y="454" class="vor-label">AYT VOR</text>
+                </g>
+
+                <!-- DYNAMIC AIRCRAFT BLIPS LAYER -->
+                <g id="svgBlipsLayer"></g>
+              </svg>
+            </div>
           </div>
 
-          <!-- SIDEBAR: LIVE AIRCRAFT STATUS AT TIME T -->
+          <!-- RIGHT / BOTTOM: INTERACTIVE FL TESTER + LIVE CONFLICTS + TRAFFIC STATUS -->
           <div class="radar-sidebar">
-            <h3>✈️ Traffic Status at <code id="sidebarTimeLabel">:00</code></h3>
-            <div id="positionSnapshotList" class="snapshot-list">
-              <!-- Populated by JS -->
+            <!-- A. FLIGHT LEVEL TESTER (SOLVE & TEST CLEARANCES) -->
+            <div class="fl-tester-section">
+              <div class="fl-tester-header">
+                <h3>🧪 Test Flight Levels</h3>
+                <button type="button" id="btnResetAllTestFl" class="small-btn" title="Reset all aircraft back to Auto / Original FLs">
+                  ↺ Reset All FLs
+                </button>
+              </div>
+              <div id="flTesterPlanePills" class="fl-plane-pills">
+                <!-- Populated by JS -->
+              </div>
+              <div id="flTesterEditor" class="fl-tester-editor">
+                <!-- Populated by JS -->
+              </div>
+            </div>
+
+            <!-- B. LIVE CONFLICT DETECTOR FEED -->
+            <div class="chart-conflicts-section">
+              <div class="fl-tester-header">
+                <h3>🚨 Conflict Detector</h3>
+                <div class="conflict-scope-tabs">
+                  <button type="button" class="scope-tab active" data-scope="all" id="btnScopeAll">All</button>
+                  <button type="button" class="scope-tab" data-scope="now" id="btnScopeNow">@ Time T</button>
+                </div>
+              </div>
+              <div id="chartConflictFeed" class="chart-conflict-feed">
+                <!-- Populated by JS -->
+              </div>
+            </div>
+
+            <!-- C. TRAFFIC SNAPSHOT AT TIME T -->
+            <div class="snapshot-section">
+              <h3>✈️ Traffic @ <code id="sidebarTimeLabel">:00</code></h3>
+              <div id="positionSnapshotList" class="snapshot-list">
+                <!-- Populated by JS -->
+              </div>
             </div>
           </div>
         </div>
@@ -586,6 +657,6 @@
     </div>
   </main>
 
-  <script src="app.js?v=20261103b"></script>
+  <script src="app.js?v=20261117b"></script>
 </body>
 </html>
