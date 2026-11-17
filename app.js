@@ -405,6 +405,14 @@ function parseScenarioJsonText(rawText) {
       .toUpperCase();
     const timeRaw = String(item.time ?? item.timeRaw ?? item.reportTime ?? "00").trim();
 
+    const altSteps = Array.isArray(item.altSteps)
+      ? item.altSteps.map((s) => ({
+          timeRaw: String(s.timeRaw ?? s.time ?? timeRaw),
+          altRaw: String(s.altRaw ?? s.alt ?? s.fl ?? 150),
+        }))
+      : [];
+    const flMode = item.flMode === "test" || altSteps.length > 0 ? "test" : "auto";
+
     if (type === "TRN") {
       let rawRoute = [];
       if (Array.isArray(item.route) && item.route.length > 0) {
@@ -432,6 +440,8 @@ function parseScenarioJsonText(rawText) {
         exitWptId,
         route: [entryWptId, "AYT", exitWptId],
         fl: normalizeImportedFl(item.fl ?? item.flightLevel, 150),
+        flMode,
+        altSteps,
         dist: Number(item.dist ?? item.distance ?? 60) || 60,
         timeRaw,
         holdMins: Number(item.holdMins) || 0,
@@ -448,6 +458,8 @@ function parseScenarioJsonText(rawText) {
         callsign,
         wptId,
         fl: normalizeImportedFl(item.fl ?? item.flightLevel ?? item.reqFl, 270),
+        flMode,
+        altSteps,
         dist: 0,
         timeRaw,
         mode: "auto",
@@ -460,6 +472,8 @@ function parseScenarioJsonText(rawText) {
       callsign,
       wptId,
       fl: normalizeImportedFl(item.fl ?? item.flightLevel, 250),
+      flMode,
+      altSteps,
       dist: Number(item.dist ?? item.distance ?? 60) || 60,
       timeRaw,
       mode: "auto",
@@ -496,6 +510,7 @@ const state = {
   nextId: 1,
   playInterval: null,
   selectedTestAcftId: null,
+  selectedStepIdx: 0,
   conflictScope: "all", // 'all' | 'now'
   cam: {
     yawDeg: 26,
@@ -547,6 +562,23 @@ function loadSavedState() {
           const endpoints =
             type === "TRN" ? normalizeTransitEndpoints(a) : { entryWptId: a.wptId, exitWptId: null };
           const baseFl = a.fl || (type === "DEP" ? wpt.defaultDepFl : wpt.defaultArrFl);
+          let altSteps = Array.isArray(a.altSteps) ? a.altSteps.map((st) => ({
+            timeRaw: String(st.timeRaw ?? st.time ?? a.timeRaw ?? "00"),
+            altRaw: String(st.altRaw ?? st.alt ?? st.fl ?? baseFl),
+          })) : [];
+          // Migrate legacy 1-2 step fields into unlimited altSteps cleanly
+          if (altSteps.length === 0 && a.flMode === "test") {
+            altSteps.push({
+              timeRaw: a.timeRaw || "0",
+              altRaw: String(a.testFl ?? baseFl),
+            });
+            if (typeof a.stepTimeRaw === "string" && a.stepTimeRaw.trim() !== "" && a.stepFl != null) {
+              altSteps.push({
+                timeRaw: a.stepTimeRaw.trim(),
+                altRaw: String(a.stepFl),
+              });
+            }
+          }
           return {
             ...a,
             type,
@@ -555,9 +587,7 @@ function loadSavedState() {
             exitWptId: endpoints.exitWptId,
             fl: baseFl,
             flMode: a.flMode === "test" ? "test" : "auto",
-            testFl: typeof a.testFl === "number" ? a.testFl : baseFl,
-            stepTimeRaw: typeof a.stepTimeRaw === "string" ? a.stepTimeRaw : "",
-            stepFl: typeof a.stepFl === "number" ? a.stepFl : null,
+            altSteps,
             queryDme: typeof a.queryDme === "number" ? a.queryDme : state.globalQueryDme,
           };
         });
@@ -584,6 +614,33 @@ function saveState() {
   } catch (err) {
     console.warn("Could not save state:", err);
   }
+}
+
+// Parse flexible altitude input: "160" -> 16000', "9000" -> 9000', "FL140" -> 14000', "70" -> 7000', "9" -> 9000'
+function parseFlexibleAltToFeet(raw, fallbackFeet = 10000) {
+  if (typeof raw === "number" && !Number.isNaN(raw) && raw > 0) {
+    return flInputToFeet(raw);
+  }
+  const cleaned = String(raw ?? "")
+    .toUpperCase()
+    .replace(/FL|FT|'|,/g, "")
+    .trim();
+  if (!cleaned) return fallbackFeet;
+  const num = parseFloat(cleaned);
+  if (Number.isNaN(num) || num <= 0) return fallbackFeet;
+  return flInputToFeet(num);
+}
+
+// Parse sequence step time: supports "0", "8", ":08", "10:08", "10:08:30", or "+8" (relative minutes after entry/dep)
+function parseSequenceStepTime(timeRaw, tOriginNorm, refHour) {
+  const s = String(timeRaw ?? "").trim();
+  if (!s) return tOriginNorm;
+  if (s.startsWith("+")) {
+    const rel = parseFloat(s.slice(1));
+    return Number.isNaN(rel) ? tOriginNorm : tOriginNorm + rel;
+  }
+  const p = parseTimeInput(s);
+  return normalizeTime(p.totalMinutes, p.hasHour, refHour);
 }
 
 // Convert user FL or altitude number to feet
@@ -1160,110 +1217,169 @@ function evalPiecewiseAlt(anchors, tQuery) {
   return last.alt;
 }
 
+function getResolvedAltSteps(item, refHour) {
+  const { acft, calc } = item;
+  const rawSteps = Array.isArray(acft.altSteps) ? acft.altSteps : [];
+  if (rawSteps.length === 0) return [];
+
+  const tOrigin = acft.type === "DEP" ? item.normDep : item.normInit;
+  const fallbackFt =
+    acft.type === "DEP"
+      ? calc.reqAltFt
+      : acft.type === "TRN"
+      ? calc.maintAltFt
+      : calc.initAltFt;
+
+  return rawSteps
+    .map((s, idx) => ({
+      idx,
+      timeRaw: s.timeRaw,
+      altRaw: s.altRaw,
+      tNorm: parseSequenceStepTime(s.timeRaw, tOrigin, refHour),
+      targetFt: parseFlexibleAltToFeet(s.altRaw, fallbackFt),
+    }))
+    .sort((a, b) => (a.tNorm !== b.tNorm ? a.tNorm - b.tNorm : a.idx - b.idx));
+}
+
+function advanceSegmentAltitude(item, tFrom, altFrom, targetAlt, tTo) {
+  if (tTo <= tFrom) return altFrom;
+  const { acft, wpt } = item;
+
+  // Departures climb steeply enough to clear MSA by 10 NM (2 min) when target >= MSA
+  if (acft.type === "DEP" && tFrom < item.norm10 && targetAlt >= wpt.msaFt) {
+    const depBoostRate = Math.max(VERT_RATE_FPM, (wpt.msaFt - 1000) / 2);
+    const tSplit = Math.min(tTo, item.norm10);
+    let cur = stepTowardAlt(altFrom, targetAlt, tSplit - tFrom, depBoostRate);
+    if (tTo > tSplit) {
+      cur = stepTowardAlt(cur, targetAlt, tTo - tSplit, VERT_RATE_FPM);
+    }
+    return cur;
+  }
+
+  return stepTowardAlt(altFrom, targetAlt, tTo - tFrom, VERT_RATE_FPM);
+}
+
 function evaluatePlannedAltitude(item, eatInfo, queryNormMins, refHour) {
   const { acft, calc } = item;
-  const isTest = acft.flMode === "test";
-  const target1Ft = isTest
-    ? flInputToFeet(acft.testFl ?? acft.fl)
-    : null;
+  const isSeq = acft.flMode === "test";
+  const resolvedSteps = isSeq ? getResolvedAltSteps(item, refHour) : [];
 
-  function evalBasePhase1(t) {
-    // TRANSIT
-    if (acft.type === "TRN") {
-      return isTest ? target1Ft : calc.maintAltFt;
+  // Multi-Step Altitude Sequence Mode
+  if (isSeq && resolvedSteps.length > 0) {
+    const tOrigin = acft.type === "DEP" ? item.normDep : item.normInit;
+    let curAlt =
+      acft.type === "DEP"
+        ? 1000
+        : acft.type === "TRN"
+        ? resolvedSteps[0].tNorm <= tOrigin + 1e-6
+          ? resolvedSteps[0].targetFt
+          : calc.maintAltFt
+        : calc.initAltFt;
+
+    if (queryNormMins <= tOrigin) return Math.round(curAlt);
+
+    let curTarget = curAlt;
+    const futureSteps = [];
+    resolvedSteps.forEach((s) => {
+      if (s.tNorm <= tOrigin + 1e-6) {
+        curTarget = s.targetFt;
+      } else {
+        futureSteps.push(s);
+      }
+    });
+
+    let curT = tOrigin;
+    for (let i = 0; i < futureSteps.length; i++) {
+      const nextStep = futureSteps[i];
+      if (queryNormMins <= nextStep.tNorm) {
+        return Math.round(
+          advanceSegmentAltitude(item, curT, curAlt, curTarget, queryNormMins)
+        );
+      }
+      curAlt = advanceSegmentAltitude(item, curT, curAlt, curTarget, nextStep.tNorm);
+      curT = nextStep.tNorm;
+      curTarget = nextStep.targetFt;
     }
 
-    // DEPARTURE
-    if (acft.type === "DEP") {
-      const { wpt } = item;
-      const tDep = item.normDep;
-      if (t <= tDep) return 1000;
+    return Math.round(
+      advanceSegmentAltitude(item, curT, curAlt, curTarget, queryNormMins)
+    );
+  }
 
-      const finalTargetFt = isTest ? target1Ft : calc.reqAltFt;
-      const msaCap = isTest ? Math.min(finalTargetFt, wpt.msaFt) : Math.min(calc.reqAltFt, wpt.msaFt);
-      const meaCap = isTest
-        ? Math.min(finalTargetFt, Math.max(wpt.msaFt, wpt.meaFt))
-        : Math.min(calc.reqAltFt, Math.max(wpt.msaFt, wpt.meaFt));
+  // Default AUTO Procedural Profile
+  if (acft.type === "TRN") {
+    return Math.round(calc.maintAltFt);
+  }
 
-      if (t <= item.norm10) {
-        return evalPiecewiseAlt(
+  if (acft.type === "DEP") {
+    const { wpt } = item;
+    const tDep = item.normDep;
+    if (queryNormMins <= tDep) return 1000;
+
+    const msaCap = Math.min(calc.reqAltFt, wpt.msaFt);
+    const meaCap = Math.min(calc.reqAltFt, Math.max(wpt.msaFt, wpt.meaFt));
+
+    if (queryNormMins <= item.norm10) {
+      return Math.round(
+        evalPiecewiseAlt(
           [
             { t: tDep, alt: 1000 },
             { t: item.norm10, alt: msaCap },
           ],
-          t
-        );
-      }
-      if (t <= item.norm25) {
-        return evalPiecewiseAlt(
+          queryNormMins
+        )
+      );
+    }
+    if (queryNormMins <= item.norm25) {
+      return Math.round(
+        evalPiecewiseAlt(
           [
             { t: item.norm10, alt: msaCap },
             { t: item.norm25, alt: meaCap },
           ],
-          t
-        );
-      }
-      return stepTowardAlt(meaCap, finalTargetFt, t - item.norm25, VERT_RATE_FPM);
+          queryNormMins
+        )
+      );
     }
+    return Math.round(
+      stepTowardAlt(meaCap, calc.reqAltFt, queryNormMins - item.norm25, VERT_RATE_FPM)
+    );
+  }
 
-    // ARRIVAL
-    const { wpt } = item;
-    if (isTest) {
-      if (t <= item.normInit) return calc.initAltFt;
-      return stepTowardAlt(calc.initAltFt, target1Ft, t - item.normInit, VERT_RATE_FPM);
-    }
+  // ARRIVAL Auto Procedural Profile
+  const { wpt } = item;
+  const t25 = item.norm25 ?? item.normInit;
+  const alt25 = Math.min(calc.initAltFt, wpt.meaFt);
 
-    const t25 = item.norm25 ?? item.normInit;
-    const alt25 = Math.min(calc.initAltFt, wpt.meaFt);
-
-    if (calc.straightIn) {
-      const inner10Alt = eatInfo && eatInfo.willDelay ? Math.max(4000, wpt.msaFt) : 3000;
-      const estNorm = eatInfo ? eatInfo.effectiveEstNorm : item.norm10;
-      const anchors = [
-        { t: item.normInit, alt: calc.initAltFt },
-        { t: t25, alt: alt25 },
-        { t: item.norm10, alt: inner10Alt },
-      ];
-      if (estNorm > item.norm10 + 0.05) {
-        anchors.push({ t: estNorm - 0.1, alt: 4000 });
-        anchors.push({ t: estNorm, alt: 3000 });
-      }
-      anchors.push({ t: estNorm + 2, alt: 0 });
-      return evalPiecewiseAlt(anchors, t);
-    }
-
-    const inner10Alt = Math.max(wpt.msaFt, 4000);
-    const estNorm = eatInfo ? eatInfo.effectiveEstNorm : item.norm10 + 9;
-    const fixNorm = eatInfo ? eatInfo.effectiveFixNorm : item.normFixBase;
+  if (calc.straightIn) {
+    const inner10Alt = eatInfo && eatInfo.willDelay ? Math.max(4000, wpt.msaFt) : 3000;
+    const estNorm = eatInfo ? eatInfo.effectiveEstNorm : item.norm10;
     const anchors = [
       { t: item.normInit, alt: calc.initAltFt },
       { t: t25, alt: alt25 },
       { t: item.norm10, alt: inner10Alt },
-      { t: item.normVor, alt: 4000 },
-      { t: fixNorm, alt: 4000 },
-      { t: estNorm, alt: 3000 },
-      { t: estNorm + 2, alt: 0 },
     ];
-    return evalPiecewiseAlt(anchors, t);
-  }
-
-  // Optional 2nd Clearance Step (after stepTimeRaw -> stepFl)
-  const rawStepT = String(acft.stepTimeRaw || "").trim();
-  if (isTest && rawStepT !== "" && acft.stepFl !== null && acft.stepFl !== undefined) {
-    const pStep = parseTimeInput(rawStepT);
-    if (pStep.valid) {
-      const tStep2Norm = normalizeTime(pStep.totalMinutes, pStep.hasHour, refHour);
-      if (queryNormMins > tStep2Norm) {
-        const altAtStep2 = evalBasePhase1(tStep2Norm);
-        const target2Ft = flInputToFeet(acft.stepFl);
-        return Math.round(
-          stepTowardAlt(altAtStep2, target2Ft, queryNormMins - tStep2Norm, VERT_RATE_FPM)
-        );
-      }
+    if (estNorm > item.norm10 + 0.05) {
+      anchors.push({ t: estNorm - 0.1, alt: 4000 });
+      anchors.push({ t: estNorm, alt: 3000 });
     }
+    anchors.push({ t: estNorm + 2, alt: 0 });
+    return Math.round(evalPiecewiseAlt(anchors, queryNormMins));
   }
 
-  return Math.round(evalBasePhase1(queryNormMins));
+  const inner10Alt = Math.max(wpt.msaFt, 4000);
+  const estNorm = eatInfo ? eatInfo.effectiveEstNorm : item.norm10 + 9;
+  const fixNorm = eatInfo ? eatInfo.effectiveFixNorm : item.normFixBase;
+  const anchors = [
+    { t: item.normInit, alt: calc.initAltFt },
+    { t: t25, alt: alt25 },
+    { t: item.norm10, alt: inner10Alt },
+    { t: item.normVor, alt: 4000 },
+    { t: fixNorm, alt: 4000 },
+    { t: estNorm, alt: 3000 },
+    { t: estNorm + 2, alt: 0 },
+  ];
+  return Math.round(evalPiecewiseAlt(anchors, queryNormMins));
 }
 
 function getAircraftStateAtTime(item, solverData, queryNormMins) {
@@ -3337,8 +3453,8 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
   const sinPhi = Math.sin(pitchRad);
   const cosPhi = Math.cos(pitchRad);
 
-  const camDist = 260;
-  const baseScale = ((Math.min(W, H) * 0.46) / 56) * state.cam.zoom;
+  const camDist = 155;
+  const baseScale = ((Math.min(W, H) * 0.44) / 56) * state.cam.zoom;
   const centerX = W / 2 + state.cam.panX;
   const centerY = H * (0.5 + 0.12 * cosPhi) + state.cam.panY;
   const zPerFt = (40 / 40000) * state.cam.altScale; // FL400 -> 40 NM visual height * altScale
@@ -3348,7 +3464,7 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
     const y1 = xNm * sinYaw + yNm * cosYaw;
     const z = (altFt || 0) * zPerFt;
     const viewAway = y1 * cosPhi - z * sinPhi;
-    const persp = camDist / Math.max(40, camDist + viewAway);
+    const persp = camDist / Math.max(45, camDist + viewAway);
     const sx = centerX + x1 * persp * baseScale;
     const sy = centerY - (y1 * sinPhi + z * cosPhi) * persp * baseScale;
     return { x: sx, y: sy, depth: viewAway, scale: persp };
@@ -3693,6 +3809,33 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
           ctx.stroke();
         }
       }
+
+      // Draw sequence step milestone dots & compact target pills for Selected aircraft
+      if (
+        state.selectedTestAcftId === d.item.acft.id &&
+        d.item.acft.flMode === "test" &&
+        Array.isArray(d.item.acft.altSteps)
+      ) {
+        const resSteps = getResolvedAltSteps(d.item, solver.refHour);
+        ctx.globalAlpha = 0.95;
+        resSteps.forEach((step, idx) => {
+          const stM = getAircraftStateAtTime(d.item, solver, step.tNorm);
+          if (!stM.visible) return;
+          const pM = project(stM.xNm, stM.yNm, stM.altFt);
+          ctx.fillStyle = "#c084fc";
+          ctx.strokeStyle = "#fff";
+          ctx.lineWidth = 1.4;
+          ctx.beginPath();
+          ctx.arc(pM.x, pM.y, 4, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+
+          ctx.font = "800 9px JetBrains Mono, monospace";
+          ctx.fillStyle = "#e9d5ff";
+          ctx.textAlign = "center";
+          ctx.fillText(`#${idx + 1}→${formatAltShort(step.targetFt)}`, pM.x, pM.y - 8);
+        });
+      }
       ctx.restore();
       return;
     }
@@ -3732,37 +3875,43 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
     if (d.kind === "aircraft") {
       const { item, st, proj3d, projFloor, isSelected, inConflictNow } = d;
       const blipColor = inConflictNow ? "#f87171" : st.color;
+      // Depth-based visual scaling (farther = smaller, closer = larger)
+      const dScale = Math.max(0.62, Math.min(1.48, proj3d.scale));
+      const fScale = Math.max(0.76, Math.min(1.22, 0.45 + 0.55 * proj3d.scale));
+      const depthAlpha = Math.max(0.74, Math.min(1.0, 0.52 + 0.48 * proj3d.scale));
+      const floorScale = Math.max(0.62, Math.min(1.48, projFloor.scale));
 
       // Ground shadow ring + crisp vertical plumb line stalk down to TMA floor
       ctx.save();
       ctx.strokeStyle = blipColor;
       ctx.fillStyle = blipColor;
-      ctx.globalAlpha = isSelected ? 0.75 : 0.42;
-      ctx.lineWidth = isSelected ? 1.5 : 1;
+      ctx.globalAlpha = isSelected ? 0.78 : 0.44 * depthAlpha;
+      ctx.lineWidth = (isSelected ? 1.5 : 1) * floorScale;
       ctx.beginPath();
-      ctx.arc(projFloor.x, projFloor.y, isSelected ? 5 : 3.5, 0, Math.PI * 2);
+      ctx.arc(projFloor.x, projFloor.y, (isSelected ? 5 : 3.6) * floorScale, 0, Math.PI * 2);
       ctx.stroke();
 
-      ctx.globalAlpha = isSelected ? 0.85 : 0.48;
-      ctx.lineWidth = isSelected ? 1.8 : 1.1;
+      ctx.globalAlpha = isSelected ? 0.85 : 0.46 * depthAlpha;
+      ctx.lineWidth = (isSelected ? 1.7 : 1.05) * Math.min(1.2, dScale);
       ctx.beginPath();
       ctx.moveTo(projFloor.x, projFloor.y);
       ctx.lineTo(proj3d.x, proj3d.y);
       ctx.stroke();
       ctx.restore();
 
-      // Highlight halo if Selected or Conflicting
+      // Highlight halo if Selected or Conflicting (depth scaled)
       if (isSelected || inConflictNow) {
         ctx.save();
         ctx.strokeStyle = inConflictNow ? "#f87171" : "#ffffff";
-        ctx.lineWidth = 2;
+        ctx.lineWidth = Math.max(1.3, 2 * dScale);
+        ctx.globalAlpha = depthAlpha;
         ctx.beginPath();
-        ctx.arc(proj3d.x, proj3d.y, isSelected ? 12 : 11, 0, Math.PI * 2);
+        ctx.arc(proj3d.x, proj3d.y, (isSelected ? 12.5 : 11) * dScale, 0, Math.PI * 2);
         ctx.stroke();
         ctx.restore();
       }
 
-      // 3D Directional Jet Arrow / Diamond Marker
+      // 3D Directional Jet Arrow / Diamond Marker scaled by perspective depth
       if (st.trackDeg !== null) {
         const noseRad = (st.trackDeg * Math.PI) / 180;
         const pNose = project(
@@ -3772,56 +3921,71 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
         );
         const angle = Math.atan2(pNose.y - proj3d.y, pNose.x - proj3d.x);
         ctx.save();
+        ctx.globalAlpha = isSelected ? 1 : depthAlpha;
         ctx.translate(proj3d.x, proj3d.y);
         ctx.rotate(angle);
         ctx.fillStyle = blipColor;
         ctx.strokeStyle = "#0b111e";
-        ctx.lineWidth = 1.4;
+        ctx.lineWidth = Math.max(0.9, 1.4 * dScale);
         ctx.beginPath();
-        ctx.moveTo(9, 0);
-        ctx.lineTo(-6, -5.5);
-        ctx.lineTo(-3, 0);
-        ctx.lineTo(-6, 5.5);
+        ctx.moveTo(9.5 * dScale, 0);
+        ctx.lineTo(-6.2 * dScale, -5.8 * dScale);
+        ctx.lineTo(-3.1 * dScale, 0);
+        ctx.lineTo(-6.2 * dScale, 5.8 * dScale);
         ctx.closePath();
         ctx.fill();
         ctx.stroke();
         ctx.restore();
       } else {
+        const halfSq = 5.5 * dScale;
         ctx.save();
+        ctx.globalAlpha = isSelected ? 1 : depthAlpha;
         ctx.translate(proj3d.x, proj3d.y);
         ctx.rotate(Math.PI / 4);
         ctx.fillStyle = "#0b111e";
         ctx.strokeStyle = blipColor;
-        ctx.lineWidth = 2.4;
-        ctx.fillRect(-5.5, -5.5, 11, 11);
-        ctx.strokeRect(-5.5, -5.5, 11, 11);
+        ctx.lineWidth = Math.max(1.5, 2.3 * dScale);
+        ctx.fillRect(-halfSq, -halfSq, halfSq * 2, halfSq * 2);
+        ctx.strokeRect(-halfSq, -halfSq, halfSq * 2, halfSq * 2);
         ctx.restore();
       }
 
-      // Queue Callsign & FL / DME Label Tag for collision separation pass
-      const line1 = `${item.acft.callsign}${item.acft.flMode === "test" ? " ★" : ""}`;
+      // Queue Callsign & FL / DME Label Tag with depth-proportional scale
+      const stepCount =
+        item.acft.flMode === "test" && Array.isArray(item.acft.altSteps)
+          ? item.acft.altSteps.length
+          : 0;
+      const line1 = `${item.acft.callsign}${stepCount > 0 ? ` [${stepCount}]` : ""}`;
       const line2 = `${st.altStr} • ${st.dme}NM`;
-      ctx.font = "800 10.5px JetBrains Mono, monospace";
+      const f1Px = +(10.2 * fScale).toFixed(1);
+      const f2Px = +(9.2 * fScale).toFixed(1);
+      ctx.font = `800 ${f1Px}px JetBrains Mono, monospace`;
       const w1 = ctx.measureText(line1).width;
-      ctx.font = "700 9.5px JetBrains Mono, monospace";
+      ctx.font = `700 ${f2Px}px JetBrains Mono, monospace`;
       const w2 = ctx.measureText(line2).width;
-      const tagW = Math.max(w1, w2) + 12;
-      const tagH = 29;
+      const padH = Math.round(5.5 * fScale);
+      const tagW = Math.round(Math.max(w1, w2) + padH * 2);
+      const tagH = Math.round(28 * fScale);
       const dxC = proj3d.x - centerX;
       const dyC = proj3d.y - centerY;
-      const pushOutX = dxC >= 0 ? 18 : -(tagW + 18);
-      const pushOutY = dyC >= 0 ? 12 : -(tagH + 12);
+      const pushOutX = dxC >= 0 ? 16 : -(tagW + 16);
+      const pushOutY = dyC >= 0 ? 11 : -(tagH + 11);
       const tx = Math.max(6, Math.min(W - tagW - 6, proj3d.x + pushOutX));
       const ty = Math.max(46, Math.min(H - tagH - 38, proj3d.y + pushOutY));
 
       labelQueue.push({
         id: item.acft.id,
+        depth: proj3d.depth,
         sx: proj3d.x,
         sy: proj3d.y,
         tx,
         ty,
         tw: tagW,
         th: tagH,
+        f1Px,
+        f2Px,
+        padH,
+        alpha: isSelected ? 1 : depthAlpha,
         line1,
         line2,
         blipColor,
@@ -3875,19 +4039,20 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
     if (!moved) break;
   }
 
-  // Draw leader lines & de-overlapped 3D labels
+  // Draw leader lines & de-overlapped 3D labels sorted back-to-front by depth
+  labelQueue.sort((a, b) => b.depth - a.depth);
   labelQueue.forEach((lbl) => {
     const anchor = getRectPerimeterAnchor(lbl.sx, lbl.sy, lbl.tx, lbl.ty, lbl.tw, lbl.th);
     ctx.save();
     ctx.strokeStyle = lbl.blipColor;
-    ctx.globalAlpha = 0.72;
-    ctx.lineWidth = 1.2;
+    ctx.globalAlpha = 0.65 * lbl.alpha;
+    ctx.lineWidth = 1.1;
     ctx.beginPath();
     ctx.moveTo(lbl.sx, lbl.sy);
     ctx.lineTo(anchor.x, anchor.y);
     ctx.stroke();
 
-    ctx.globalAlpha = 1;
+    ctx.globalAlpha = lbl.alpha;
     ctx.fillStyle = lbl.isSelected ? "rgba(30, 58, 138, 0.94)" : "rgba(9, 14, 26, 0.9)";
     ctx.strokeStyle = lbl.blipColor;
     ctx.lineWidth = lbl.isSelected ? 1.8 : 1.1;
@@ -3896,12 +4061,12 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
     ctx.stroke();
 
     ctx.fillStyle = lbl.blipColor;
-    ctx.font = "800 10.5px JetBrains Mono, monospace";
+    ctx.font = `800 ${lbl.f1Px}px JetBrains Mono, monospace`;
     ctx.textAlign = "left";
-    ctx.fillText(lbl.line1, lbl.tx + 6, lbl.ty + 12);
+    ctx.fillText(lbl.line1, lbl.tx + lbl.padH, lbl.ty + Math.round(lbl.th * 0.43));
     ctx.fillStyle = "#e2e8f0";
-    ctx.font = "700 9.5px JetBrains Mono, monospace";
-    ctx.fillText(lbl.line2, lbl.tx + 6, lbl.ty + 23.5);
+    ctx.font = `700 ${lbl.f2Px}px JetBrains Mono, monospace`;
+    ctx.fillText(lbl.line2, lbl.tx + lbl.padH, lbl.ty + Math.round(lbl.th * 0.83));
     ctx.restore();
 
     projectedBlips3d.push({
@@ -3965,6 +4130,22 @@ function renderConflictHeatmapBar(solver, queryNorm) {
   });
 }
 
+function ensureAltSteps(acft, wptObj) {
+  if (!Array.isArray(acft.altSteps)) acft.altSteps = [];
+  if (acft.altSteps.length === 0) {
+    const defaultTarget =
+      acft.type === "DEP"
+        ? String(acft.fl || wptObj?.defaultDepFl || 150)
+        : acft.type === "TRN"
+        ? String(acft.fl || 150)
+        : String(Math.round((wptObj?.meaFt || 12000) / 100));
+    acft.altSteps.push({
+      timeRaw: acft.timeRaw || "00",
+      altRaw: defaultTarget,
+    });
+  }
+}
+
 function renderFlTesterPanel(solver, queryNorm) {
   const pillsEl = document.getElementById("flTesterPlanePills");
   const editorEl = document.getElementById("flTesterEditor");
@@ -3973,7 +4154,7 @@ function renderFlTesterPanel(solver, queryNorm) {
   const allItems = getAllItemsFromSolver(solver);
   if (allItems.length === 0) {
     pillsEl.innerHTML = "";
-    editorEl.innerHTML = `<div style="font-size:0.8rem;color:var(--text-muted);">Add aircraft or import a scenario to test Flight Levels and detect separation conflicts live.</div>`;
+    editorEl.innerHTML = `<div style="font-size:0.8rem;color:var(--text-muted);">Add aircraft or import a scenario to build Altitude Sequences and detect separation conflicts live.</div>`;
     return;
   }
 
@@ -3982,6 +4163,7 @@ function renderFlTesterPanel(solver, queryNorm) {
     !allItems.some((it) => it.acft.id === state.selectedTestAcftId)
   ) {
     state.selectedTestAcftId = allItems[0].acft.id;
+    state.selectedStepIdx = 0;
   }
 
   const conflictIds = solver.conflictAcftIds || new Set();
@@ -4008,6 +4190,7 @@ function renderFlTesterPanel(solver, queryNorm) {
   pillsEl.querySelectorAll("[data-select-acft]").forEach((btn) => {
     btn.addEventListener("click", () => {
       state.selectedTestAcftId = Number(btn.getAttribute("data-select-acft"));
+      state.selectedStepIdx = 0;
       renderRadarChartView(solver);
     });
   });
@@ -4018,41 +4201,85 @@ function renderFlTesterPanel(solver, queryNorm) {
   const stNow = getAircraftStateAtTime(selItem, solver, queryNorm);
   const corr = getAcftCorridorShort(selItem);
   const wptObj = selItem.wpt || selItem.entryWpt || WAYPOINTS[0];
-  const currentTestFl = Number(acft.testFl ?? acft.fl) || 150;
-  const isTestMode = acft.flMode === "test";
+  const isSeqMode = acft.flMode === "test";
+  if (!Array.isArray(acft.altSteps)) acft.altSteps = [];
 
-  const presetValues =
-    acft.type === "DEP"
-      ? [
-          { lbl: `MSA (${Math.round(wptObj.msaFt / 100)})`, val: Math.round(wptObj.msaFt / 100) },
-          { lbl: `MEA (${Math.round(wptObj.meaFt / 100)})`, val: Math.round(wptObj.meaFt / 100) },
-          { lbl: "FL130", val: 130 },
-          { lbl: "FL150", val: 150 },
-          { lbl: `Req FL${acft.fl}`, val: acft.fl },
-        ]
-      : acft.type === "TRN"
-      ? [
-          { lbl: `Orig FL${acft.fl}`, val: acft.fl },
-          { lbl: "FL130", val: 130 },
-          { lbl: "FL140", val: 140 },
-          { lbl: "FL150", val: 150 },
-          { lbl: "FL160", val: 160 },
-        ]
-      : [
-          { lbl: `Init FL${acft.fl}`, val: acft.fl },
-          { lbl: `MEA (${Math.round(wptObj.meaFt / 100)})`, val: Math.round(wptObj.meaFt / 100) },
-          { lbl: "FL150", val: 150 },
-          { lbl: "FL140", val: 140 },
-          { lbl: `MSA (${Math.round(wptObj.msaFt / 100)})`, val: Math.round(wptObj.msaFt / 100) },
-          { lbl: "4,000'", val: 40 },
-          { lbl: "3,000'", val: 30 },
-        ];
+  if (state.selectedStepIdx < 0) state.selectedStepIdx = 0;
+  if (acft.altSteps.length > 0 && state.selectedStepIdx >= acft.altSteps.length) {
+    state.selectedStepIdx = acft.altSteps.length - 1;
+  }
 
-  const hasStep2 = String(acft.stepTimeRaw || "").trim() !== "" && acft.stepFl !== null;
   const nowDisp = formatTime(
     denormalizeTime(queryNorm, solver.useHasHour, solver.refHour),
     solver.useHasHour
   );
+
+  const presetValues =
+    acft.type === "DEP"
+      ? [
+          { lbl: `MSA ${Math.round(wptObj.msaFt / 100)}`, val: String(Math.round(wptObj.msaFt / 100)) },
+          { lbl: `MEA ${Math.round(wptObj.meaFt / 100)}`, val: String(Math.round(wptObj.meaFt / 100)) },
+          { lbl: "130", val: "130" },
+          { lbl: "150", val: "150" },
+          { lbl: `Req ${acft.fl}`, val: String(acft.fl) },
+        ]
+      : acft.type === "TRN"
+      ? [
+          { lbl: `Orig ${acft.fl}`, val: String(acft.fl) },
+          { lbl: "130", val: "130" },
+          { lbl: "140", val: "140" },
+          { lbl: "150", val: "150" },
+          { lbl: "160", val: "160" },
+        ]
+      : [
+          { lbl: `Init ${acft.fl}`, val: String(acft.fl) },
+          { lbl: "160", val: "160" },
+          { lbl: "150", val: "150" },
+          { lbl: `MEA ${Math.round(wptObj.meaFt / 100)}`, val: String(Math.round(wptObj.meaFt / 100)) },
+          { lbl: "9000'", val: "9000" },
+          { lbl: `MSA ${Math.round(wptObj.msaFt / 100)}`, val: String(Math.round(wptObj.msaFt / 100)) },
+          { lbl: "4000'", val: "4000" },
+          { lbl: "3000'", val: "3000" },
+        ];
+
+  const stepsHtml =
+    acft.altSteps.length === 0
+      ? `<div class="seq-empty-note">Currently using automatic TMA profile. Click <strong>📋 Alt Sequence</strong> or <strong>➕ Add Step</strong> to script timed clearances (e.g. <code>0m → 160</code>, <code>8m → 9000</code>).</div>`
+      : `<div class="alt-seq-list">
+          ${acft.altSteps
+            .map((step, idx) => {
+              const feet = parseFlexibleAltToFeet(step.altRaw, stNow.altFt);
+              const altBadge = formatAltShort(feet);
+              const tOrigin = acft.type === "DEP" ? selItem.normDep : selItem.normInit;
+              const tNorm = parseSequenceStepTime(step.timeRaw, tOrigin, solver.refHour);
+              const tResolvedDisp = formatTime(
+                denormalizeTime(tNorm, solver.useHasHour, solver.refHour),
+                solver.useHasHour
+              );
+              const isFocused = idx === state.selectedStepIdx;
+              return `
+                <div class="alt-seq-row ${isFocused ? "focused" : ""}" data-seq-row="${idx}">
+                  <span class="seq-idx-badge">#${idx + 1}</span>
+                  <label class="seq-field-group" title="Start time of clearance (e.g. 0, 8, +5, or 10:08)">
+                    <span class="seq-mini-lbl">At</span>
+                    <input type="text" class="inline-input seq-time-input" data-seq-time="${idx}" value="${step.timeRaw}" placeholder="00" />
+                    <span class="seq-resolved-chip">${tResolvedDisp}</span>
+                  </label>
+                  <span class="seq-arrow">→</span>
+                  <label class="seq-field-group" title="Target FL or Feet (e.g. 160 or 9000)">
+                    <input type="text" class="inline-input seq-alt-input" data-seq-alt="${idx}" value="${step.altRaw}" placeholder="160 / 9000" />
+                    <span class="seq-resolved-chip alt-chip">${altBadge}</span>
+                  </label>
+                  <div class="seq-row-btns">
+                    <button type="button" class="seq-mini-btn" data-seq-step-delta="${idx}:-10" title="-1,000 ft">-10</button>
+                    <button type="button" class="seq-mini-btn" data-seq-step-delta="${idx}:10" title="+1,000 ft">+10</button>
+                    <button type="button" class="row-del-btn seq-del-btn" data-seq-del="${idx}" title="Delete step">✕</button>
+                  </div>
+                </div>
+              `;
+            })
+            .join("")}
+        </div>`;
 
   editorEl.innerHTML = `
     <div class="fl-editor-top">
@@ -4061,162 +4288,190 @@ function renderFlTesterPanel(solver, queryNorm) {
         <span class="step-delta" id="flEditorNowInfo">(${corr}) • Now: <strong>${stNow.altStr}</strong> @ ${stNow.dme} DME</span>
       </div>
       <div class="fl-mode-switch">
-        <button type="button" class="fl-mode-btn ${!isTestMode ? "active" : ""}" data-flmode="auto">Auto Proc</button>
-        <button type="button" class="fl-mode-btn ${isTestMode ? "active" : ""}" data-flmode="test">🧪 Test FL</button>
+        <button type="button" class="fl-mode-btn ${!isSeqMode ? "active" : ""}" data-flmode="auto">Auto Proc</button>
+        <button type="button" class="fl-mode-btn ${isSeqMode ? "active" : ""}" data-flmode="test">📋 Alt Sequence</button>
       </div>
     </div>
 
-    <div class="fl-step-control-row">
-      <button type="button" class="fl-big-step-btn" data-fl-delta="-20">-20</button>
-      <button type="button" class="fl-big-step-btn" data-fl-delta="-10">-10</button>
-      <div class="fl-input-wrap" style="flex:1;min-width:94px;">
-        <span class="fl-prefix">FL</span>
-        <input type="number" id="testerFlInput" value="${currentTestFl}" min="30" max="420" step="10" aria-label="Test Flight Level" />
-      </div>
-      <button type="button" class="fl-big-step-btn" data-fl-delta="10">+10</button>
-      <button type="button" class="fl-big-step-btn" data-fl-delta="20">+20</button>
-    </div>
+    ${stepsHtml}
 
-    <input type="range" id="testerFlSlider" class="fl-test-slider" min="30" max="400" step="10" value="${Math.max(
-      30,
-      Math.min(400, currentTestFl)
-    )}" aria-label="Test Flight Level Slider" />
+    <div class="seq-action-bar">
+      <button type="button" id="btnAddSeqNow" class="small-btn accent-btn">➕ Step @ Now (${nowDisp})</button>
+      <button type="button" id="btnAddSeqNext" class="small-btn">➕ Add Step (+5m)</button>
+      <span class="seq-help-hint">Type e.g. <code>0</code> / <code>8</code> / <code>+5</code> / <code>10:08</code> &amp; <code>160</code> or <code>9000</code></span>
+    </div>
 
     <div class="fl-quick-presets">
+      <span class="quick-pill-label">Quick → #${
+        acft.altSteps.length > 0 ? state.selectedStepIdx + 1 : 1
+      }:</span>
       ${presetValues
         .map(
           (p) =>
-            `<button type="button" class="small-btn tester-preset-btn" data-preset-fl="${p.val}">${p.lbl}</button>`
+            `<button type="button" class="small-btn tester-preset-btn" data-preset-alt="${p.val}">${p.lbl}</button>`
         )
         .join("")}
     </div>
-
-    <div class="fl-step2-box">
-      <div class="fl-step2-row">
-        <span><strong>Step 2 Clearance</strong> (optional): After time</span>
-        <input type="text" id="testerStepTimeInput" class="inline-input inline-time" value="${
-          acft.stepTimeRaw || ""
-        }" placeholder="${nowDisp}" title="Time when next FL clearance starts" />
-        <span>→ FL</span>
-        <input type="number" id="testerStepFlInput" class="inline-input inline-fl" value="${
-          acft.stepFl ?? acft.fl
-        }" min="30" max="420" step="10" />
-        <button type="button" id="btnSetStep2Now" class="small-btn" title="Set Step 2 trigger to current scrub time ${nowDisp}">@ Now (${nowDisp})</button>
-        ${
-          hasStep2
-            ? `<button type="button" id="btnClearStep2" class="small-btn danger-btn">✕</button>`
-            : ""
-        }
-      </div>
-    </div>
   `;
 
-  function applyFlUpdate(nextFl, forceTestMode = true) {
-    acft.testFl = Math.max(30, Math.min(450, Number(nextFl) || 100));
-    if (forceTestMode) acft.flMode = "test";
+  function commitSequenceChanges(fullRender = true) {
     saveState();
     const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
     renderConflictPanels(newSolver);
-    renderRadarChartView(newSolver);
+    if (fullRender) {
+      renderRadarChartView(newSolver);
+    } else {
+      renderRadarChartOnlyVisuals(newSolver);
+    }
   }
 
+  // Switch Auto vs Sequence Mode
   editorEl.querySelectorAll("[data-flmode]").forEach((btn) => {
     btn.addEventListener("click", () => {
       acft.flMode = btn.getAttribute("data-flmode");
-      if (acft.flMode === "test" && (acft.testFl === undefined || acft.testFl === null)) {
-        acft.testFl = acft.fl;
+      if (acft.flMode === "test") ensureAltSteps(acft, wptObj);
+      commitSequenceChanges(true);
+    });
+  });
+
+  // Clicking a row selects it as the active target for Quick Presets
+  editorEl.querySelectorAll("[data-seq-row]").forEach((row) => {
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("button")) return;
+      const idx = Number(row.getAttribute("data-seq-row"));
+      if (state.selectedStepIdx !== idx) {
+        state.selectedStepIdx = idx;
+        editorEl.querySelectorAll("[data-seq-row]").forEach((r) => {
+          r.classList.toggle("focused", Number(r.getAttribute("data-seq-row")) === idx);
+        });
+        const lbl = editorEl.querySelector(".fl-quick-presets .quick-pill-label");
+        if (lbl) lbl.textContent = `Quick → #${idx + 1}:`;
       }
-      saveState();
-      const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
-      renderConflictPanels(newSolver);
-      renderRadarChartView(newSolver);
     });
   });
 
-  editorEl.querySelectorAll("[data-fl-delta]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const delta = Number(btn.getAttribute("data-fl-delta"));
-      applyFlUpdate(currentTestFl + delta, true);
-    });
-  });
-
-  editorEl.querySelectorAll("[data-preset-fl]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const val = Number(btn.getAttribute("data-preset-fl"));
-      applyFlUpdate(val, true);
-    });
-  });
-
-  const testerFlInput = document.getElementById("testerFlInput");
-  const testerFlSlider = document.getElementById("testerFlSlider");
-  if (testerFlInput) {
-    testerFlInput.addEventListener("change", () => applyFlUpdate(testerFlInput.value, true));
-  }
-  if (testerFlSlider) {
-    testerFlSlider.addEventListener("input", () => {
-      const v = Number(testerFlSlider.value);
-      if (testerFlInput) testerFlInput.value = v;
-      acft.testFl = v;
+  // Time edits inside Sequence steps
+  editorEl.querySelectorAll("[data-seq-time]").forEach((inp) => {
+    const idx = Number(inp.getAttribute("data-seq-time"));
+    inp.addEventListener("input", () => {
+      if (!acft.altSteps[idx]) return;
+      acft.altSteps[idx].timeRaw = inp.value;
       acft.flMode = "test";
-      saveState();
-      const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
-      renderConflictPanels(newSolver);
-      renderRadarChartOnlyVisuals(newSolver);
-    });
-  }
-
-  const testerStepTimeInput = document.getElementById("testerStepTimeInput");
-  const testerStepFlInput = document.getElementById("testerStepFlInput");
-  const btnSetStep2Now = document.getElementById("btnSetStep2Now");
-  const btnClearStep2 = document.getElementById("btnClearStep2");
-
-  if (testerStepTimeInput) {
-    testerStepTimeInput.addEventListener("change", () => {
-      acft.stepTimeRaw = testerStepTimeInput.value.trim();
-      if (acft.stepTimeRaw && (acft.stepFl === null || acft.stepFl === undefined)) {
-        acft.stepFl = Number(testerStepFlInput?.value) || acft.fl;
+      const tOrigin = acft.type === "DEP" ? selItem.normDep : selItem.normInit;
+      const tNorm = parseSequenceStepTime(inp.value, tOrigin, solver.refHour);
+      const chip = inp.parentElement.querySelector(".seq-resolved-chip");
+      if (chip) {
+        chip.textContent = formatTime(
+          denormalizeTime(tNorm, solver.useHasHour, solver.refHour),
+          solver.useHasHour
+        );
       }
-      if (acft.stepTimeRaw) acft.flMode = "test";
-      saveState();
-      const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
-      renderConflictPanels(newSolver);
-      renderRadarChartView(newSolver);
+      commitSequenceChanges(false);
     });
-  }
+  });
 
-  if (testerStepFlInput) {
-    testerStepFlInput.addEventListener("change", () => {
-      acft.stepFl = Number(testerStepFlInput.value) || acft.fl;
-      if (acft.stepTimeRaw) acft.flMode = "test";
-      saveState();
-      const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
-      renderConflictPanels(newSolver);
-      renderRadarChartView(newSolver);
-    });
-  }
-
-  if (btnSetStep2Now) {
-    btnSetStep2Now.addEventListener("click", () => {
-      acft.stepTimeRaw = nowDisp;
-      acft.stepFl = Number(testerStepFlInput?.value) || acft.fl;
+  // Altitude edits inside Sequence steps (supports 160, 9000, FL160, 70, etc.)
+  editorEl.querySelectorAll("[data-seq-alt]").forEach((inp) => {
+    const idx = Number(inp.getAttribute("data-seq-alt"));
+    inp.addEventListener("input", () => {
+      if (!acft.altSteps[idx]) return;
+      acft.altSteps[idx].altRaw = inp.value;
       acft.flMode = "test";
-      saveState();
-      const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
-      renderConflictPanels(newSolver);
-      renderRadarChartView(newSolver);
+      const feet = parseFlexibleAltToFeet(inp.value, stNow.altFt);
+      const chip = inp.parentElement.querySelector(".alt-chip");
+      if (chip) chip.textContent = formatAltShort(feet);
+      commitSequenceChanges(false);
+    });
+  });
+
+  // -10 / +10 Steppers per step
+  editorEl.querySelectorAll("[data-seq-step-delta]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const [idxStr, deltaStr] = btn.getAttribute("data-seq-step-delta").split(":");
+      const idx = Number(idxStr);
+      const deltaFl = Number(deltaStr);
+      if (!acft.altSteps[idx]) return;
+      const curFeet = parseFlexibleAltToFeet(acft.altSteps[idx].altRaw, stNow.altFt);
+      const nextFeet = Math.max(1000, Math.min(45000, curFeet + deltaFl * 100));
+      acft.altSteps[idx].altRaw =
+        nextFeet >= 10000 ? String(Math.round(nextFeet / 100)) : String(Math.round(nextFeet));
+      acft.flMode = "test";
+      state.selectedStepIdx = idx;
+      commitSequenceChanges(true);
+    });
+  });
+
+  // Delete a step
+  editorEl.querySelectorAll("[data-seq-del]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = Number(btn.getAttribute("data-seq-del"));
+      acft.altSteps.splice(idx, 1);
+      if (acft.altSteps.length === 0) acft.flMode = "auto";
+      if (state.selectedStepIdx >= acft.altSteps.length) {
+        state.selectedStepIdx = Math.max(0, acft.altSteps.length - 1);
+      }
+      commitSequenceChanges(true);
+    });
+  });
+
+  // Add Step @ Current Time Now
+  const btnAddSeqNow = document.getElementById("btnAddSeqNow");
+  if (btnAddSeqNow) {
+    btnAddSeqNow.addEventListener("click", () => {
+      acft.flMode = "test";
+      if (acft.altSteps.length === 0) ensureAltSteps(acft, wptObj);
+      const curAltFeet = Math.round(stNow.altFt / 1000) * 1000;
+      const suggestAlt =
+        curAltFeet >= 11000
+          ? String(Math.max(30, Math.round(curAltFeet / 100) - 20))
+          : String(Math.max(3000, curAltFeet - 2000));
+      acft.altSteps.push({ timeRaw: nowDisp, altRaw: suggestAlt });
+      state.selectedStepIdx = acft.altSteps.length - 1;
+      commitSequenceChanges(true);
     });
   }
 
-  if (btnClearStep2) {
-    btnClearStep2.addEventListener("click", () => {
-      acft.stepTimeRaw = "";
-      acft.stepFl = null;
-      saveState();
-      const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
-      renderConflictPanels(newSolver);
-      renderRadarChartView(newSolver);
+  // Add Step (+5 min after last step or entry)
+  const btnAddSeqNext = document.getElementById("btnAddSeqNext");
+  if (btnAddSeqNext) {
+    btnAddSeqNext.addEventListener("click", () => {
+      acft.flMode = "test";
+      if (acft.altSteps.length === 0) {
+        ensureAltSteps(acft, wptObj);
+      } else {
+        const last = acft.altSteps[acft.altSteps.length - 1];
+        const tOrigin = acft.type === "DEP" ? selItem.normDep : selItem.normInit;
+        const lastTNorm = parseSequenceStepTime(last.timeRaw, tOrigin, solver.refHour);
+        const nextTNorm = lastTNorm + 5;
+        const nextTDisp = formatTime(
+          denormalizeTime(nextTNorm, solver.useHasHour, solver.refHour),
+          solver.useHasHour
+        );
+        const lastFeet = parseFlexibleAltToFeet(last.altRaw, stNow.altFt);
+        const nextAltRaw =
+          acft.type === "DEP"
+            ? String(Math.min(400, Math.round(lastFeet / 100) + 50))
+            : lastFeet > 11000
+            ? String(Math.max(9000, lastFeet - 3000) >= 11000 ? Math.round((lastFeet - 3000) / 100) : 9000)
+            : String(Math.max(3000, lastFeet - 3000));
+        acft.altSteps.push({ timeRaw: nextTDisp, altRaw: nextAltRaw });
+      }
+      state.selectedStepIdx = acft.altSteps.length - 1;
+      commitSequenceChanges(true);
     });
   }
+
+  // Quick Presets apply directly to the focused step (or create Step 1)
+  editorEl.querySelectorAll("[data-preset-alt]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const val = btn.getAttribute("data-preset-alt");
+      acft.flMode = "test";
+      if (acft.altSteps.length === 0) ensureAltSteps(acft, wptObj);
+      const targetIdx = Math.min(state.selectedStepIdx, acft.altSteps.length - 1);
+      acft.altSteps[targetIdx].altRaw = val;
+      commitSequenceChanges(true);
+    });
+  });
 }
 
 function renderChartConflictFeed(solver, queryNorm, activeNowConflicts) {
@@ -4704,10 +4959,9 @@ function initApp() {
     btnResetAllTestFl.addEventListener("click", () => {
       state.aircraftList.forEach((a) => {
         a.flMode = "auto";
-        a.testFl = a.fl;
-        a.stepTimeRaw = "";
-        a.stepFl = null;
+        a.altSteps = [];
       });
+      state.selectedStepIdx = 0;
       saveState();
       const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
       renderConflictPanels(newSolver);
@@ -4866,9 +5120,7 @@ function initApp() {
         route: [endpoints.entryWptId, "AYT", endpoints.exitWptId],
         fl: initFl,
         flMode: "auto",
-        testFl: initFl,
-        stepTimeRaw: "",
-        stepFl: null,
+        altSteps: [],
         dist: Number(inputDist.value) || 60,
         timeRaw: inputTime.value.trim() || "00",
         queryDme: state.globalQueryDme,
@@ -4883,12 +5135,9 @@ function initApp() {
         wptId: state.selectedWpt,
         fl: initFl,
         flMode: "auto",
-        testFl: initFl,
-        stepTimeRaw: "",
-        stepFl: null,
+        altSteps: [],
         dist: isDep ? 0 : Number(inputDist.value) || 60,
         timeRaw: inputTime.value.trim() || "00",
-        mode: "auto",
         queryDme: state.globalQueryDme,
         holdMins: 0,
       });
@@ -5282,10 +5531,8 @@ function initApp() {
       const addedItems = result.aircraft.map((item) => ({
         ...item,
         id: state.nextId++,
-        flMode: "auto",
-        testFl: item.fl,
-        stepTimeRaw: "",
-        stepFl: null,
+        flMode: item.flMode === "test" ? "test" : "auto",
+        altSteps: Array.isArray(item.altSteps) ? item.altSteps : [],
         queryDme: state.globalQueryDme,
       }));
 
@@ -5364,6 +5611,10 @@ function initApp() {
         scenario: "AYT TMA Custom Scenario",
         rwy: state.activeRwy,
         aircraft: state.aircraftList.map((a) => {
+          const seqFields =
+            a.flMode === "test" && Array.isArray(a.altSteps) && a.altSteps.length > 0
+              ? { flMode: "test", altSteps: a.altSteps }
+              : {};
           if (a.type === "TRN") {
             return {
               type: "TRN",
@@ -5372,6 +5623,7 @@ function initApp() {
               time: a.timeRaw,
               route: [a.entryWptId || a.wptId, "AYT", a.exitWptId || "DERYA"],
               dist: a.dist,
+              ...seqFields,
             };
           }
           if (a.type === "DEP") {
@@ -5381,6 +5633,7 @@ function initApp() {
               fl: a.fl,
               time: a.timeRaw,
               wpt: a.wptId,
+              ...seqFields,
             };
           }
           return {
@@ -5390,6 +5643,7 @@ function initApp() {
             time: a.timeRaw,
             wpt: a.wptId,
             dist: a.dist,
+            ...seqFields,
           };
         }),
       };
