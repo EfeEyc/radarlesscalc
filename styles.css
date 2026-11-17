@@ -2522,6 +2522,304 @@ code {
   cursor: pointer;
 }
 
+/* ILS CLEARANCE MANUAL PICKER & CONFIRM SEPARATION UI */
+.ils-pick-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.22rem;
+  align-items: flex-start;
+}
+
+.ils-pick-btns {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.24rem;
+  flex-wrap: nowrap;
+}
+
+.ils-pick-btn {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.69rem;
+  font-weight: 800;
+  padding: 0.2rem 0.42rem;
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ils-pick-btn.active-hold {
+  background: rgba(251, 191, 36, 0.16);
+  border-color: rgba(251, 191, 36, 0.65);
+  color: #fbbf24;
+}
+
+.ils-pick-btn.active-clear {
+  background: rgba(52, 211, 153, 0.16);
+  border-color: rgba(52, 211, 153, 0.65);
+  color: #34d399;
+}
+
+.inline-ils-time {
+  width: 58px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 0.73rem;
+  padding: 0.18rem 0.28rem;
+}
+
+.ils-pick-sub {
+  font-family: var(--font-mono);
+  font-size: 0.67rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.badge-awaiting {
+  background: rgba(251, 191, 36, 0.16);
+  color: #fbbf24;
+  border: 1px solid rgba(251, 191, 36, 0.45);
+}
+
+.ils-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.32rem;
+  margin-top: 0.45rem;
+}
+
+.fl-ils-box {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 0.52rem 0.58rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.42rem;
+  min-width: 0;
+}
+
+.fl-ils-box.is-holding {
+  border-color: rgba(251, 191, 36, 0.42);
+}
+
+.fl-ils-box.is-cleared {
+  border-color: rgba(52, 211, 153, 0.48);
+}
+
+.fl-ils-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.fl-ils-title {
+  display: flex;
+  flex-direction: column;
+  gap: 0.12rem;
+  font-size: 0.76rem;
+}
+
+.fl-ils-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.36rem;
+}
+
+.fl-ils-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.confirm-sep-btn {
+  background: rgba(52, 211, 153, 0.14);
+  border: 1px solid rgba(52, 211, 153, 0.48);
+  color: #34d399;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-weight: 800;
+  padding: 0.24rem 0.48rem;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.h2h-tip-pill {
+  margin-top: 0.36rem;
+  padding: 0.28rem 0.46rem;
+  border-radius: 5px;
+  background: rgba(52, 211, 153, 0.1);
+  border: 1px dashed rgba(52, 211, 153, 0.42);
+  color: #6ee7b7;
+  font-size: 0.72rem;
+}
+
+.confirmed-sep-drawer {
+  margin-top: 0.5rem;
+  background: rgba(16, 185, 129, 0.08);
+  border: 1px solid rgba(52, 211, 153, 0.35);
+  border-radius: 7px;
+  padding: 0.52rem 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.42rem;
+}
+
+.confirmed-sep-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  font-size: 0.76rem;
+  font-weight: 800;
+  color: #34d399;
+}
+
+.confirmed-sep-items {
+  display: flex;
+  flex-direction: column;
+  gap: 0.34rem;
+}
+
+.confirmed-sep-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.36rem 0.48rem;
+}
+
+.confirmed-sep-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.confirmed-sep-info strong {
+  color: var(--text-main);
+}
+
+.unconfirm-btn {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-highlight);
+  color: var(--text-main);
+  font-family: var(--font-mono);
+  font-size: 0.69rem;
+  font-weight: 800;
+  padding: 0.22rem 0.48rem;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+/* CONFIRMATION MODAL */
+.confirm-sep-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(4, 9, 20, 0.78);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+
+.confirm-sep-backdrop.hidden {
+  display: none;
+}
+
+.confirm-sep-dialog {
+  width: min(460px, 100%);
+  background: var(--bg-card);
+  border: 1.5px solid var(--border-highlight);
+  border-radius: 12px;
+  padding: 1rem;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.55);
+  display: flex;
+  flex-direction: column;
+  gap: 0.72rem;
+}
+
+.confirm-sep-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.confirm-sep-head h3 {
+  margin: 0;
+  font-size: 0.96rem;
+  color: #fff;
+}
+
+.icon-close-btn {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  border-radius: 6px;
+  padding: 0.2rem 0.48rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.confirm-sep-desc {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--text-main);
+  line-height: 1.45;
+}
+
+.confirm-sep-hint {
+  font-size: 0.76rem;
+  color: #6ee7b7;
+  background: rgba(16, 185, 129, 0.12);
+  border: 1px solid rgba(52, 211, 153, 0.35);
+  border-radius: 7px;
+  padding: 0.48rem 0.6rem;
+  line-height: 1.4;
+}
+
+.confirm-sep-methods {
+  display: flex;
+  flex-direction: column;
+  gap: 0.38rem;
+}
+
+.confirm-method-chip {
+  text-align: left;
+  background: var(--bg-input);
+  border: 1.5px solid var(--border);
+  color: var(--text-main);
+  font-size: 0.78rem;
+  font-weight: 700;
+  padding: 0.5rem 0.65rem;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.confirm-method-chip.active {
+  border-color: #34d399;
+  background: rgba(52, 211, 153, 0.14);
+  color: #fff;
+}
+
+.confirm-sep-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
 /* RESPONSIVE */
 @media (max-width: 980px) {
   .wizard-type-grid,
@@ -2621,5 +2919,19 @@ code {
   .seq-action-bar .small-btn {
     flex: 1 1 auto;
     text-align: center;
+  }
+
+  .fl-ils-presets .small-btn {
+    flex: 1 1 auto;
+    text-align: center;
+  }
+
+  .confirm-sep-actions {
+    flex-direction: column-reverse;
+  }
+
+  .confirm-sep-actions button {
+    width: 100%;
+    justify-content: center;
   }
 }

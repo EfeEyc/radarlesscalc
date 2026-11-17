@@ -467,6 +467,13 @@ function parseScenarioJsonText(rawText) {
       };
     }
 
+    const hasExplicitIlsTime =
+      typeof item.ilsClearTime === "string" && item.ilsClearTime.trim() !== "";
+    const ilsCleared = item.ilsCleared === true || hasExplicitIlsTime;
+    const ilsClearTimeRaw = String(
+      item.ilsClearTime ?? item.ilsClearTimeRaw ?? ""
+    ).trim();
+
     return {
       type: "ARR",
       callsign,
@@ -474,6 +481,8 @@ function parseScenarioJsonText(rawText) {
       fl: normalizeImportedFl(item.fl ?? item.flightLevel, 250),
       flMode,
       altSteps,
+      ilsCleared,
+      ilsClearTimeRaw,
       dist: Number(item.dist ?? item.distance ?? 60) || 60,
       timeRaw,
       mode: "auto",
@@ -512,6 +521,8 @@ const state = {
   selectedTestAcftId: null,
   selectedStepIdx: 0,
   conflictScope: "all", // 'all' | 'now'
+  confirmedSeparations: {}, // keyed by canonical "minId-maxId" -> { pairKey, idA, idB, callsignA, callsignB, method }
+  pendingConfirmContext: null,
   cam: {
     yawDeg: 26,
     pitchDeg: 32,
@@ -523,6 +534,12 @@ const state = {
   },
   projectedBlips3d: [], // Hitboxes from last 3D render
 };
+
+function getPairKey(idA, idB) {
+  const a = Number(idA);
+  const b = Number(idB);
+  return a < b ? `${a}-${b}` : `${b}-${a}`;
+}
 
 function normalizeTransitEndpoints(acft) {
   let entryWptId = acft.entryWptId || acft.wptId || "KUMRU";
@@ -554,6 +571,9 @@ function loadSavedState() {
       }
       if (parsed.cam && typeof parsed.cam === "object") {
         state.cam = { ...state.cam, ...parsed.cam };
+      }
+      if (parsed.confirmedSeparations && typeof parsed.confirmedSeparations === "object") {
+        state.confirmedSeparations = parsed.confirmedSeparations;
       }
       if (Array.isArray(parsed.aircraftList)) {
         state.aircraftList = parsed.aircraftList.map((a) => {
@@ -588,6 +608,8 @@ function loadSavedState() {
             fl: baseFl,
             flMode: a.flMode === "test" ? "test" : "auto",
             altSteps,
+            ilsCleared: a.ilsCleared === true,
+            ilsClearTimeRaw: String(a.ilsClearTimeRaw ?? ""),
             queryDme: typeof a.queryDme === "number" ? a.queryDme : state.globalQueryDme,
           };
         });
@@ -607,6 +629,7 @@ function saveState() {
         activeRwy: state.activeRwy,
         globalQueryDme: state.globalQueryDme,
         cam: state.cam,
+        confirmedSeparations: state.confirmedSeparations,
         aircraftList: state.aircraftList,
         nextId: state.nextId,
       })
@@ -1012,7 +1035,7 @@ function analyzeScenarioConflicts(aircraftList, activeRwy) {
   });
 
   // --------------------------------------------------------------------------
-  // 1. Arrival Sequencing & Expected Approach Time (EAT) Calculation
+  // 1. Arrival Sequencing & Manual ILS Clearance Model (Holds Until You Pick!)
   // --------------------------------------------------------------------------
   const sequencedArrivals = [...computedArrivals].sort((a, b) => {
     if (a.normClearBase !== b.normClearBase) return a.normClearBase - b.normClearBase;
@@ -1021,104 +1044,126 @@ function analyzeScenarioConflicts(aircraftList, activeRwy) {
   });
 
   const eatMap = new Map();
-  let prevEstNorm = null;
-  let prevAcft = null;
+  let prevRefEstNorm = null;
+  let prevRefAcft = null;
+  let prevClearedEstNorm = null;
+  let prevClearedAcft = null;
 
   sequencedArrivals.forEach((item, index) => {
     const { acft, calc } = item;
     const manualHold = calc.holdMins || 0;
+    const fmt = (norm) =>
+      formatTime(denormalizeTime(norm, calc.hasHour, refHour), calc.hasHour);
 
-    let willDelay = false;
-    let eatNorm = null;
+    // Advisory minimum EAT based on preceding traffic (for guidance ONLY — never auto-clears!)
+    const suggestedEatNorm = prevRefEstNorm;
+    const earlyBaseNorm = calc.straightIn ? item.normClearBase : item.normFixBase;
+    const defaultSuggestedClearNorm =
+      suggestedEatNorm !== null && suggestedEatNorm > earlyBaseNorm
+        ? suggestedEatNorm
+        : earlyBaseNorm;
+    const suggestedDefaultClearDisp = fmt(defaultSuggestedClearNorm);
+    const earlyBaseClearDisplay = fmt(earlyBaseNorm);
+
+    const ilsCleared = acft.ilsCleared === true;
+    let clearTimeNorm = null;
+    let tTurnStartNorm = null;
     let autoHoldMins = 0;
     let effectiveFixNorm = item.normFixBase;
     let effectiveEstNorm = null;
     let clearancePhaseNote = "";
+    let overlapWithPrev = false;
+    let overlapPrevAcft = null;
 
-    if (prevEstNorm !== null && item.normClearBase < prevEstNorm) {
-      willDelay = true;
-      eatNorm = prevEstNorm;
-
-      if (calc.straightIn) {
-        if (eatNorm <= item.norm10) {
-          autoHoldMins = 0;
-          effectiveEstNorm = item.norm10 + manualHold;
-          const dmeAtEat = +(10 + (item.norm10 - eatNorm) * SPEED_NM_PER_MIN).toFixed(1);
-          clearancePhaseNote = `Gets ILS clearance at EAT (${formatTime(
-            denormalizeTime(eatNorm, calc.hasHour, refHour),
-            calc.hasHour
-          )}) at ${dmeAtEat} NM — No hold needed`;
-        } else {
-          autoHoldMins = +(eatNorm - item.norm10).toFixed(1);
-          effectiveEstNorm = eatNorm + 5 + manualHold;
-          clearancePhaseNote = `Holds ${autoHoldMins}m at 10 DME FIX until EAT (${formatTime(
-            denormalizeTime(eatNorm, calc.hasHour, refHour),
-            calc.hasHour
-          )}), then +5m to Establish`;
-        }
-      } else {
-        if (eatNorm <= item.normFixBase) {
-          autoHoldMins = 0;
-          effectiveFixNorm = item.normFixBase + manualHold;
-          effectiveEstNorm = effectiveFixNorm + 5;
-          if (eatNorm <= item.normVor) {
-            const dmeToVor = +((item.normVor - eatNorm) * SPEED_NM_PER_MIN).toFixed(1);
-            clearancePhaseNote = `EAT is ${formatTime(
-              denormalizeTime(eatNorm, calc.hasHour, refHour),
-              calc.hasHour
-            )} (at ${
-              dmeToVor === 0 ? "AYT VOR" : `${dmeToVor} NM inbound to VOR`
-            }) — No hold occurs!`;
-          } else {
-            const dmeOut = +((eatNorm - item.normVor) * SPEED_NM_PER_MIN).toFixed(1);
-            clearancePhaseNote = `EAT is ${formatTime(
-              denormalizeTime(eatNorm, calc.hasHour, refHour),
-              calc.hasHour
-            )} (at ${dmeOut} NM outbound to 10 DME FIX) — No hold occurs!`;
-          }
-        } else {
-          autoHoldMins = +(eatNorm - item.normFixBase).toFixed(1);
-          effectiveFixNorm = eatNorm + manualHold;
-          effectiveEstNorm = effectiveFixNorm + 5;
-          clearancePhaseNote = `Holds ${autoHoldMins}m at 10 DME FIX until EAT (${formatTime(
-            denormalizeTime(eatNorm, calc.hasHour, refHour),
-            calc.hasHour
-          )}), then +5m to full establish`;
-        }
-      }
+    if (!ilsCleared) {
+      clearancePhaseNote = calc.straightIn
+        ? `Holds at 10 NM (≥4,000') until you pick ILS clearance`
+        : `Holds at 10 DME FIX (≥4,000') until you pick ILS clearance`;
     } else {
-      willDelay = false;
-      eatNorm = null;
-      autoHoldMins = 0;
+      const hasCustomClear =
+        typeof acft.ilsClearTimeRaw === "string" && acft.ilsClearTimeRaw.trim() !== "";
+      const parsedClearNorm = hasCustomClear
+        ? parseSequenceStepTime(acft.ilsClearTimeRaw, item.normInit, refHour)
+        : defaultSuggestedClearNorm;
+      clearTimeNorm = Math.max(item.normInit, parsedClearNorm);
+
       if (calc.straightIn) {
-        effectiveEstNorm = item.norm10 + manualHold;
-        clearancePhaseNote = `Cleared Straight-In ILS at 25 NM`;
+        if (clearTimeNorm > item.norm10 + 0.05) {
+          autoHoldMins = +(clearTimeNorm - item.norm10).toFixed(1);
+          tTurnStartNorm = clearTimeNorm + manualHold;
+          effectiveEstNorm = +(tTurnStartNorm + 5).toFixed(2);
+          clearancePhaseNote = `Held ${autoHoldMins}m at 10 NM until cleared (${fmt(
+            clearTimeNorm
+          )}) → Descends to 3,000' (+5m Est @ ${fmt(effectiveEstNorm)})`;
+        } else {
+          autoHoldMins = 0;
+          tTurnStartNorm = clearTimeNorm;
+          effectiveEstNorm =
+            clearTimeNorm > item.norm10 - 0.5
+              ? +(Math.max(item.norm10, clearTimeNorm + 0.5) + manualHold).toFixed(2)
+              : +(item.norm10 + manualHold).toFixed(2);
+          clearancePhaseNote = `Cleared Straight-In ILS @ ${fmt(
+            clearTimeNorm
+          )} → Descends to 3,000' (Est ${fmt(effectiveEstNorm)})`;
+        }
       } else {
-        effectiveFixNorm = item.normFixBase + manualHold;
-        effectiveEstNorm = effectiveFixNorm + 5;
-        clearancePhaseNote = `Cleared ILS at 10 NM`;
+        if (clearTimeNorm > item.normFixBase + 0.05) {
+          autoHoldMins = +(clearTimeNorm - item.normFixBase).toFixed(1);
+          effectiveFixNorm = +(clearTimeNorm + manualHold).toFixed(2);
+          tTurnStartNorm = effectiveFixNorm;
+          effectiveEstNorm = +(effectiveFixNorm + 5).toFixed(2);
+          clearancePhaseNote = `Held ${autoHoldMins}m at 10 DME FIX until cleared (${fmt(
+            clearTimeNorm
+          )}) → Descends to 3,000' (+5m Est @ ${fmt(effectiveEstNorm)})`;
+        } else {
+          autoHoldMins = 0;
+          effectiveFixNorm = +(item.normFixBase + manualHold).toFixed(2);
+          tTurnStartNorm = effectiveFixNorm;
+          effectiveEstNorm = +(effectiveFixNorm + 5).toFixed(2);
+          clearancePhaseNote = `Cleared ILS @ ${fmt(
+            clearTimeNorm
+          )} → Descends to 3,000' from 10 DME FIX (${fmt(effectiveFixNorm)} → Est ${fmt(
+            effectiveEstNorm
+          )})`;
+        }
       }
+
+      if (prevClearedEstNorm !== null && effectiveEstNorm < prevClearedEstNorm - 0.05) {
+        overlapWithPrev = true;
+        overlapPrevAcft = prevClearedAcft;
+      }
+      prevClearedEstNorm = effectiveEstNorm;
+      prevClearedAcft = item;
     }
 
-    const eatDisplay =
-      eatNorm !== null
-        ? formatTime(denormalizeTime(eatNorm, calc.hasHour, refHour), calc.hasHour)
-        : "—";
-    const effectiveFixDisplay =
-      effectiveFixNorm !== null
-        ? formatTime(denormalizeTime(effectiveFixNorm, calc.hasHour, refHour), calc.hasHour)
-        : "—";
-    const effectiveEstDisplay = formatTime(
-      denormalizeTime(effectiveEstNorm, calc.hasHour, refHour),
-      calc.hasHour
-    );
+    const eatDisplay = suggestedEatNorm !== null ? fmt(suggestedEatNorm) : "—";
+    const clearTimeDisplay = clearTimeNorm !== null ? fmt(clearTimeNorm) : "HOLD";
+    const effectiveFixDisplay = effectiveFixNorm !== null ? fmt(effectiveFixNorm) : "—";
+    const effectiveEstDisplay = effectiveEstNorm !== null ? fmt(effectiveEstNorm) : "HOLD";
+
+    const willDelay = ilsCleared && autoHoldMins > 0;
+    const minBaselineEst =
+      effectiveEstNorm !== null
+        ? effectiveEstNorm
+        : calc.straightIn
+        ? Math.max(item.norm10, prevRefEstNorm ?? item.norm10)
+        : Math.max(item.normFixBase, prevRefEstNorm ?? item.normFixBase) + 5;
 
     eatMap.set(acft.id, {
       seqNum: index + 1,
+      ilsCleared,
+      clearTimeNorm,
+      clearTimeDisplay,
+      tTurnStartNorm,
       willDelay,
-      blockedBy: willDelay ? prevAcft : null,
-      eatNorm,
+      blockedBy: prevRefAcft,
+      overlapWithPrev,
+      overlapPrevAcft,
+      eatNorm: suggestedEatNorm,
       eatDisplay,
+      suggestedEatNorm,
+      earlyBaseClearDisplay,
+      suggestedDefaultClearDisp,
       autoHoldMins,
       effectiveFixNorm,
       effectiveFixDisplay,
@@ -1127,8 +1172,8 @@ function analyzeScenarioConflicts(aircraftList, activeRwy) {
       clearancePhaseNote,
     });
 
-    prevEstNorm = effectiveEstNorm;
-    prevAcft = item;
+    prevRefEstNorm = minBaselineEst;
+    prevRefAcft = item;
   });
 
   // --------------------------------------------------------------------------
@@ -1153,6 +1198,7 @@ function analyzeScenarioConflicts(aircraftList, activeRwy) {
     headOnConflicts: scanResult.headOnConflicts,
     radialConflicts: scanResult.radialConflicts,
     conflicts4d: scanResult.conflicts4d,
+    confirmedResolvedPairs: scanResult.confirmedResolvedPairs,
     heatmapBins: scanResult.heatmapBins,
     conflictAcftIds: scanResult.conflictAcftIds,
   };
@@ -1259,51 +1305,87 @@ function advanceSegmentAltitude(item, tFrom, altFrom, targetAlt, tTo) {
   return stepTowardAlt(altFrom, targetAlt, tTo - tFrom, VERT_RATE_FPM);
 }
 
+function evaluateSeqStepsOnly(item, resolvedSteps, queryNormMins) {
+  const { acft, calc } = item;
+  const tOrigin = acft.type === "DEP" ? item.normDep : item.normInit;
+  let curAlt =
+    acft.type === "DEP"
+      ? 1000
+      : acft.type === "TRN"
+      ? resolvedSteps[0].tNorm <= tOrigin + 1e-6
+        ? resolvedSteps[0].targetFt
+        : calc.maintAltFt
+      : calc.initAltFt;
+
+  if (queryNormMins <= tOrigin) return curAlt;
+
+  let curTarget = curAlt;
+  const futureSteps = [];
+  resolvedSteps.forEach((s) => {
+    if (s.tNorm <= tOrigin + 1e-6) {
+      curTarget = s.targetFt;
+    } else {
+      futureSteps.push(s);
+    }
+  });
+
+  let curT = tOrigin;
+  for (let i = 0; i < futureSteps.length; i++) {
+    const nextStep = futureSteps[i];
+    if (queryNormMins <= nextStep.tNorm) {
+      return advanceSegmentAltitude(item, curT, curAlt, curTarget, queryNormMins);
+    }
+    curAlt = advanceSegmentAltitude(item, curT, curAlt, curTarget, nextStep.tNorm);
+    curT = nextStep.tNorm;
+    curTarget = nextStep.targetFt;
+  }
+
+  return advanceSegmentAltitude(item, curT, curAlt, curTarget, queryNormMins);
+}
+
 function evaluatePlannedAltitude(item, eatInfo, queryNormMins, refHour) {
   const { acft, calc } = item;
   const isSeq = acft.flMode === "test";
   const resolvedSteps = isSeq ? getResolvedAltSteps(item, refHour) : [];
 
-  // Multi-Step Altitude Sequence Mode
+  // Multi-Step Altitude Sequence Mode (plus automatic 3,000' descent once user clears ILS)
   if (isSeq && resolvedSteps.length > 0) {
-    const tOrigin = acft.type === "DEP" ? item.normDep : item.normInit;
-    let curAlt =
-      acft.type === "DEP"
-        ? 1000
-        : acft.type === "TRN"
-        ? resolvedSteps[0].tNorm <= tOrigin + 1e-6
-          ? resolvedSteps[0].targetFt
-          : calc.maintAltFt
-        : calc.initAltFt;
-
-    if (queryNormMins <= tOrigin) return Math.round(curAlt);
-
-    let curTarget = curAlt;
-    const futureSteps = [];
-    resolvedSteps.forEach((s) => {
-      if (s.tNorm <= tOrigin + 1e-6) {
-        curTarget = s.targetFt;
-      } else {
-        futureSteps.push(s);
-      }
-    });
-
-    let curT = tOrigin;
-    for (let i = 0; i < futureSteps.length; i++) {
-      const nextStep = futureSteps[i];
-      if (queryNormMins <= nextStep.tNorm) {
+    if (
+      acft.type === "ARR" &&
+      eatInfo &&
+      eatInfo.ilsCleared &&
+      eatInfo.tTurnStartNorm !== null &&
+      eatInfo.effectiveEstNorm !== null &&
+      queryNormMins > eatInfo.tTurnStartNorm
+    ) {
+      const hasLaterStep = resolvedSteps.some(
+        (s) => s.tNorm > eatInfo.tTurnStartNorm + 0.05
+      );
+      if (!hasLaterStep) {
+        const altAtTurn = evaluateSeqStepsOnly(item, resolvedSteps, eatInfo.tTurnStartNorm);
+        if (queryNormMins <= eatInfo.effectiveEstNorm) {
+          return Math.round(
+            evalPiecewiseAlt(
+              [
+                { t: eatInfo.tTurnStartNorm, alt: altAtTurn },
+                { t: eatInfo.effectiveEstNorm, alt: 3000 },
+              ],
+              queryNormMins
+            )
+          );
+        }
         return Math.round(
-          advanceSegmentAltitude(item, curT, curAlt, curTarget, queryNormMins)
+          evalPiecewiseAlt(
+            [
+              { t: eatInfo.effectiveEstNorm, alt: 3000 },
+              { t: eatInfo.effectiveEstNorm + 2, alt: 0 },
+            ],
+            queryNormMins
+          )
         );
       }
-      curAlt = advanceSegmentAltitude(item, curT, curAlt, curTarget, nextStep.tNorm);
-      curT = nextStep.tNorm;
-      curTarget = nextStep.targetFt;
     }
-
-    return Math.round(
-      advanceSegmentAltitude(item, curT, curAlt, curTarget, queryNormMins)
-    );
+    return Math.round(evaluateSeqStepsOnly(item, resolvedSteps, queryNormMins));
   }
 
   // Default AUTO Procedural Profile
@@ -1346,39 +1428,59 @@ function evaluatePlannedAltitude(item, eatInfo, queryNormMins, refHour) {
     );
   }
 
-  // ARRIVAL Auto Procedural Profile
+  // ARRIVAL Auto Procedural Profile (holds >= 4,000' until controller clears ILS to descend to 3,000')
   const { wpt } = item;
   const t25 = item.norm25 ?? item.normInit;
   const alt25 = Math.min(calc.initAltFt, wpt.meaFt);
 
   if (calc.straightIn) {
-    const inner10Alt = eatInfo && eatInfo.willDelay ? Math.max(4000, wpt.msaFt) : 3000;
-    const estNorm = eatInfo ? eatInfo.effectiveEstNorm : item.norm10;
-    const anchors = [
+    const holdFloorAlt = Math.max(4000, wpt.msaFt);
+    const preHoldAnchors = [
       { t: item.normInit, alt: calc.initAltFt },
       { t: t25, alt: alt25 },
-      { t: item.norm10, alt: inner10Alt },
+      { t: item.norm10, alt: holdFloorAlt },
     ];
-    if (estNorm > item.norm10 + 0.05) {
-      anchors.push({ t: estNorm - 0.1, alt: 4000 });
-      anchors.push({ t: estNorm, alt: 3000 });
+    if (!eatInfo || !eatInfo.ilsCleared) {
+      return Math.round(evalPiecewiseAlt(preHoldAnchors, queryNormMins));
     }
+
+    const tTurnStart = eatInfo.tTurnStartNorm;
+    const estNorm = eatInfo.effectiveEstNorm;
+    if (eatInfo.autoHoldMins > 0.05) {
+      return Math.round(
+        evalPiecewiseAlt(
+          [
+            ...preHoldAnchors,
+            { t: tTurnStart, alt: holdFloorAlt },
+            { t: estNorm, alt: 3000 },
+            { t: estNorm + 2, alt: 0 },
+          ],
+          queryNormMins
+        )
+      );
+    }
+
+    const altAtClear = evalPiecewiseAlt(preHoldAnchors, tTurnStart);
+    const anchors = preHoldAnchors.filter((a) => a.t < tTurnStart - 1e-4);
+    anchors.push({ t: tTurnStart, alt: altAtClear });
+    anchors.push({ t: estNorm, alt: 3000 });
     anchors.push({ t: estNorm + 2, alt: 0 });
     return Math.round(evalPiecewiseAlt(anchors, queryNormMins));
   }
 
   const inner10Alt = Math.max(wpt.msaFt, 4000);
-  const estNorm = eatInfo ? eatInfo.effectiveEstNorm : item.norm10 + 9;
-  const fixNorm = eatInfo ? eatInfo.effectiveFixNorm : item.normFixBase;
   const anchors = [
     { t: item.normInit, alt: calc.initAltFt },
     { t: t25, alt: alt25 },
     { t: item.norm10, alt: inner10Alt },
     { t: item.normVor, alt: 4000 },
-    { t: fixNorm, alt: 4000 },
-    { t: estNorm, alt: 3000 },
-    { t: estNorm + 2, alt: 0 },
+    { t: item.normFixBase, alt: 4000 },
   ];
+  if (eatInfo && eatInfo.ilsCleared) {
+    anchors.push({ t: eatInfo.effectiveFixNorm, alt: 4000 });
+    anchors.push({ t: eatInfo.effectiveEstNorm, alt: 3000 });
+    anchors.push({ t: eatInfo.effectiveEstNorm + 2, alt: 0 });
+  }
   return Math.round(evalPiecewiseAlt(anchors, queryNormMins));
 }
 
@@ -1613,13 +1715,19 @@ function getAircraftStateAtTime(item, solverData, queryNormMins) {
         altStr,
         isTested,
         text: `${+dme.toFixed(1)} NM TO AYT ${wpt.name} (Str-In) @ ${altStr}`,
-        color: "#c084fc",
+        color: isTested ? "#c084fc" : "#38bdf8",
       };
     }
 
-    if (queryNormMins <= eatInfo.effectiveEstNorm) {
+    if (
+      !eatInfo.ilsCleared ||
+      (eatInfo.autoHoldMins > 0.05 && queryNormMins <= eatInfo.tTurnStartNorm)
+    ) {
       const { xNm, yNm } = polarToNm(10, wpt.deg);
       const svgPos = nmToSvg(xNm, yNm);
+      const remHold = eatInfo.ilsCleared
+        ? +(eatInfo.tTurnStartNorm - queryNormMins).toFixed(1)
+        : null;
       return {
         visible: true,
         underSepControl: true,
@@ -1638,7 +1746,43 @@ function getAircraftStateAtTime(item, solverData, queryNormMins) {
         altFt: liveAltFt,
         altStr: `${altStr} HLD`,
         isTested,
-        text: `10 NM (${wpt.name}) — Holding until EAT ${eatInfo.eatDisplay} @ ${altStr}`,
+        text: eatInfo.ilsCleared
+          ? `10 NM (${wpt.name}) — Holding ${remHold}m until ILS clear (${eatInfo.clearTimeDisplay}) @ ${altStr}`
+          : `10 NM (${wpt.name}) — Holding (awaiting ILS clearance) @ ${altStr}`,
+        color: eatInfo.ilsCleared ? "#f87171" : "#fbbf24",
+      };
+    }
+
+    if (queryNormMins <= eatInfo.effectiveEstNorm) {
+      const span = Math.max(0.5, eatInfo.effectiveEstNorm - eatInfo.tTurnStartNorm);
+      const turnProgress = Math.max(0, Math.min(1, (queryNormMins - eatInfo.tTurnStartNorm) / span));
+      const remTurn = +(eatInfo.effectiveEstNorm - queryNormMins).toFixed(1);
+      const arcDme =
+        eatInfo.autoHoldMins > 0.05 ? +(10 + 3 * Math.sin(turnProgress * Math.PI)).toFixed(2) : 10;
+      const arcDeg =
+        eatInfo.autoHoldMins > 0.05 ? wpt.deg + 10 * Math.sin(turnProgress * Math.PI) : wpt.deg;
+      const { xNm, yNm } = polarToNm(arcDme, arcDeg);
+      const svgPos = nmToSvg(xNm, yNm);
+      const tipPos = polarToSvg(Math.max(0, arcDme - 3), wpt.deg);
+      return {
+        visible: true,
+        underSepControl: true,
+        phase: "turn",
+        x: svgPos.x,
+        y: svgPos.y,
+        tipX: tipPos.x,
+        tipY: tipPos.y,
+        xNm,
+        yNm,
+        vx: inbVx,
+        vy: inbVy,
+        radialDeg: arcDeg,
+        trackDeg: inbTrackDeg,
+        dme: +arcDme.toFixed(1),
+        altFt: liveAltFt,
+        altStr: `${altStr} ILS`,
+        isTested,
+        text: `Cleared ILS (${remTurn}m to Est) descending to 3,000' @ ${altStr}`,
         color: "#34d399",
       };
     }
@@ -1753,8 +1897,10 @@ function getAircraftStateAtTime(item, solverData, queryNormMins) {
     };
   }
 
-  if (queryNormMins <= eatInfo.effectiveFixNorm) {
-    const remHold = +(eatInfo.effectiveFixNorm - queryNormMins).toFixed(1);
+  if (!eatInfo.ilsCleared || queryNormMins <= eatInfo.effectiveFixNorm) {
+    const remHold = eatInfo.ilsCleared
+      ? +(eatInfo.effectiveFixNorm - queryNormMins).toFixed(1)
+      : null;
     const { xNm, yNm } = polarToNm(10, procDeg);
     const svgPos = nmToSvg(xNm, yNm);
     return {
@@ -1775,13 +1921,16 @@ function getAircraftStateAtTime(item, solverData, queryNormMins) {
       altFt: liveAltFt,
       altStr: `${altStr} HLD`,
       isTested,
-      text: `HOLDING at 10 DME FIX (${remHold}m to EAT) @ ${altStr}`,
-      color: "#f87171",
+      text: eatInfo.ilsCleared
+        ? `HOLDING at 10 DME FIX (${remHold}m to ILS @ ${eatInfo.effectiveFixDisplay}) @ ${altStr}`
+        : `HOLDING at 10 DME FIX (awaiting ILS clearance) @ ${altStr}`,
+      color: eatInfo.ilsCleared ? "#f87171" : "#fbbf24",
     };
   }
 
   if (queryNormMins <= eatInfo.effectiveEstNorm) {
-    const turnProgress = (queryNormMins - eatInfo.effectiveFixNorm) / 5;
+    const span = Math.max(0.5, eatInfo.effectiveEstNorm - eatInfo.effectiveFixNorm);
+    const turnProgress = (queryNormMins - eatInfo.effectiveFixNorm) / span;
     const remTurn = +(eatInfo.effectiveEstNorm - queryNormMins).toFixed(1);
     const arcDme = 10 + 3 * Math.sin(turnProgress * Math.PI);
     const arcDeg = procDeg + 12 * Math.sin(turnProgress * Math.PI);
@@ -1877,13 +2026,20 @@ function getScenarioTimeBounds(solver) {
     ...allItems.map((it) => (it.acft.type === "DEP" ? it.normDep : it.normInit))
   );
   const tMax = Math.max(
-    ...allItems.map((it) =>
-      it.acft.type === "DEP"
-        ? it.normDep + 15
-        : it.acft.type === "TRN"
-        ? it.norm60From || it.normVor + 14
-        : (solver.eatMap.get(it.acft.id)?.effectiveEstNorm || it.normInit + 20) + 2
-    )
+    ...allItems.map((it) => {
+      const stepsMax =
+        it.acft.flMode === "test"
+          ? Math.max(0, ...getResolvedAltSteps(it, solver.refHour).map((s) => s.tNorm + 3))
+          : 0;
+      if (it.acft.type === "DEP") return Math.max(it.normDep + 15, stepsMax);
+      if (it.acft.type === "TRN") return Math.max(it.norm60From || it.normVor + 14, stepsMax);
+      const eat = solver.eatMap.get(it.acft.id);
+      const arrEnd =
+        eat && eat.ilsCleared && eat.effectiveEstNorm !== null
+          ? eat.effectiveEstNorm + 2
+          : (it.normFixBase || it.norm10 || it.normInit + 10) + 14;
+      return Math.max(arrEnd, stepsMax);
+    })
   );
   return { tMin: Math.floor(tMin), tMax: Math.ceil(tMax) };
 }
@@ -1941,24 +2097,11 @@ function evaluatePairStepViolation(itemA, stA0, stA1, itemB, stB0, stB1) {
 
   // 1. Check HEAD-TO-HEAD (< 45 deg off reciprocal) & < 100 NM while closing
   // (Once they pass over each other, closingRate <= 0 and separation is complete!)
-  let isHeadToHeadTrack = false;
-  let isHeadToHeadViolation = false;
-  let headOnOffDeg = null;
-  if (stA0.trackDeg !== null && stB0.trackDeg !== null) {
-    const recipA = (stA0.trackDeg + 180) % 360;
-    headOnOffDeg = angularDiffDeg(recipA, stB0.trackDeg);
-    if (headOnOffDeg < 45 - 1e-6) {
-      isHeadToHeadTrack = true;
-      const dvx = stB0.vx - stA0.vx;
-      const dvy = stB0.vy - stA0.vy;
-      // Closing rate toward each other in NM/min (positive = approaching, negative = passed/diverging)
-      const closingRate =
-        horizDistNm > 0.05 ? -(dx * dvx + dy * dvy) / horizDistNm : bothDep ? -10 : 10;
-      if (closingRate > 0.1 && horizDistNm < 100 - 1e-4) {
-        isHeadToHeadViolation = true;
-      }
-    }
-  }
+  const h2hGeo = measureH2hClosing(stA0, stB0, bothDep);
+  const isHeadToHeadTrack = h2hGeo.isH2hTrack;
+  const headOnOffDeg = h2hGeo.headOnOffDeg;
+  const isHeadToHeadViolation =
+    isHeadToHeadTrack && h2hGeo.closingRate > 0.1 && horizDistNm < 100 - 1e-4;
 
   // 2. Check VOR SEPARATION (< 15 DME) — Conflict ONLY when BOTH aircraft are inside 15 DME (DEP <-> DEP exempt)
   let isVorViolation = false;
@@ -1993,6 +2136,28 @@ function evaluatePairStepViolation(itemA, stA0, stA1, itemB, stB0, stB1) {
   };
 }
 
+function measureH2hClosing(stA, stB, bothDep = false) {
+  if (!stA || !stB || !stA.underSepControl || !stB.underSepControl) {
+    return { isH2hTrack: false, headOnOffDeg: null, closingRate: 0, horizDistNm: Infinity };
+  }
+  const dx = stB.xNm - stA.xNm;
+  const dy = stB.yNm - stA.yNm;
+  const horizDistNm = Math.hypot(dx, dy);
+  if (stA.trackDeg === null || stB.trackDeg === null) {
+    return { isH2hTrack: false, headOnOffDeg: null, closingRate: 0, horizDistNm };
+  }
+  const recipA = (stA.trackDeg + 180) % 360;
+  const headOnOffDeg = angularDiffDeg(recipA, stB.trackDeg);
+  if (headOnOffDeg >= 45 - 1e-6) {
+    return { isH2hTrack: false, headOnOffDeg, closingRate: 0, horizDistNm };
+  }
+  const dvx = stB.vx - stA.vx;
+  const dvy = stB.vy - stA.vy;
+  const closingRate =
+    horizDistNm > 0.05 ? -(dx * dvx + dy * dvy) / horizDistNm : bothDep ? -10 : 10;
+  return { isH2hTrack: true, headOnOffDeg, closingRate, horizDistNm };
+}
+
 function detect4DConflicts(solver) {
   const { refHour, useHasHour } = solver;
   const allItems = getAllItemsFromSolver(solver);
@@ -2011,6 +2176,7 @@ function detect4DConflicts(solver) {
       headOnConflicts: [],
       radialConflicts: [],
       conflicts4d: [],
+      confirmedResolvedPairs: [],
       heatmapBins: times.map((t) => ({ t, severity: "safe" })),
       conflictAcftIds: new Set(),
     };
@@ -2026,12 +2192,13 @@ function detect4DConflicts(solver) {
   });
 
   const conflicts4d = [];
+  const confirmedResolvedPairs = [];
   const conflictAcftIds = new Set();
 
   // Track heatmap severity at every sample index
   const binSeverity = new Array(times.length - 1).fill("safe");
 
-  function pushEpisode(itemA, itemB, ruleType, samples) {
+  function pushEpisode(itemA, itemB, ruleType, samples, passedH2hTimeNorm) {
     if (samples.length === 0) return;
     conflictAcftIds.add(itemA.acft.id);
     conflictAcftIds.add(itemB.acft.id);
@@ -2058,6 +2225,7 @@ function detect4DConflicts(solver) {
     const iconB = getAcftIcon(itemB.acft.type);
     const corrA = getAcftCorridorShort(itemA);
     const corrB = getAcftCorridorShort(itemB);
+    const pairKey = getPairKey(itemA.acft.id, itemB.acft.id);
 
     let badgeText = "";
     let detailText = "";
@@ -2072,9 +2240,17 @@ function detect4DConflicts(solver) {
       detailText = `Same-radial proximity without 1,000' vertical separation: <strong>${itemA.acft.callsign}</strong> (${best.dmeA} DME, ${formatAltShort(best.altA)}) and <strong>${itemB.acft.callsign}</strong> (${best.dmeB} DME, ${formatAltShort(best.altB)}) only <strong>${best.horizDistNm} NM</strong> apart at <code>${windowStr}</code>.`;
     }
 
+    const passedH2h = passedH2hTimeNorm !== null && passedH2hTimeNorm <= tStart + 0.4;
+    if (passedH2h && ruleType !== "HEAD_TO_HEAD") {
+      const passStr = formatTime(denormalizeTime(passedH2hTimeNorm, useHasHour, refHour), useHasHour);
+      detailText += `<div class="h2h-tip-pill">💡 Passed head-to-head around <code>${passStr}</code> — confirm if H2H separation is complete to remove this conflict.</div>`;
+    }
+
     conflicts4d.push({
       id: `${itemA.acft.id}-${itemB.acft.id}-${ruleType}-${tStart}`,
+      pairKey,
       ruleType,
+      passedH2h,
       itemA,
       itemB,
       pairIds: [itemA.acft.id, itemB.acft.id],
@@ -2099,14 +2275,48 @@ function detect4DConflicts(solver) {
     for (let j = i + 1; j < allItems.length; j++) {
       const itemA = allItems[i];
       const itemB = allItems[j];
+      const pairKey = getPairKey(itemA.acft.id, itemB.acft.id);
+      const confirmedRec =
+        state.confirmedSeparations && state.confirmedSeparations[pairKey]
+          ? state.confirmedSeparations[pairKey]
+          : null;
+
       const sA = seriesMap.get(itemA.acft.id);
       const sB = seriesMap.get(itemB.acft.id);
+
+      let sawClosingH2h = false;
+      let passedH2hTimeNorm = null;
+      const bothDep = itemA.acft.type === "DEP" && itemB.acft.type === "DEP";
+
+      if (confirmedRec) {
+        const iconA = getAcftIcon(itemA.acft.type);
+        const iconB = getAcftIcon(itemB.acft.type);
+        const corrA = getAcftCorridorShort(itemA);
+        const corrB = getAcftCorridorShort(itemB);
+        confirmedResolvedPairs.push({
+          pairKey,
+          itemA,
+          itemB,
+          pairLabel: `${iconA} ${itemA.acft.callsign} (${corrA}) ↔ ${iconB} ${itemB.acft.callsign} (${corrB})`,
+          method: confirmedRec.method || "Alternate separation confirmed",
+        });
+        continue;
+      }
 
       let activeH2h = [];
       let activeVor = [];
       let activeSame = [];
 
       for (let k = 0; k < times.length - 1; k++) {
+        const h2hCheck = measureH2hClosing(sA[k], sB[k], bothDep);
+        if (h2hCheck.isH2hTrack) {
+          if (h2hCheck.closingRate > 0.1) {
+            sawClosingH2h = true;
+          } else if (sawClosingH2h && h2hCheck.closingRate <= 0.1 && passedH2hTimeNorm === null) {
+            passedH2hTimeNorm = times[k];
+          }
+        }
+
         const res = evaluatePairStepViolation(
           itemA,
           sA[k],
@@ -2120,7 +2330,7 @@ function detect4DConflicts(solver) {
           activeH2h.push({ t: times[k], tEnd: times[k + 1], ...res });
           binSeverity[k] = "h2h";
         } else if (activeH2h.length > 0) {
-          pushEpisode(itemA, itemB, "HEAD_TO_HEAD", activeH2h);
+          pushEpisode(itemA, itemB, "HEAD_TO_HEAD", activeH2h, passedH2hTimeNorm);
           activeH2h = [];
         }
 
@@ -2128,7 +2338,7 @@ function detect4DConflicts(solver) {
           activeVor.push({ t: times[k], tEnd: times[k + 1], ...res });
           if (binSeverity[k] !== "h2h") binSeverity[k] = "vor";
         } else if (activeVor.length > 0) {
-          pushEpisode(itemA, itemB, "VOR_15DME", activeVor);
+          pushEpisode(itemA, itemB, "VOR_15DME", activeVor, passedH2hTimeNorm);
           activeVor = [];
         }
 
@@ -2136,14 +2346,14 @@ function detect4DConflicts(solver) {
           activeSame.push({ t: times[k], tEnd: times[k + 1], ...res });
           if (binSeverity[k] === "safe") binSeverity[k] = "vor";
         } else if (activeSame.length > 0) {
-          pushEpisode(itemA, itemB, "SAME_RADIAL", activeSame);
+          pushEpisode(itemA, itemB, "SAME_RADIAL", activeSame, passedH2hTimeNorm);
           activeSame = [];
         }
       }
 
-      if (activeH2h.length > 0) pushEpisode(itemA, itemB, "HEAD_TO_HEAD", activeH2h);
-      if (activeVor.length > 0) pushEpisode(itemA, itemB, "VOR_15DME", activeVor);
-      if (activeSame.length > 0) pushEpisode(itemA, itemB, "SAME_RADIAL", activeSame);
+      if (activeH2h.length > 0) pushEpisode(itemA, itemB, "HEAD_TO_HEAD", activeH2h, passedH2hTimeNorm);
+      if (activeVor.length > 0) pushEpisode(itemA, itemB, "VOR_15DME", activeVor, passedH2hTimeNorm);
+      if (activeSame.length > 0) pushEpisode(itemA, itemB, "SAME_RADIAL", activeSame, passedH2hTimeNorm);
     }
   }
 
@@ -2175,6 +2385,7 @@ function detect4DConflicts(solver) {
     headOnConflicts: conflicts4d.filter((c) => c.ruleType === "HEAD_TO_HEAD"),
     radialConflicts: conflicts4d.filter((c) => c.ruleType !== "HEAD_TO_HEAD"),
     conflicts4d,
+    confirmedResolvedPairs,
     heatmapBins,
     conflictAcftIds,
   };
@@ -2548,14 +2759,22 @@ function refreshCalculatedValuesOnly() {
     setCell("tEat", eatInfo.eatDisplay);
     setCell("tEst", eatInfo.effectiveEstDisplay);
     setCell("dmeTo", `TO AYT: ${formatTime(calc.tQueryTo, calc.hasHour)}`);
-    setCell(
-      "willDelay",
-      eatInfo.willDelay
-        ? `<span class="badge ${eatInfo.autoHoldMins > 0 ? "badge-delayed" : "badge-eat"}">${
-            eatInfo.autoHoldMins > 0 ? `HOLD ${eatInfo.autoHoldMins}m` : "EAT DELAY"
-          }</span>`
-        : `<span class="badge badge-nodelay">ON TIME</span>`
-    );
+
+    const holdBtn = tr.querySelector("[data-ils-hold]");
+    const clrBtn = tr.querySelector("[data-ils-clear]");
+    if (holdBtn) holdBtn.classList.toggle("active-hold", !eatInfo.ilsCleared);
+    if (clrBtn) {
+      clrBtn.classList.toggle("active-clear", eatInfo.ilsCleared);
+      clrBtn.textContent = eatInfo.overlapWithPrev ? "⚠️ Overlap" : "🛬 Clear";
+    }
+    const statusSub = tr.querySelector("[data-col='ilsSub']");
+    if (statusSub) {
+      statusSub.textContent = eatInfo.ilsCleared
+        ? eatInfo.autoHoldMins > 0
+          ? `Held ${eatInfo.autoHoldMins}m → 3k`
+          : `Est ${eatInfo.effectiveEstDisplay}`
+        : `Holds ≥4k (Pick)`;
+    }
   });
 
   solver.computedDepartures.forEach(({ acft, calc }) => {
@@ -2714,14 +2933,29 @@ function renderScenarioBoard() {
             )}</span>
           </div>
         </td>
-        <td data-col="willDelay">
-          ${
-            eatInfo.willDelay
-              ? `<span class="badge ${eatInfo.autoHoldMins > 0 ? "badge-delayed" : "badge-eat"}">${
-                  eatInfo.autoHoldMins > 0 ? `HOLD ${eatInfo.autoHoldMins}m` : "EAT DELAY"
-                }</span>`
-              : `<span class="badge badge-nodelay">ON TIME</span>`
-          }
+        <td>
+          <div class="ils-pick-cell" data-col="ilsPick">
+            <div class="ils-pick-btns">
+              <button type="button" class="ils-pick-btn ${!eatInfo.ilsCleared ? "active-hold" : ""}" data-ils-hold="${acft.id}" title="Hold at fix (stays ≥4,000') until you clear ILS">⏳ Hold</button>
+              <button type="button" class="ils-pick-btn ${eatInfo.ilsCleared ? "active-clear" : ""}" data-ils-clear="${acft.id}" title="Clear for ILS (descends down to 3,000')">${eatInfo.overlapWithPrev ? "⚠️ Overlap" : "🛬 Clear"}</button>
+              <input
+                type="text"
+                class="inline-input inline-ils-time"
+                data-edit-field="ilsClearTimeRaw"
+                data-id="${acft.id}"
+                value="${acft.ilsCleared ? acft.ilsClearTimeRaw || eatInfo.clearTimeDisplay : ""}"
+                placeholder="${eatInfo.suggestedDefaultClearDisp}"
+                title="ILS Clearance Time (e.g. 10:15 or 15)"
+              />
+            </div>
+            <span class="ils-pick-sub" data-col="ilsSub">${
+              eatInfo.ilsCleared
+                ? eatInfo.autoHoldMins > 0
+                  ? `Held ${eatInfo.autoHoldMins}m → 3k`
+                  : `Est ${eatInfo.effectiveEstDisplay}`
+                : "Holds ≥4k (Pick)"
+            }</span>
+          </div>
         </td>
         <td>
           <div class="hold-controls">
@@ -2967,6 +3201,9 @@ function renderScenarioBoard() {
         target.timeRaw = inputEl.value;
       } else if (field === "holdMins") {
         target.holdMins = Number(inputEl.value) || 0;
+      } else if (field === "ilsClearTimeRaw") {
+        target.ilsClearTimeRaw = inputEl.value;
+        target.ilsCleared = inputEl.value.trim() !== "";
       } else if (field === "queryDme") {
         target.queryDme = inputEl.value === "" ? 0 : Number(inputEl.value);
       }
@@ -2983,8 +3220,36 @@ function renderScenarioBoard() {
     btn.addEventListener("click", () => {
       const id = Number(btn.getAttribute("data-del-id"));
       state.aircraftList = state.aircraftList.filter((a) => a.id !== id);
+      if (state.confirmedSeparations) {
+        Object.keys(state.confirmedSeparations).forEach((pk) => {
+          const rec = state.confirmedSeparations[pk];
+          if (rec && (Number(rec.idA) === id || Number(rec.idB) === id)) {
+            delete state.confirmedSeparations[pk];
+          }
+        });
+      }
       saveState();
       renderScenarioBoard();
+    });
+  });
+
+  arrTbody.querySelectorAll("[data-ils-hold]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      applyIlsClearanceChoice(Number(btn.getAttribute("data-ils-hold")), false, null, "calc");
+    });
+  });
+
+  arrTbody.querySelectorAll("[data-ils-clear]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = Number(btn.getAttribute("data-ils-clear"));
+      const curSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+      const eatInfo = curSolver.eatMap.get(id);
+      const target = state.aircraftList.find((a) => a.id === id);
+      const timeToUse =
+        target && target.ilsClearTimeRaw && target.ilsClearTimeRaw.trim()
+          ? target.ilsClearTimeRaw.trim()
+          : eatInfo?.suggestedDefaultClearDisp || target?.timeRaw || "00";
+      applyIlsClearanceChoice(id, true, timeToUse, "calc");
     });
   });
 
@@ -3036,6 +3301,158 @@ function jumpChartToTime(normMins, solverHint = null) {
   requestAnimationFrame(() => renderRadarChartView(solver));
 }
 
+const CONFIRM_SEP_METHODS = [
+  { id: "h2h", label: "⚔️ Passed over each other (H2H complete)" },
+  { id: "vor", label: "🎯 VOR ≥ 15° Radial / ≥ 15 DME separated" },
+  { id: "long", label: "⏱️ Longitudinal Time / DME separated" },
+  { id: "lat", label: "🧭 Lateral / Visual / Alternate ATC sep" },
+];
+
+function applyIlsClearanceChoice(acftId, ilsCleared, clearTimeStr = null, sourceView = "both") {
+  const target = state.aircraftList.find((a) => a.id === acftId);
+  if (!target) return;
+  target.ilsCleared = Boolean(ilsCleared);
+  if (clearTimeStr !== null) {
+    target.ilsClearTimeRaw = String(clearTimeStr);
+  }
+  saveState();
+  if (sourceView === "calc") {
+    renderScenarioBoard();
+  } else {
+    const newSolver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+    renderConflictPanels(newSolver);
+    renderRadarChartView(newSolver);
+  }
+}
+
+function openConfirmSepModal(ctx) {
+  const modal = document.getElementById("confirmSepModal");
+  const descEl = document.getElementById("confirmSepDesc");
+  const hintEl = document.getElementById("confirmSepH2hHint");
+  const methodsEl = document.getElementById("confirmSepMethods");
+  if (!modal || !descEl || !methodsEl) return;
+
+  const defaultMethod =
+    ctx.passedH2h || ctx.ruleType === "HEAD_TO_HEAD"
+      ? CONFIRM_SEP_METHODS[0].label
+      : CONFIRM_SEP_METHODS[1].label;
+
+  state.pendingConfirmContext = {
+    pairKey: ctx.pairKey,
+    idA: ctx.idA,
+    idB: ctx.idB,
+    callsignA: ctx.callsignA,
+    callsignB: ctx.callsignB,
+    selectedMethod: defaultMethod,
+  };
+
+  descEl.innerHTML = `Separation is complete once <strong>one</strong> method is achieved. Confirm another method of separation is complete between <strong>${ctx.callsignA}</strong> and <strong>${ctx.callsignB}</strong> to remove them as a conflict:`;
+
+  if (hintEl) {
+    if (ctx.passedH2h) {
+      hintEl.classList.remove("hidden");
+      hintEl.innerHTML = `💡 Geometry shows <strong>${ctx.callsignA}</strong> and <strong>${ctx.callsignB}</strong> already passed head-to-head. If H2H pass-over is confirmed, VOR &lt;15 DME separation is no longer required.`;
+    } else {
+      hintEl.classList.add("hidden");
+    }
+  }
+
+  methodsEl.innerHTML = CONFIRM_SEP_METHODS.map(
+    (m) => `
+      <button type="button" class="confirm-method-chip ${
+        m.label === defaultMethod ? "active" : ""
+      }" data-sep-method="${m.label}">${m.label}</button>
+    `
+  ).join("");
+
+  methodsEl.querySelectorAll("[data-sep-method]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const val = btn.getAttribute("data-sep-method");
+      if (state.pendingConfirmContext) {
+        state.pendingConfirmContext.selectedMethod = val;
+      }
+      methodsEl.querySelectorAll("[data-sep-method]").forEach((b) => {
+        b.classList.toggle("active", b === btn);
+      });
+    });
+  });
+
+  modal.classList.remove("hidden");
+}
+
+function closeConfirmSepModal() {
+  const modal = document.getElementById("confirmSepModal");
+  if (modal) modal.classList.add("hidden");
+  state.pendingConfirmContext = null;
+}
+
+function renderConfirmedSeparationsDrawer(solver) {
+  const resolved = solver.confirmedResolvedPairs || [];
+  if (resolved.length === 0) return "";
+  return `
+    <div class="confirmed-sep-drawer">
+      <div class="confirmed-sep-header">
+        <span>✓ Confirmed Separated (${resolved.length})</span>
+        <button type="button" class="small-btn" data-unconfirm-all="1">↺ Restore All</button>
+      </div>
+      <div class="confirmed-sep-items">
+        ${resolved
+          .map(
+            (r) => `
+            <div class="confirmed-sep-item">
+              <div class="confirmed-sep-info">
+                <strong>${r.pairLabel}</strong>
+                <span>${r.method}</span>
+              </div>
+              <button type="button" class="unconfirm-btn" data-unconfirm-pair="${r.pairKey}">↺ Restore</button>
+            </div>
+          `
+          )
+          .join("")}
+      </div>
+    </div>
+  `;
+}
+
+function wireConflictCardButtons(containerEl, solver) {
+  if (!containerEl) return;
+  containerEl.querySelectorAll("[data-confirm-pair]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const pairKey = btn.getAttribute("data-confirm-pair");
+      const conflict = (solver.conflicts4d || []).find((c) => c.pairKey === pairKey);
+      if (!conflict) return;
+      openConfirmSepModal({
+        pairKey,
+        idA: conflict.itemA.acft.id,
+        idB: conflict.itemB.acft.id,
+        callsignA: conflict.itemA.acft.callsign,
+        callsignB: conflict.itemB.acft.callsign,
+        passedH2h: conflict.passedH2h,
+        ruleType: conflict.ruleType,
+      });
+    });
+  });
+
+  containerEl.querySelectorAll("[data-unconfirm-pair]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const pairKey = btn.getAttribute("data-unconfirm-pair");
+      if (state.confirmedSeparations && state.confirmedSeparations[pairKey]) {
+        delete state.confirmedSeparations[pairKey];
+        saveState();
+        renderScenarioBoard();
+      }
+    });
+  });
+
+  containerEl.querySelectorAll("[data-unconfirm-all]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.confirmedSeparations = {};
+      saveState();
+      renderScenarioBoard();
+    });
+  });
+}
+
 // Render the 3 Conflict Finder Panels on Calculator Tab (Powered by Live 4D Engine)
 function renderConflictPanels(solver) {
   const depArrListEl = document.getElementById("depArrConflictList");
@@ -3052,7 +3469,7 @@ function renderConflictPanels(solver) {
             <span class="badge badge-nodelay">NO H2H &lt;100 NM BREACH</span>
           </div>
           <div class="conflict-detail">
-            No aircraft pairs with &lt;45° head-to-head track alignment cross altitudes within 100 NM.
+            No active conflicts where aircraft with &lt;45° head-to-head track alignment cross altitudes within 100 NM.
           </div>
         </div>
       `;
@@ -3070,6 +3487,7 @@ function renderConflictPanels(solver) {
             <div class="metric-pill where-pill">📍 DIST: <strong>${c.minHorizNm} NM</strong> (&lt;100)</div>
             <div class="metric-pill when-pill">⏰ WHEN: <strong>${c.windowStr}</strong></div>
             <button type="button" class="conflict-jump-btn" data-jump-t="${c.tPeak}">📡 View in 3D</button>
+            <button type="button" class="confirm-sep-btn" data-confirm-pair="${c.pairKey}">✓ Confirm Sep</button>
           </div>
           <div class="conflict-detail" style="color:var(--text-main);">
             ${c.detailText}
@@ -3078,6 +3496,7 @@ function renderConflictPanels(solver) {
         depArrListEl.appendChild(box);
       });
     }
+    wireConflictCardButtons(depArrListEl, solver);
   }
 
   // 2. VOR <15 DME (DEP<->DEP Exempt) & Same-Radial Conflicts
@@ -3093,7 +3512,7 @@ function renderConflictPanels(solver) {
             <span class="badge badge-nodelay">CLEAR (AT LEAST ONE ≥15 DME)</span>
           </div>
           <div class="conflict-detail">
-            No conflicts where both aircraft are inside 15 DME crossing altitudes (DEP↔DEP exempt) or same-radial breaches.
+            No active conflicts where both aircraft are inside 15 DME crossing altitudes (DEP↔DEP exempt) or same-radial breaches.
           </div>
         </div>
       `;
@@ -3109,6 +3528,7 @@ function renderConflictPanels(solver) {
           <div class="conflict-metrics">
             <div class="metric-pill when-pill">⏰ WINDOW: <strong>${rc.windowStr}</strong></div>
             <button type="button" class="conflict-jump-btn" data-jump-t="${rc.tPeak}">📡 View in 3D</button>
+            <button type="button" class="confirm-sep-btn" data-confirm-pair="${rc.pairKey}">✓ Confirm Sep</button>
           </div>
           <div class="conflict-detail" style="color:var(--text-main);">
             ${rc.detailText}
@@ -3117,6 +3537,9 @@ function renderConflictPanels(solver) {
         radialConflictListEl.appendChild(box);
       });
     }
+    const drawerHtml = renderConfirmedSeparationsDrawer(solver);
+    if (drawerHtml) radialConflictListEl.insertAdjacentHTML("beforeend", drawerHtml);
+    wireConflictCardButtons(radialConflictListEl, solver);
   }
 
   // Wire Jump to 3D buttons inside Conflict Finder
@@ -3127,56 +3550,82 @@ function renderConflictPanels(solver) {
     });
   });
 
-  // 3. Approach Sequence & EAT Delays
+  // 3. Approach Sequence & Manual ILS Clearance Control
   if (ilsDelayListEl) {
     ilsDelayListEl.innerHTML = "";
-    const delayedArrs = solver.sequencedArrivals.filter(
-      (item) => solver.eatMap.get(item.acft.id)?.willDelay
-    );
     if (solver.sequencedArrivals.length === 0) {
       ilsDelayListEl.innerHTML = `
         <div class="conflict-box">
-          <div class="conflict-detail">Add arriving aircraft to see approach sequencing and EAT calculations.</div>
-        </div>
-      `;
-    } else if (delayedArrs.length === 0) {
-      ilsDelayListEl.innerHTML = `
-        <div class="conflict-box alert-safe">
-          <div class="conflict-top">
-            <span class="conflict-pair">✅ All Arrivals On Time</span>
-            <span class="badge badge-nodelay">NO EAT DELAY</span>
-          </div>
-          <div class="conflict-detail">
-            Every arriving aircraft reaches its ILS clearance point after the preceding aircraft is already Established.
-          </div>
+          <div class="conflict-detail">Add arriving aircraft to pick their ILS clearances and view approach sequencing.</div>
         </div>
       `;
     } else {
-      delayedArrs.forEach((item) => {
+      solver.sequencedArrivals.forEach((item) => {
         const eatInfo = solver.eatMap.get(item.acft.id);
         const box = document.createElement("div");
-        box.className = "conflict-box alert-danger";
+        box.className = `conflict-box ${
+          !eatInfo.ilsCleared
+            ? "alert-warn"
+            : eatInfo.overlapWithPrev
+            ? "alert-danger"
+            : "alert-safe"
+        }`;
+
+        const badgeHtml = !eatInfo.ilsCleared
+          ? `<span class="badge badge-awaiting">⏳ HOLDING (NOT CLEARED)</span>`
+          : eatInfo.overlapWithPrev
+          ? `<span class="badge badge-delayed">⚠️ OVERLAPS #${eatInfo.overlapPrevAcft ? "" : ""} EST</span>`
+          : eatInfo.autoHoldMins > 0
+          ? `<span class="badge badge-eat">🛬 CLEARED (${eatInfo.autoHoldMins}m HLD)</span>`
+          : `<span class="badge badge-nodelay">🛬 CLEARED ILS</span>`;
+
+        const refLine =
+          eatInfo.eatNorm !== null
+            ? `Ref min EAT after #${eatInfo.seqNum - 1} (${eatInfo.blockedBy.acft.callsign}): <code>${eatInfo.eatDisplay}</code> • `
+            : "";
 
         box.innerHTML = `
           <div class="conflict-top">
-            <span class="conflict-pair">⏳ ${item.acft.callsign} (${item.wpt.name}) — EAT: ${eatInfo.eatDisplay}</span>
-            <span class="badge badge-delayed">${
-              eatInfo.autoHoldMins > 0 ? `HOLDS ${eatInfo.autoHoldMins}m` : "NO HOLD NEEDED"
-            }</span>
+            <span class="conflict-pair">#${eatInfo.seqNum} 🛬 ${item.acft.callsign} (${item.wpt.name}${
+          item.calc.straightIn ? " Str-In" : ""
+        })</span>
+            ${badgeHtml}
           </div>
           <div class="conflict-detail" style="color:var(--text-main);">
-            Reaches ILS clearance point at <code>${formatTime(
-              item.calc.tClearBase,
-              item.calc.hasHour
-            )}</code>, while <strong>#${eatInfo.seqNum - 1} ${
-          eatInfo.blockedBy.acft.callsign
-        }</strong> is not established until <code>${eatInfo.eatDisplay}</code>.<br/>
-            → <strong>EAT = ${eatInfo.eatDisplay}</strong> (${
-          eatInfo.clearancePhaseNote
-        }) → Established at <code>${eatInfo.effectiveEstDisplay}</code>.
+            ${refLine}Base Fix @ <code>${eatInfo.earlyBaseClearDisplay}</code><br/>
+            → ${eatInfo.clearancePhaseNote}
+            ${
+              eatInfo.overlapWithPrev && eatInfo.overlapPrevAcft
+                ? `<br/><span style="color:#f87171;">⚠️ Establishes at <code>${eatInfo.effectiveEstDisplay}</code> before <strong>${eatInfo.overlapPrevAcft.acft.callsign}</strong> clears ILS!</span>`
+                : ""
+            }
+          </div>
+          <div class="ils-panel-actions">
+            <button type="button" class="ils-pick-btn ${!eatInfo.ilsCleared ? "active-hold" : ""}" data-panel-ils-hold="${item.acft.id}">⏳ Hold</button>
+            <button type="button" class="ils-pick-btn" data-panel-ils-set="${item.acft.id}:${eatInfo.earlyBaseClearDisplay}">🛬 Clear @ Fix (${eatInfo.earlyBaseClearDisplay})</button>
+            ${
+              eatInfo.eatNorm !== null
+                ? `<button type="button" class="ils-pick-btn" data-panel-ils-set="${item.acft.id}:${eatInfo.eatDisplay}">⏱️ Clear @ EAT (${eatInfo.eatDisplay})</button>`
+                : ""
+            }
           </div>
         `;
         ilsDelayListEl.appendChild(box);
+      });
+
+      ilsDelayListEl.querySelectorAll("[data-panel-ils-hold]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          applyIlsClearanceChoice(Number(btn.getAttribute("data-panel-ils-hold")), false, null, "calc");
+        });
+      });
+
+      ilsDelayListEl.querySelectorAll("[data-panel-ils-set]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const idx = btn.getAttribute("data-panel-ils-set").indexOf(":");
+          const id = Number(btn.getAttribute("data-panel-ils-set").slice(0, idx));
+          const timeStr = btn.getAttribute("data-panel-ils-set").slice(idx + 1);
+          applyIlsClearanceChoice(id, true, timeStr, "calc");
+        });
       });
     }
   }
@@ -3698,12 +4147,15 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
     // Build full trajectory ribbon samples for selected, tested, conflicting, or visible aircraft
     const trajSamples = [];
     const startT = item.acft.type === "DEP" ? item.normDep : item.normInit;
+    const arrEat = item.acft.type === "ARR" || !item.acft.type ? solver.eatMap.get(item.acft.id) : null;
     const endT =
       item.acft.type === "DEP"
         ? item.normDep + 14
         : item.acft.type === "TRN"
         ? item.normVor + 14
-        : (solver.eatMap.get(item.acft.id)?.effectiveEstNorm || startT + 20) + 1;
+        : arrEat && arrEat.ilsCleared && arrEat.effectiveEstNorm !== null
+        ? arrEat.effectiveEstNorm + 1
+        : (item.normFixBase || item.norm10 || startT + 12) + 12;
 
     const span = Math.max(2, endT - startT);
     const steps = 28;
@@ -3856,7 +4308,11 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
       // Midpoint distance pill
       const mx = (d.pA.x + d.pB.x) / 2;
       const my = (d.pA.y + d.pB.y) / 2;
-      const lbl = isH2h ? `⚔️ ${d.distNm} NM H2H` : `🎯 VOR <15 DME`;
+      const lbl = isH2h
+        ? `⚔️ ${d.distNm} NM H2H`
+        : d.conflict.ruleType === "VOR_15DME"
+        ? `🎯 VOR <15 DME`
+        : `📏 SAME RADIAL`;
       ctx.font = "800 10px JetBrains Mono, monospace";
       const tw = ctx.measureText(lbl).width + 12;
       ctx.fillStyle = isH2h ? "rgba(127, 29, 29, 0.92)" : "rgba(120, 53, 15, 0.92)";
@@ -4214,6 +4670,56 @@ function renderFlTesterPanel(solver, queryNorm) {
     solver.useHasHour
   );
 
+  let ilsControlHtml = "";
+  if (acft.type === "ARR" || !acft.type) {
+    const eatInfo = solver.eatMap.get(acft.id);
+    const isClr = Boolean(eatInfo && eatInfo.ilsCleared);
+    const ilsVal = isClr ? acft.ilsClearTimeRaw || eatInfo.clearTimeDisplay : "";
+    const statusText = isClr
+      ? eatInfo.overlapWithPrev
+        ? `⚠️ Overlaps preceding aircraft! Est ${eatInfo.effectiveEstDisplay} (Descends → 3,000')`
+        : `Establishes ${eatInfo.effectiveEstDisplay} (Descends → 3,000')`
+      : `Holds ≥4,000' until you clear ILS`;
+    ilsControlHtml = `
+      <div class="fl-ils-box ${isClr ? "is-cleared" : "is-holding"}">
+        <div class="fl-ils-top">
+          <div class="fl-ils-title">
+            <strong>🛬 ILS Clearance</strong>
+            <span class="step-delta" id="flIlsStatusSub">${statusText}</span>
+          </div>
+          <div class="fl-mode-switch">
+            <button type="button" class="fl-mode-btn ${!isClr ? "active" : ""}" data-ils-mode="hold">⏳ Hold (≥4k)</button>
+            <button type="button" class="fl-mode-btn ${isClr ? "active" : ""}" data-ils-mode="clear">🛬 Cleared (→3k)</button>
+          </div>
+        </div>
+        <div class="fl-ils-controls">
+          <label class="seq-field-group">
+            <span class="seq-mini-lbl">Clear @</span>
+            <input type="text" class="inline-input seq-time-input" id="flIlsTimeInput" data-ils-time="1" value="${ilsVal}" placeholder="${
+      eatInfo ? eatInfo.suggestedDefaultClearDisp : nowDisp
+    }" />
+            <span class="seq-resolved-chip" id="flIlsEstBadge">${
+              isClr ? `Est ${eatInfo.effectiveEstDisplay}` : "HOLDING"
+            }</span>
+          </label>
+          <div class="fl-ils-presets">
+            <button type="button" class="small-btn" data-ils-quick="${nowDisp}">Clear @ Now (${nowDisp})</button>
+            ${
+              eatInfo
+                ? `<button type="button" class="small-btn" data-ils-quick="${eatInfo.earlyBaseClearDisplay}">@ Fix (${eatInfo.earlyBaseClearDisplay})</button>`
+                : ""
+            }
+            ${
+              eatInfo && eatInfo.eatNorm !== null
+                ? `<button type="button" class="small-btn" data-ils-quick="${eatInfo.eatDisplay}">@ EAT (${eatInfo.eatDisplay})</button>`
+                : ""
+            }
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   const presetValues =
     acft.type === "DEP"
       ? [
@@ -4293,6 +4799,8 @@ function renderFlTesterPanel(solver, queryNorm) {
       </div>
     </div>
 
+    ${ilsControlHtml}
+
     ${stepsHtml}
 
     <div class="seq-action-bar">
@@ -4330,6 +4838,40 @@ function renderFlTesterPanel(solver, queryNorm) {
     btn.addEventListener("click", () => {
       acft.flMode = btn.getAttribute("data-flmode");
       if (acft.flMode === "test") ensureAltSteps(acft, wptObj);
+      commitSequenceChanges(true);
+    });
+  });
+
+  // Switch Holding vs Cleared for ILS (ARR only)
+  editorEl.querySelectorAll("[data-ils-mode]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const mode = btn.getAttribute("data-ils-mode");
+      if (mode === "hold") {
+        acft.ilsCleared = false;
+      } else {
+        acft.ilsCleared = true;
+        if (!acft.ilsClearTimeRaw || !acft.ilsClearTimeRaw.trim()) {
+          const curEat = solver.eatMap.get(acft.id);
+          acft.ilsClearTimeRaw = curEat ? curEat.suggestedDefaultClearDisp : nowDisp;
+        }
+      }
+      commitSequenceChanges(true);
+    });
+  });
+
+  const ilsTimeInp = editorEl.querySelector("[data-ils-time]");
+  if (ilsTimeInp) {
+    ilsTimeInp.addEventListener("input", () => {
+      acft.ilsClearTimeRaw = ilsTimeInp.value;
+      acft.ilsCleared = ilsTimeInp.value.trim() !== "";
+      commitSequenceChanges(false);
+    });
+  }
+
+  editorEl.querySelectorAll("[data-ils-quick]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      acft.ilsClearTimeRaw = btn.getAttribute("data-ils-quick");
+      acft.ilsCleared = true;
       commitSequenceChanges(true);
     });
   });
@@ -4506,28 +5048,31 @@ function renderChartConflictFeed(solver, queryNorm, activeNowConflicts) {
         </div>
       </div>
     `;
-    return;
+  } else {
+    feedEl.innerHTML = shown
+      .map(
+        (c) => `
+        <div class="conflict-box ${c.ruleType === "HEAD_TO_HEAD" ? "alert-danger" : "alert-warn"}">
+          <div class="conflict-top">
+            <span class="conflict-pair">${c.pairLabel}</span>
+            <span class="badge ${c.ruleType === "HEAD_TO_HEAD" ? "badge-delayed" : "badge-eat"}">${
+          c.badgeText
+        }</span>
+          </div>
+          <div class="conflict-metrics">
+            <div class="metric-pill when-pill">⏰ <strong>${c.windowStr}</strong></div>
+            <button type="button" class="conflict-jump-btn" data-feed-jump-t="${c.tPeak}">📍 Go @ ${c.peakStr}</button>
+            <button type="button" class="confirm-sep-btn" data-confirm-pair="${c.pairKey}">✓ Confirm Sep</button>
+          </div>
+          <div class="conflict-detail" style="color:var(--text-main);">${c.detailText}</div>
+        </div>
+      `
+      )
+      .join("");
   }
 
-  feedEl.innerHTML = shown
-    .map(
-      (c) => `
-      <div class="conflict-box ${c.ruleType === "HEAD_TO_HEAD" ? "alert-danger" : "alert-warn"}">
-        <div class="conflict-top">
-          <span class="conflict-pair">${c.pairLabel}</span>
-          <span class="badge ${c.ruleType === "HEAD_TO_HEAD" ? "badge-delayed" : "badge-eat"}">${
-        c.badgeText
-      }</span>
-        </div>
-        <div class="conflict-metrics">
-          <div class="metric-pill when-pill">⏰ <strong>${c.windowStr}</strong></div>
-          <button type="button" class="conflict-jump-btn" data-feed-jump-t="${c.tPeak}">📍 Go @ ${c.peakStr}</button>
-        </div>
-        <div class="conflict-detail" style="color:var(--text-main);">${c.detailText}</div>
-      </div>
-    `
-    )
-    .join("");
+  const drawerHtml = renderConfirmedSeparationsDrawer(solver);
+  if (drawerHtml) feedEl.insertAdjacentHTML("beforeend", drawerHtml);
 
   feedEl.querySelectorAll("[data-feed-jump-t]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -4535,6 +5080,8 @@ function renderChartConflictFeed(solver, queryNorm, activeNowConflicts) {
       if (!Number.isNaN(tVal)) jumpChartToTime(tVal, solver);
     });
   });
+
+  wireConflictCardButtons(feedEl, solver);
 }
 
 // Fast visual refresh used while dragging the FL slider smoothly without destroying focus
@@ -4581,6 +5128,28 @@ function renderRadarChartOnlyVisuals(solver) {
       document.querySelectorAll("[data-flmode]").forEach((btn) => {
         btn.classList.toggle("active", btn.getAttribute("data-flmode") === it.acft.flMode);
       });
+      if (it.acft.type === "ARR" || !it.acft.type) {
+        const eatInfo = solver.eatMap.get(it.acft.id);
+        const isClr = Boolean(eatInfo && eatInfo.ilsCleared);
+        document.querySelectorAll("[data-ils-mode]").forEach((btn) => {
+          btn.classList.toggle(
+            "active",
+            btn.getAttribute("data-ils-mode") === (isClr ? "clear" : "hold")
+          );
+        });
+        const estBadge = document.getElementById("flIlsEstBadge");
+        if (estBadge) {
+          estBadge.textContent = isClr ? `Est ${eatInfo.effectiveEstDisplay}` : "HOLDING";
+        }
+        const statusSub = document.getElementById("flIlsStatusSub");
+        if (statusSub) {
+          statusSub.textContent = isClr
+            ? eatInfo.overlapWithPrev
+              ? `⚠️ Overlaps preceding aircraft! Est ${eatInfo.effectiveEstDisplay} (Descends → 3,000')`
+              : `Establishes ${eatInfo.effectiveEstDisplay} (Descends → 3,000')`
+            : `Holds ≥4,000' until you clear ILS`;
+        }
+      }
     }
   });
 }
@@ -5136,6 +5705,8 @@ function initApp() {
         fl: initFl,
         flMode: "auto",
         altSteps: [],
+        ilsCleared: false,
+        ilsClearTimeRaw: "",
         dist: isDep ? 0 : Number(inputDist.value) || 60,
         timeRaw: inputTime.value.trim() || "00",
         queryDme: state.globalQueryDme,
@@ -5488,10 +6059,49 @@ function initApp() {
 
   document.getElementById("btnClearAll").addEventListener("click", () => {
     state.aircraftList = [];
+    state.confirmedSeparations = {};
     state.nextId = 1;
     saveState();
     renderScenarioBoard();
   });
+
+  // Separation Confirmation Modal Controls
+  const confirmSepModal = document.getElementById("confirmSepModal");
+  const btnCloseConfirmSep = document.getElementById("btnCloseConfirmSep");
+  const btnCancelConfirmSep = document.getElementById("btnCancelConfirmSep");
+  const btnDoConfirmSep = document.getElementById("btnDoConfirmSep");
+
+  if (btnCloseConfirmSep) btnCloseConfirmSep.addEventListener("click", closeConfirmSepModal);
+  if (btnCancelConfirmSep) btnCancelConfirmSep.addEventListener("click", closeConfirmSepModal);
+  if (confirmSepModal) {
+    confirmSepModal.addEventListener("click", (e) => {
+      if (e.target === confirmSepModal) closeConfirmSepModal();
+    });
+  }
+  if (btnDoConfirmSep) {
+    btnDoConfirmSep.addEventListener("click", () => {
+      const ctx = state.pendingConfirmContext;
+      if (ctx) {
+        if (!state.confirmedSeparations || typeof state.confirmedSeparations !== "object") {
+          state.confirmedSeparations = {};
+        }
+        state.confirmedSeparations[ctx.pairKey] = {
+          pairKey: ctx.pairKey,
+          idA: ctx.idA,
+          idB: ctx.idB,
+          callsignA: ctx.callsignA,
+          callsignB: ctx.callsignB,
+          method: ctx.selectedMethod || CONFIRM_SEP_METHODS[0].label,
+          createdAt: Date.now(),
+        };
+        saveState();
+        closeConfirmSepModal();
+        renderScenarioBoard();
+      } else {
+        closeConfirmSepModal();
+      }
+    });
+  }
 
   // ==========================================================================
   // SCENARIO JSON IMPORTER & GEMINI SKILL HELPER CONTROLS
@@ -5525,6 +6135,7 @@ function initApp() {
 
       if (mode === "replace") {
         state.aircraftList = [];
+        state.confirmedSeparations = {};
         state.nextId = 1;
       }
 
@@ -5533,6 +6144,8 @@ function initApp() {
         id: state.nextId++,
         flMode: item.flMode === "test" ? "test" : "auto",
         altSteps: Array.isArray(item.altSteps) ? item.altSteps : [],
+        ilsCleared: item.ilsCleared === true,
+        ilsClearTimeRaw: String(item.ilsClearTimeRaw ?? ""),
         queryDme: state.globalQueryDme,
       }));
 
@@ -5636,6 +6249,13 @@ function initApp() {
               ...seqFields,
             };
           }
+          const ilsFields =
+            a.type === "ARR" && a.ilsCleared
+              ? {
+                  ilsCleared: true,
+                  ilsClearTime: a.ilsClearTimeRaw || "",
+                }
+              : {};
           return {
             type: "ARR",
             callsign: a.callsign,
@@ -5644,6 +6264,7 @@ function initApp() {
             wpt: a.wptId,
             dist: a.dist,
             ...seqFields,
+            ...ilsFields,
           };
         }),
       };

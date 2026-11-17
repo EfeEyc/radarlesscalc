@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>AYT TMA Radarless Calculator &amp; Conflict Finder</title>
-  <link rel="stylesheet" href="styles.css?v=20261117e" />
+  <link rel="stylesheet" href="styles.css?v=20261117f" />
 </head>
 <body>
   <main class="container">
@@ -349,11 +349,11 @@
                 <th>10 NM</th>
                 <th>AYT VOR</th>
                 <th>10 DME FIX</th>
-                <th>EAT</th>
+                <th>Min EAT (Ref)</th>
                 <th>Established</th>
                 <th>🎯 Cross @ DME (TO AYT)</th>
-                <th>Status</th>
-                <th>Delay</th>
+                <th>ILS Clearance (Pick)</th>
+                <th>+Hold</th>
                 <th></th>
               </tr>
             </thead>
@@ -453,11 +453,11 @@
             </div>
           </div>
 
-          <!-- PART 3: APPROACH SEQUENCE & EAT DELAYS -->
+          <!-- PART 3: APPROACH SEQUENCE & ILS CLEARANCE -->
           <div class="conflict-panel">
             <div class="panel-header">
-              <h3>⏳ Approach Sequence &amp; EAT Delays</h3>
-              <span class="badge-subtle">ILS Window &amp; Hold Times</span>
+              <h3>⏳ Approach Sequence &amp; ILS Clearance</h3>
+              <span class="badge-subtle">Hold Until You Clear ILS</span>
             </div>
             <div id="ilsDelayList" class="conflict-list">
               <!-- Populated by JS -->
@@ -659,6 +659,23 @@
     </div>
   </main>
 
-  <script src="app.js?v=20261117e"></script>
+  <!-- SEPARATION METHOD CONFIRMATION MODAL -->
+  <div id="confirmSepModal" class="confirm-sep-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="confirmSepTitle">
+    <div class="confirm-sep-dialog">
+      <div class="confirm-sep-head">
+        <h3 id="confirmSepTitle">✓ Confirm Alternate Separation Method</h3>
+        <button type="button" id="btnCloseConfirmSep" class="icon-close-btn" title="Close">✕</button>
+      </div>
+      <p id="confirmSepDesc" class="confirm-sep-desc"></p>
+      <div id="confirmSepH2hHint" class="confirm-sep-hint hidden"></div>
+      <div id="confirmSepMethods" class="confirm-sep-methods"></div>
+      <div class="confirm-sep-actions">
+        <button type="button" id="btnCancelConfirmSep" class="small-btn">Cancel</button>
+        <button type="button" id="btnDoConfirmSep" class="primary-btn">✓ Yes, Separated — Remove Conflict</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js?v=20261117f"></script>
 </body>
 </html>
