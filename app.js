@@ -498,12 +498,13 @@ const state = {
   selectedTestAcftId: null,
   conflictScope: "all", // 'all' | 'now'
   cam: {
-    yawDeg: 28,
-    pitchDeg: 34,
+    yawDeg: 26,
+    pitchDeg: 32,
     zoom: 1.0,
     panX: 0,
     panY: 0,
-    altScale: 1.0,
+    altScale: 1.5,
+    showAllPaths: false,
   },
   projectedBlips3d: [], // Hitboxes from last 3D render
 };
@@ -1103,12 +1104,13 @@ function analyzeScenarioConflicts(aircraftList, activeRwy) {
 // ============================================================================
 // 4D TRAJECTORY ENGINE & REAL-TIME SEPARATION CONFLICT DETECTOR
 // Implements:
-//  1. VOR Separation: BOTH aircraft must be >= 15 DME when crossing/sharing alt
+//  1. VOR Separation: Conflict ONLY when BOTH aircraft are < 15 DME while crossing/sharing alt
 //     (Rule exempts DEP <-> DEP pairs only; applies to all other pairs!)
 //  2. Head-to-Head Routes: Tracks within <45° of reciprocal (180° ± 45°)
-//     while closing are NOT allowed to cross/share altitudes within 100 NM!
-//  3. Same-Radial Proximity: Non-(DEP<->DEP) aircraft on same radial (<15°)
-//     within <15 NM horizontally without 1,000 ft vertical separation.
+//     while closing (separation completes once they pass over each other!)
+//     are NOT allowed to cross/share altitudes within 100 NM!
+//  3. Same-Radial Proximity: Non-head-on, non-(DEP<->DEP) aircraft on same radial
+//     (<15°) within <15 NM horizontally without 1,000 ft vertical separation.
 // ============================================================================
 function polarToNm(dmeNm, deg) {
   const rad = (deg * Math.PI) / 180;
@@ -1822,15 +1824,18 @@ function evaluatePairStepViolation(itemA, stA0, stA1, itemB, stB0, stB1) {
   const bothDep = itemA.acft.type === "DEP" && itemB.acft.type === "DEP";
 
   // 1. Check HEAD-TO-HEAD (< 45 deg off reciprocal) & < 100 NM while closing
+  // (Once they pass over each other, closingRate <= 0 and separation is complete!)
+  let isHeadToHeadTrack = false;
   let isHeadToHeadViolation = false;
   let headOnOffDeg = null;
   if (stA0.trackDeg !== null && stB0.trackDeg !== null) {
     const recipA = (stA0.trackDeg + 180) % 360;
     headOnOffDeg = angularDiffDeg(recipA, stB0.trackDeg);
     if (headOnOffDeg < 45 - 1e-6) {
+      isHeadToHeadTrack = true;
       const dvx = stB0.vx - stA0.vx;
       const dvy = stB0.vy - stA0.vy;
-      // Closing rate toward each other in NM/min (positive = approaching, negative = diverging)
+      // Closing rate toward each other in NM/min (positive = approaching, negative = passed/diverging)
       const closingRate =
         horizDistNm > 0.05 ? -(dx * dvx + dy * dvy) / horizDistNm : bothDep ? -10 : 10;
       if (closingRate > 0.1 && horizDistNm < 100 - 1e-4) {
@@ -1839,15 +1844,15 @@ function evaluatePairStepViolation(itemA, stA0, stA1, itemB, stB0, stB1) {
     }
   }
 
-  // 2. Check VOR SEPARATION (< 15 DME) — Exempt ONLY for DEP <-> DEP!
+  // 2. Check VOR SEPARATION (< 15 DME) — Conflict ONLY when BOTH aircraft are inside 15 DME (DEP <-> DEP exempt)
   let isVorViolation = false;
-  if (!bothDep && (dmeA < 15 - 1e-4 || dmeB < 15 - 1e-4)) {
+  if (!bothDep && dmeA < 15 - 1e-4 && dmeB < 15 - 1e-4) {
     isVorViolation = true;
   }
 
-  // 3. Check SAME-RADIAL PROXIMITY (radials < 15 deg apart on same side, < 15 NM horiz, not DEP<->DEP)
+  // 3. Check SAME-RADIAL PROXIMITY (same-direction radials < 15 deg apart, < 15 NM horiz, not H2H, not DEP<->DEP)
   let isSameRadialViolation = false;
-  if (!bothDep && dmeA >= 15 && dmeB >= 15 && !isHeadToHeadViolation) {
+  if (!bothDep && !isVorViolation && !isHeadToHeadTrack && !isHeadToHeadViolation) {
     const radDiff = angularDiffDeg(stA0.radialDeg, stB0.radialDeg);
     if (radDiff < 15 && horizDistNm < 15) {
       isSameRadialViolation = true;
@@ -1921,8 +1926,10 @@ function detect4DConflicts(solver) {
     samples.forEach((s) => {
       if (ruleType === "HEAD_TO_HEAD") {
         if (s.horizDistNm < best.horizDistNm) best = s;
+      } else if (ruleType === "VOR_15DME") {
+        if (Math.max(s.dmeA, s.dmeB) < Math.max(best.dmeA, best.dmeB)) best = s;
       } else {
-        if (Math.min(s.dmeA, s.dmeB) < Math.min(best.dmeA, best.dmeB)) best = s;
+        if (s.horizDistNm < best.horizDistNm) best = s;
       }
     });
 
@@ -1942,9 +1949,8 @@ function detect4DConflicts(solver) {
       badgeText = `⚔️ H2H ${best.headOnOffDeg}° • ${best.horizDistNm} NM (<100)`;
       detailText = `<strong>${itemA.acft.callsign}</strong> (${formatAltShort(best.altA)} @ ${best.dmeA} DME) and <strong>${itemB.acft.callsign}</strong> (${formatAltShort(best.altB)} @ ${best.dmeB} DME) are head-to-head (<strong>${best.headOnOffDeg}°</strong> off reciprocal, <strong>${best.horizDistNm} NM &lt; 100 NM</strong>) crossing altitudes during <code>${windowStr}</code>.`;
     } else if (ruleType === "VOR_15DME") {
-      const minDme = Math.min(best.dmeA, best.dmeB);
-      badgeText = `🎯 VOR <15 DME (${minDme} NM)`;
-      detailText = `Crossing/sharing altitude inside <strong>15 DME</strong> of AYT VOR (both must be ≥15 DME): <strong>${itemA.acft.callsign}</strong> at <strong>${best.dmeA} DME</strong> (${formatAltShort(best.altA)}) vs <strong>${itemB.acft.callsign}</strong> at <strong>${best.dmeB} DME</strong> (${formatAltShort(best.altB)}) at <code>${windowStr}</code>.`;
+      badgeText = `🎯 BOTH <15 DME (${best.dmeA}/${best.dmeB} NM)`;
+      detailText = `Both aircraft inside <strong>15 DME</strong> of AYT VOR crossing/sharing altitude: <strong>${itemA.acft.callsign}</strong> at <strong>${best.dmeA} DME</strong> (${formatAltShort(best.altA)}) &amp; <strong>${itemB.acft.callsign}</strong> at <strong>${best.dmeB} DME</strong> (${formatAltShort(best.altB)}) at <code>${windowStr}</code>.`;
     } else {
       badgeText = `📏 SAME RADIAL (${best.horizDistNm} NM)`;
       detailText = `Same-radial proximity without 1,000' vertical separation: <strong>${itemA.acft.callsign}</strong> (${best.dmeA} DME, ${formatAltShort(best.altA)}) and <strong>${itemB.acft.callsign}</strong> (${best.dmeB} DME, ${formatAltShort(best.altB)}) only <strong>${best.horizDistNm} NM</strong> apart at <code>${windowStr}</code>.`;
@@ -2968,10 +2974,10 @@ function renderConflictPanels(solver) {
         <div class="conflict-box alert-safe">
           <div class="conflict-top">
             <span class="conflict-pair">✅ Clear VOR &amp; Radial Sep</span>
-            <span class="badge badge-nodelay">BOTH ≥15 DME / SEPARATED</span>
+            <span class="badge badge-nodelay">CLEAR (AT LEAST ONE ≥15 DME)</span>
           </div>
           <div class="conflict-detail">
-            No VOR &lt;15 DME altitude-crossing violations (DEP↔DEP exempt) or same-radial breaches detected.
+            No conflicts where both aircraft are inside 15 DME crossing altitudes (DEP↔DEP exempt) or same-radial breaches.
           </div>
         </div>
       `;
@@ -3332,9 +3338,9 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
   const cosPhi = Math.cos(pitchRad);
 
   const camDist = 260;
-  const baseScale = (Math.min(W, H) * 0.41) / 68 * state.cam.zoom;
+  const baseScale = ((Math.min(W, H) * 0.46) / 56) * state.cam.zoom;
   const centerX = W / 2 + state.cam.panX;
-  const centerY = H * (0.5 + 0.11 * cosPhi) + state.cam.panY;
+  const centerY = H * (0.5 + 0.12 * cosPhi) + state.cam.panY;
   const zPerFt = (40 / 40000) * state.cam.altScale; // FL400 -> 40 NM visual height * altScale
 
   function project(xNm, yNm, altFt) {
@@ -3365,7 +3371,7 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
     ctx.restore();
   }
 
-  // 1. Subtle floor fill for 50 NM TMA Disc
+  // 1. Soft radial TMA Floor (50 NM)
   ctx.save();
   ctx.beginPath();
   for (let s = 0; s <= 72; s++) {
@@ -3375,32 +3381,29 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
     else ctx.lineTo(p.x, p.y);
   }
   ctx.closePath();
-  ctx.fillStyle = "rgba(30, 52, 92, 0.22)";
+  ctx.fillStyle = "rgba(22, 40, 74, 0.28)";
   ctx.fill();
   ctx.restore();
 
-  // Distance rings on floor (0 ft)
-  drawCircle3d(60, 0, "rgba(71, 104, 158, 0.25)", 1, [4, 6]);
-  drawCircle3d(50, 0, "rgba(71, 104, 158, 0.65)", 1.8, []);
-  drawCircle3d(25, 0, "rgba(56, 189, 248, 0.35)", 1.2, [5, 4]);
-  drawCircle3d(10, 0, "rgba(52, 211, 153, 0.28)", 1, [2, 4]);
+  // Floor DME Rings (subtle & clear)
+  drawCircle3d(60, 0, "rgba(71, 104, 158, 0.16)", 1, [4, 6]);
+  drawCircle3d(50, 0, "rgba(96, 138, 204, 0.55)", 1.6, []);
+  drawCircle3d(25, 0, "rgba(56, 189, 248, 0.24)", 1, [5, 5]);
+  drawCircle3d(10, 0, "rgba(52, 211, 153, 0.18)", 1, [2, 4]);
 
-  // 2. 15 DME VOR SEPARATION CYLINDER (Highlights RED if active VOR < 15 DME breach!)
+  // 2. 15 DME VOR SEPARATION CYLINDER
+  // Clean & unobtrusive when clear; glows crimson when a BOTH <15 DME conflict happens at T!
   const hasVorBreachNow = activeNowConflicts.some(
     (c) => c.ruleType === "VOR_15DME"
   );
-  const cylTopAlt = 36000;
+  const cylTopAlt = 32000;
   const cylColor = hasVorBreachNow
-    ? "rgba(248, 113, 113, 0.65)"
-    : "rgba(251, 191, 36, 0.38)";
-  const cylFill = hasVorBreachNow
-    ? "rgba(248, 113, 113, 0.09)"
-    : "rgba(251, 191, 36, 0.045)";
+    ? "rgba(248, 113, 113, 0.85)"
+    : "rgba(251, 191, 36, 0.28)";
 
-  // Translucent cylinder wall quads (front + back simplified)
-  if (cosPhi > 0.12) {
+  if (cosPhi > 0.15 && hasVorBreachNow) {
     ctx.save();
-    const cylSegs = 36;
+    const cylSegs = 32;
     for (let s = 0; s < cylSegs; s++) {
       const a0 = (s / cylSegs) * Math.PI * 2;
       const a1 = ((s + 1) / cylSegs) * Math.PI * 2;
@@ -3414,115 +3417,131 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
       ctx.lineTo(t1.x, t1.y);
       ctx.lineTo(t0.x, t0.y);
       ctx.closePath();
-      ctx.fillStyle = cylFill;
+      ctx.fillStyle = "rgba(248, 113, 113, 0.08)";
       ctx.fill();
     }
     ctx.restore();
   }
 
-  drawCircle3d(15, 0, cylColor, 1.5, [3, 3]);
-  if (cosPhi > 0.15) {
-    drawCircle3d(15, 10000, hasVorBreachNow ? "rgba(248, 113, 113, 0.3)" : "rgba(251, 191, 36, 0.18)", 1, [3, 4]);
-    drawCircle3d(15, 20000, hasVorBreachNow ? "rgba(248, 113, 113, 0.28)" : "rgba(251, 191, 36, 0.15)", 1, [3, 4]);
-    drawCircle3d(15, cylTopAlt, cylColor, 1.1, [3, 4]);
-    for (let deg = 0; deg < 360; deg += 90) {
-      const rad = (deg * Math.PI) / 180;
-      const pBot = project(15 * Math.sin(rad), 15 * Math.cos(rad), 0);
-      const pTop = project(15 * Math.sin(rad), 15 * Math.cos(rad), cylTopAlt);
-      ctx.strokeStyle = hasVorBreachNow
-        ? "rgba(248, 113, 113, 0.28)"
-        : "rgba(251, 191, 36, 0.16)";
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(pBot.x, pBot.y);
-      ctx.lineTo(pTop.x, pTop.y);
-      ctx.stroke();
+  // Subtle shaded base disc inside 15 DME
+  ctx.save();
+  ctx.beginPath();
+  for (let s = 0; s <= 48; s++) {
+    const a = (s / 48) * Math.PI * 2;
+    const p = project(15 * Math.sin(a), 15 * Math.cos(a), 0);
+    if (s === 0) ctx.moveTo(p.x, p.y);
+    else ctx.lineTo(p.x, p.y);
+  }
+  ctx.closePath();
+  ctx.fillStyle = hasVorBreachNow
+    ? "rgba(248, 113, 113, 0.14)"
+    : "rgba(251, 191, 36, 0.045)";
+  ctx.fill();
+  ctx.restore();
+
+  drawCircle3d(15, 0, cylColor, hasVorBreachNow ? 2 : 1.2, [4, 4]);
+  if (cosPhi > 0.18) {
+    drawCircle3d(
+      15,
+      hasVorBreachNow ? cylTopAlt : 22000,
+      hasVorBreachNow ? "rgba(248, 113, 113, 0.5)" : "rgba(251, 191, 36, 0.14)",
+      1,
+      [3, 5]
+    );
+    if (hasVorBreachNow) {
+      for (let deg = 0; deg < 360; deg += 90) {
+        const rad = (deg * Math.PI) / 180;
+        const pBot = project(15 * Math.sin(rad), 15 * Math.cos(rad), 0);
+        const pTop = project(15 * Math.sin(rad), 15 * Math.cos(rad), cylTopAlt);
+        ctx.strokeStyle = "rgba(248, 113, 113, 0.35)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(pBot.x, pBot.y);
+        ctx.lineTo(pTop.x, pTop.y);
+        ctx.stroke();
+      }
     }
   }
 
-  // Label for 15 DME VOR Cylinder
-  const p15Lbl = project(0, 15, cylTopAlt * 0.92);
-  ctx.fillStyle = hasVorBreachNow ? "#fca5a5" : "rgba(251, 191, 36, 0.8)";
-  ctx.font = "700 10px JetBrains Mono, monospace";
+  // Label 15 DME cleanly on the front/bottom edge (away from center aircraft cluster!)
+  const p15Lbl = project(0, -16.5, hasVorBreachNow ? cylTopAlt * 0.85 : 0);
+  ctx.fillStyle = hasVorBreachNow ? "#fca5a5" : "rgba(251, 191, 36, 0.65)";
+  ctx.font = "700 9px JetBrains Mono, monospace";
   ctx.textAlign = "center";
-  ctx.fillText(hasVorBreachNow ? "⚠ 15 DME VOR BREACH" : "15 DME VOR SEP", p15Lbl.x, p15Lbl.y - 4);
+  ctx.fillText(hasVorBreachNow ? "⚠ BOTH <15 DME" : "15 DME", p15Lbl.x, p15Lbl.y + 10);
 
-  // 3. Radial Airways & Waypoints on Floor
+  // 3. Radial Airways & Subtle Waypoint Labels on Floor
   WAYPOINTS.forEach((wpt) => {
-    const pOuter = polarToNm(66, wpt.deg);
+    const pOuter = polarToNm(63, wpt.deg);
     const pTma = polarToNm(50, wpt.deg);
-    const pCenter = { xNm: 0, yNm: 0 };
 
     const sOuter = project(pOuter.xNm, pOuter.yNm, 0);
     const sTma = project(pTma.xNm, pTma.yNm, 0);
-    const sCtr = project(pCenter.xNm, pCenter.yNm, 0);
+    const sCtr = project(0, 0, 0);
 
-    // Outer dotted
-    ctx.strokeStyle = "rgba(148, 163, 184, 0.35)";
-    ctx.lineWidth = 1.1;
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.18)";
+    ctx.lineWidth = 1;
     ctx.setLineDash([4, 4]);
     ctx.beginPath();
     ctx.moveTo(sOuter.x, sOuter.y);
     ctx.lineTo(sTma.x, sTma.y);
     ctx.stroke();
 
-    // Inner TMA track
-    ctx.strokeStyle = "rgba(248, 113, 113, 0.42)";
-    ctx.lineWidth = 1.4;
-    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.24)";
+    ctx.lineWidth = 1.1;
+    ctx.setLineDash([5, 5]);
     ctx.beginPath();
     ctx.moveTo(sTma.x, sTma.y);
     ctx.lineTo(sCtr.x, sCtr.y);
     ctx.stroke();
     ctx.setLineDash([]);
 
-    // Waypoint diamond + label
-    ctx.fillStyle = "#38bdf8";
+    ctx.fillStyle = "rgba(56, 189, 248, 0.72)";
     ctx.beginPath();
-    ctx.arc(sTma.x, sTma.y, 3.2, 0, Math.PI * 2);
+    ctx.arc(sTma.x, sTma.y, 2.8, 0, Math.PI * 2);
     ctx.fill();
 
-    const pLbl = polarToNm(57, wpt.deg);
+    const pLbl = polarToNm(56, wpt.deg);
     const sLbl = project(pLbl.xNm, pLbl.yNm, 0);
-    ctx.fillStyle = "#e2e8f0";
-    ctx.font = "800 10px JetBrains Mono, monospace";
-    ctx.textAlign = "center";
-    ctx.fillText(wpt.name, sLbl.x, sLbl.y + 3);
-
-    const pEntryLbl = polarToNm(69, wpt.deg);
-    const sEntryLbl = project(pEntryLbl.xNm, pEntryLbl.yNm, 0);
-    ctx.fillStyle = "rgba(251, 191, 36, 0.8)";
+    ctx.fillStyle = "rgba(226, 232, 240, 0.72)";
     ctx.font = "700 9px JetBrains Mono, monospace";
-    ctx.fillText(wpt.entryWpt, sEntryLbl.x, sEntryLbl.y + 3);
+    ctx.textAlign = "center";
+    ctx.fillText(`${wpt.name}`, sLbl.x, sLbl.y + 3);
   });
 
-  // 4. Center AYT VOR Marker & Vertical Altitude Scale Post
+  // 4. Center AYT VOR Marker + Outer Rim Altitude Scale Post (kept clear of center!)
   const sVor = project(0, 0, 0);
   ctx.fillStyle = "#38bdf8";
-  ctx.strokeStyle = "#38bdf8";
-  ctx.lineWidth = 1.8;
-  ctx.strokeRect(sVor.x - 5, sVor.y - 5, 10, 10);
+  ctx.strokeStyle = "rgba(56, 189, 248, 0.75)";
+  ctx.lineWidth = 1.6;
+  ctx.strokeRect(sVor.x - 4.5, sVor.y - 4.5, 9, 9);
   ctx.beginPath();
   ctx.arc(sVor.x, sVor.y, 2, 0, Math.PI * 2);
   ctx.fill();
 
-  if (cosPhi > 0.12) {
-    const sPoleTop = project(0, 0, 36000);
-    ctx.strokeStyle = "rgba(56, 189, 248, 0.35)";
+  if (cosPhi > 0.14) {
+    // Place altitude ladder on the camera-left TMA rim so center airspace stays crystal clear
+    const rimX = -52 * cosYaw;
+    const rimY = 52 * sinYaw;
+    const sPoleBot = project(rimX, rimY, 0);
+    const sPoleTop = project(rimX, rimY, 36000);
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.28)";
     ctx.lineWidth = 1;
     ctx.setLineDash([2, 3]);
     ctx.beginPath();
-    ctx.moveTo(sVor.x, sVor.y);
+    ctx.moveTo(sPoleBot.x, sPoleBot.y);
     ctx.lineTo(sPoleTop.x, sPoleTop.y);
     ctx.stroke();
     ctx.setLineDash([]);
 
     [10000, 20000, 30000].forEach((alt) => {
-      const pTick = project(0, 0, alt);
-      ctx.fillStyle = "rgba(148, 163, 184, 0.72)";
+      const pTick = project(rimX, rimY, alt);
+      ctx.fillStyle = "rgba(148, 163, 184, 0.78)";
       ctx.font = "700 9px JetBrains Mono, monospace";
-      ctx.textAlign = "left";
-      ctx.fillText(`FL${alt / 100}`, pTick.x + 5, pTick.y + 3);
+      ctx.textAlign = "right";
+      ctx.fillText(`FL${alt / 100}`, pTick.x - 5, pTick.y + 3);
+      ctx.fillStyle = "rgba(56, 189, 248, 0.55)";
+      ctx.fillRect(pTick.x - 2, pTick.y - 0.5, 5, 1);
     });
   }
 
@@ -3580,12 +3599,14 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
       }
     }
 
-    if (trajSamples.length >= 2) {
+    const showThisTraj =
+      state.cam.showAllPaths || isSelected || inConflictNow;
+    if (showThisTraj && trajSamples.length >= 2) {
       const midSample = trajSamples[Math.floor(trajSamples.length / 2)];
       const midProj = project(midSample.st.xNm, midSample.st.yNm, midSample.st.altFt);
       drawables.push({
         kind: "trajectory",
-        depth: midProj.depth + 5, // Slightly behind plane blips
+        depth: midProj.depth + 5,
         item,
         trajSamples,
         color: inConflictNow
@@ -3597,7 +3618,7 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
           : item.acft.type === "TRN"
           ? "#34d399"
           : "#38bdf8",
-        emphasis: isSelected || inConflictNow || stNow.visible,
+        emphasis: isSelected || inConflictNow,
       });
     }
 
@@ -3712,61 +3733,69 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
       const { item, st, proj3d, projFloor, isSelected, inConflictNow } = d;
       const blipColor = inConflictNow ? "#f87171" : st.color;
 
-      // Ground shadow dot & vertical plumb line stalk
+      // Ground shadow ring + crisp vertical plumb line stalk down to TMA floor
       ctx.save();
-      ctx.fillStyle = blipColor;
-      ctx.globalAlpha = 0.45;
-      ctx.beginPath();
-      ctx.arc(projFloor.x, projFloor.y, 3, 0, Math.PI * 2);
-      ctx.fill();
-
       ctx.strokeStyle = blipColor;
+      ctx.fillStyle = blipColor;
+      ctx.globalAlpha = isSelected ? 0.75 : 0.42;
+      ctx.lineWidth = isSelected ? 1.5 : 1;
+      ctx.beginPath();
+      ctx.arc(projFloor.x, projFloor.y, isSelected ? 5 : 3.5, 0, Math.PI * 2);
+      ctx.stroke();
+
       ctx.globalAlpha = isSelected ? 0.85 : 0.48;
       ctx.lineWidth = isSelected ? 1.8 : 1.1;
-      ctx.setLineDash([3, 3]);
       ctx.beginPath();
       ctx.moveTo(projFloor.x, projFloor.y);
       ctx.lineTo(proj3d.x, proj3d.y);
       ctx.stroke();
-      ctx.setLineDash([]);
       ctx.restore();
 
-      // Highlight ring if Selected or Conflicting
+      // Highlight halo if Selected or Conflicting
       if (isSelected || inConflictNow) {
         ctx.save();
         ctx.strokeStyle = inConflictNow ? "#f87171" : "#ffffff";
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.arc(proj3d.x, proj3d.y, isSelected ? 11 : 10, 0, Math.PI * 2);
+        ctx.arc(proj3d.x, proj3d.y, isSelected ? 12 : 11, 0, Math.PI * 2);
         ctx.stroke();
         ctx.restore();
       }
 
-      // 3D Aircraft Diamond Marker
-      ctx.save();
-      ctx.translate(proj3d.x, proj3d.y);
-      ctx.rotate(Math.PI / 4);
-      ctx.fillStyle = "#0b111e";
-      ctx.strokeStyle = blipColor;
-      ctx.lineWidth = 2.4;
-      ctx.fillRect(-5.5, -5.5, 11, 11);
-      ctx.strokeRect(-5.5, -5.5, 11, 11);
-      ctx.restore();
-
-      // Heading vector nose tip in 3D
+      // 3D Directional Jet Arrow / Diamond Marker
       if (st.trackDeg !== null) {
         const noseRad = (st.trackDeg * Math.PI) / 180;
-        const tip3d = project(
-          st.xNm + 3.8 * Math.sin(noseRad),
-          st.yNm + 3.8 * Math.cos(noseRad),
+        const pNose = project(
+          st.xNm + 3.2 * Math.sin(noseRad),
+          st.yNm + 3.2 * Math.cos(noseRad),
           st.altFt
         );
-        ctx.strokeStyle = blipColor;
-        ctx.lineWidth = 2;
+        const angle = Math.atan2(pNose.y - proj3d.y, pNose.x - proj3d.x);
+        ctx.save();
+        ctx.translate(proj3d.x, proj3d.y);
+        ctx.rotate(angle);
+        ctx.fillStyle = blipColor;
+        ctx.strokeStyle = "#0b111e";
+        ctx.lineWidth = 1.4;
         ctx.beginPath();
-        ctx.moveTo(proj3d.x, proj3d.y);
-        ctx.lineTo(tip3d.x, tip3d.y);
+        ctx.moveTo(9, 0);
+        ctx.lineTo(-6, -5.5);
+        ctx.lineTo(-3, 0);
+        ctx.lineTo(-6, 5.5);
+        ctx.closePath();
+        ctx.fill();
         ctx.stroke();
+        ctx.restore();
+      } else {
+        ctx.save();
+        ctx.translate(proj3d.x, proj3d.y);
+        ctx.rotate(Math.PI / 4);
+        ctx.fillStyle = "#0b111e";
+        ctx.strokeStyle = blipColor;
+        ctx.lineWidth = 2.4;
+        ctx.fillRect(-5.5, -5.5, 11, 11);
+        ctx.strokeRect(-5.5, -5.5, 11, 11);
+        ctx.restore();
       }
 
       // Queue Callsign & FL / DME Label Tag for collision separation pass
@@ -3778,8 +3807,12 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
       const w2 = ctx.measureText(line2).width;
       const tagW = Math.max(w1, w2) + 12;
       const tagH = 29;
-      const tx = Math.max(6, Math.min(W - tagW - 6, proj3d.x + 12));
-      const ty = Math.max(44, Math.min(H - tagH - 36, proj3d.y - 16));
+      const dxC = proj3d.x - centerX;
+      const dyC = proj3d.y - centerY;
+      const pushOutX = dxC >= 0 ? 18 : -(tagW + 18);
+      const pushOutY = dyC >= 0 ? 12 : -(tagH + 12);
+      const tx = Math.max(6, Math.min(W - tagW - 6, proj3d.x + pushOutX));
+      const ty = Math.max(46, Math.min(H - tagH - 38, proj3d.y + pushOutY));
 
       labelQueue.push({
         id: item.acft.id,
@@ -3797,22 +3830,40 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
     }
   });
 
-  // Fast iterative 2D tag de-overlap pass on projected 3D labels
-  for (let iter = 0; iter < 24; iter++) {
+  // Fast iterative 2D tag de-overlap pass (repel both other tags AND aircraft dots)
+  for (let iter = 0; iter < 36; iter++) {
     let moved = false;
     for (let i = 0; i < labelQueue.length; i++) {
-      for (let j = i + 1; j < labelQueue.length; j++) {
-        const A = labelQueue[i];
+      const A = labelQueue[i];
+      // Repel away from any aircraft icon dot
+      for (let j = 0; j < labelQueue.length; j++) {
         const B = labelQueue[j];
-        const pad = 5;
+        const dotX = B.sx;
+        const dotY = B.sy;
+        const cxA = A.tx + A.tw / 2;
+        const cyA = A.ty + A.th / 2;
+        const dxD = cxA - dotX;
+        const dyD = cyA - dotY;
+        const clearX = A.tw / 2 + 12;
+        const clearY = A.th / 2 + 12;
+        if (Math.abs(dxD) < clearX && Math.abs(dyD) < clearY) {
+          moved = true;
+          A.ty = Math.max(46, Math.min(H - A.th - 38, A.ty + (dyD >= 0 ? 4 : -4)));
+          A.tx = Math.max(6, Math.min(W - A.tw - 6, A.tx + (dxD >= 0 ? 4 : -4)));
+        }
+      }
+      // Repel away from other tags
+      for (let j = i + 1; j < labelQueue.length; j++) {
+        const B = labelQueue[j];
+        const pad = 7;
         const ovX = (A.tw + B.tw) / 2 + pad - Math.abs(A.tx + A.tw / 2 - (B.tx + B.tw / 2));
         const ovY = (A.th + B.th) / 2 + pad - Math.abs(A.ty + A.th / 2 - (B.ty + B.th / 2));
         if (ovX > 0 && ovY > 0) {
           moved = true;
           if (ovY <= ovX * 1.4) {
             const dir = A.ty <= B.ty ? -1 : 1;
-            A.ty = Math.max(44, Math.min(H - A.th - 36, A.ty + (dir * ovY) / 2));
-            B.ty = Math.max(44, Math.min(H - B.th - 36, B.ty - (dir * ovY) / 2));
+            A.ty = Math.max(46, Math.min(H - A.th - 38, A.ty + (dir * ovY) / 2));
+            B.ty = Math.max(46, Math.min(H - B.th - 38, B.ty - (dir * ovY) / 2));
           } else {
             const dir = A.tx <= B.tx ? -1 : 1;
             A.tx = Math.max(6, Math.min(W - A.tw - 6, A.tx + (dir * ovX) / 2));
@@ -4591,17 +4642,17 @@ function initApp() {
       document.querySelectorAll(".cam-btn[data-cam]").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
       if (preset === "iso") {
-        state.cam.yawDeg = 28;
-        state.cam.pitchDeg = 34;
+        state.cam.yawDeg = 26;
+        state.cam.pitchDeg = 32;
         state.cam.zoom = 1.0;
       } else if (preset === "top") {
         state.cam.yawDeg = 0;
         state.cam.pitchDeg = 89.5;
-        state.cam.zoom = 1.05;
+        state.cam.zoom = 1.0;
       } else if (preset === "side") {
         state.cam.yawDeg = 12;
         state.cam.pitchDeg = 13;
-        state.cam.zoom = 1.08;
+        state.cam.zoom = 1.05;
       }
       state.cam.panX = 0;
       state.cam.panY = 0;
@@ -4613,7 +4664,7 @@ function initApp() {
   const btnResetCam = document.getElementById("btnResetCam");
   if (btnResetCam) {
     btnResetCam.addEventListener("click", () => {
-      state.cam = { ...state.cam, yawDeg: 28, pitchDeg: 34, zoom: 1.0, panX: 0, panY: 0 };
+      state.cam = { ...state.cam, yawDeg: 26, pitchDeg: 32, zoom: 1.0, panX: 0, panY: 0 };
       document.querySelectorAll(".cam-btn[data-cam]").forEach((b) => {
         b.classList.toggle("active", b.getAttribute("data-cam") === "iso");
       });
@@ -4623,13 +4674,30 @@ function initApp() {
   }
 
   document.querySelectorAll(".zscale-btn[data-zscale]").forEach((btn) => {
+    const zVal = parseFloat(btn.getAttribute("data-zscale"));
+    btn.classList.toggle("active", Math.abs(zVal - state.cam.altScale) < 0.05);
     btn.addEventListener("click", () => {
-      state.cam.altScale = parseFloat(btn.getAttribute("data-zscale")) || 1.0;
-      document.querySelectorAll(".zscale-btn").forEach((b) => b.classList.toggle("active", b === btn));
+      state.cam.altScale = parseFloat(btn.getAttribute("data-zscale")) || 1.5;
+      document
+        .querySelectorAll(".zscale-btn[data-zscale]")
+        .forEach((b) => b.classList.toggle("active", b === btn));
       saveState();
       renderRadarChartOnlyVisuals(analyzeScenarioConflicts(state.aircraftList, state.activeRwy));
     });
   });
+
+  const btnToggle3dPaths = document.getElementById("btnToggle3dPaths");
+  if (btnToggle3dPaths) {
+    btnToggle3dPaths.classList.toggle("active", !!state.cam.showAllPaths);
+    btnToggle3dPaths.textContent = state.cam.showAllPaths ? "Paths: All" : "Paths: Focus";
+    btnToggle3dPaths.addEventListener("click", () => {
+      state.cam.showAllPaths = !state.cam.showAllPaths;
+      btnToggle3dPaths.classList.toggle("active", state.cam.showAllPaths);
+      btnToggle3dPaths.textContent = state.cam.showAllPaths ? "Paths: All" : "Paths: Focus";
+      saveState();
+      renderRadarChartOnlyVisuals(analyzeScenarioConflicts(state.aircraftList, state.activeRwy));
+    });
+  }
 
   const btnResetAllTestFl = document.getElementById("btnResetAllTestFl");
   if (btnResetAllTestFl) {

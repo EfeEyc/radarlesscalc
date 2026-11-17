@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>AYT TMA Radarless Calculator &amp; Conflict Finder</title>
-  <link rel="stylesheet" href="styles.css?v=20261117b" />
+  <link rel="stylesheet" href="styles.css?v=20261117d" />
 </head>
 <body>
   <main class="container">
@@ -425,7 +425,7 @@
           <div>
             <h2>🔍 Live Conflict Finder (Head-to-Head &lt;45°/100 NM, VOR &lt;15 DME &amp; EAT)</h2>
             <p class="card-sub">
-              Detects <strong>Head-to-Head (&lt;45° track diff)</strong> altitude crossings within <strong>100 NM</strong>, <strong>VOR &lt;15 DME</strong> crossings (exempting DEP↔DEP only), same-radial proximity, and ILS / EAT delays — including any active Test FLs.
+              Detects <strong>Head-to-Head (&lt;45° track diff)</strong> altitude crossings within <strong>100 NM</strong> (until passing each other), <strong>VOR &lt;15 DME</strong> crossings when both are inside 15 DME (DEP↔DEP exempt), same-radial proximity, and ILS / EAT delays.
             </p>
           </div>
         </div>
@@ -435,7 +435,7 @@
           <div class="conflict-panel">
             <div class="panel-header">
               <h3>⚔️ Head-to-Head (&lt;45° / 100 NM)</h3>
-              <span class="badge-subtle">Alt Crossings &lt;100 NM</span>
+              <span class="badge-subtle">Until Passing Each Other</span>
             </div>
             <div id="depArrConflictList" class="conflict-list">
               <!-- Populated by JS -->
@@ -446,7 +446,7 @@
           <div class="conflict-panel">
             <div class="panel-header">
               <h3>🎯 VOR &lt;15 DME &amp; Radial Conflicts</h3>
-              <span class="badge-subtle">Both ≥15 DME (DEP↔DEP exempt)</span>
+              <span class="badge-subtle">Both &lt;15 DME (DEP↔DEP exempt)</span>
             </div>
             <div id="radialConflictList" class="conflict-list">
               <!-- Populated by JS -->
@@ -529,12 +529,14 @@
 
               <!-- Bottom Hint / Selected Blip Quick Readout -->
               <div class="canvas3d-bottom-bar">
-                <span class="cam-touch-hint">1-finger drag: Rotate • Pinch/Wheel: Zoom • Tap plane: Test FL</span>
+                <span class="cam-touch-hint">Drag: Orbit • Pinch/Wheel: Zoom • Tap plane: Test FL</span>
                 <div class="vert-scale-toggle">
+                  <button type="button" id="btnToggle3dPaths" class="zscale-btn" title="Toggle between Focused and All 3D Trajectory Paths">Paths: Focus</button>
+                  <span style="opacity:0.4">|</span>
                   <span>Alt Z:</span>
-                  <button type="button" class="zscale-btn active" data-zscale="1">1x</button>
-                  <button type="button" class="zscale-btn" data-zscale="1.6">1.6x</button>
-                  <button type="button" class="zscale-btn" data-zscale="2.4">2.4x</button>
+                  <button type="button" class="zscale-btn" data-zscale="1">1x</button>
+                  <button type="button" class="zscale-btn active" data-zscale="1.5">1.5x</button>
+                  <button type="button" class="zscale-btn" data-zscale="2.2">2.2x</button>
                 </div>
               </div>
             </div>
@@ -657,6 +659,6 @@
     </div>
   </main>
 
-  <script src="app.js?v=20261117b"></script>
+  <script src="app.js?v=20261117d"></script>
 </body>
 </html>
