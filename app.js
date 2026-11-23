@@ -1580,6 +1580,13 @@ function getAircraftStateAtTime(item, solverData, queryNormMins) {
   return st;
 }
 
+function getChartAircraftColor(type, inConflictNow = false) {
+  if (inConflictNow) return "#f87171"; // Red: conflicted aircraft
+  if (type === "DEP") return "#38bdf8"; // Blue: departures
+  if (type === "TRN") return "#c084fc"; // Purple: transits
+  return "#fbbf24"; // Yellow: arrivals
+}
+
 function computeAircraftKinematics(item, eatInfo, queryNormMins, liveAltFt, altStr, isTested) {
   const { acft, calc } = item;
 
@@ -1641,7 +1648,7 @@ function computeAircraftKinematics(item, eatInfo, queryNormMins, liveAltFt, altS
         altStr,
         isTested,
         text: `${+dme.toFixed(1)} NM TO AYT (${entryWpt.name} → ${exitWpt.name}) @ ${altStr}`,
-        color: isTested ? "#c084fc" : "#34d399",
+        color: getChartAircraftColor("TRN"),
       };
     }
 
@@ -1673,7 +1680,7 @@ function computeAircraftKinematics(item, eatInfo, queryNormMins, liveAltFt, altS
           altStr,
           isTested,
           text: `${+dme.toFixed(1)} NM FROM AYT (→ ${exitWpt.name}) @ ${altStr}`,
-          color: isTested ? "#c084fc" : "#34d399",
+          color: getChartAircraftColor("TRN"),
         };
       }
     }
@@ -1750,7 +1757,7 @@ function computeAircraftKinematics(item, eatInfo, queryNormMins, liveAltFt, altS
       altStr,
       isTested,
       text: `${+dme.toFixed(1)} NM FROM AYT on ${wpt.name} @ ${altStr}`,
-      color: isTested ? "#c084fc" : "#fbbf24",
+      color: getChartAircraftColor("DEP"),
     };
   }
 
@@ -1815,7 +1822,7 @@ function computeAircraftKinematics(item, eatInfo, queryNormMins, liveAltFt, altS
         altStr,
         isTested,
         text: `${+dme.toFixed(1)} NM TO AYT ${wpt.name} (Str-In) @ ${altStr}`,
-        color: isTested ? "#c084fc" : "#38bdf8",
+        color: getChartAircraftColor("ARR"),
       };
     }
 
@@ -1849,7 +1856,7 @@ function computeAircraftKinematics(item, eatInfo, queryNormMins, liveAltFt, altS
         text: eatInfo.ilsCleared
           ? `10 NM (${wpt.name}) — Holding ${remHold}m until ILS clear (${eatInfo.clearTimeDisplay}) @ ${altStr}`
           : `10 NM (${wpt.name}) — Holding (awaiting ILS clearance) @ ${altStr}`,
-        color: eatInfo.ilsCleared ? "#f87171" : "#fbbf24",
+        color: getChartAircraftColor("ARR"),
       };
     }
 
@@ -1883,7 +1890,7 @@ function computeAircraftKinematics(item, eatInfo, queryNormMins, liveAltFt, altS
         altStr: `${altStr} ILS`,
         isTested,
         text: `Cleared ILS (${remTurn}m to Est) descending to 3,000' @ ${altStr}`,
-        color: "#34d399",
+        color: getChartAircraftColor("ARR"),
       };
     }
 
@@ -1912,7 +1919,7 @@ function computeAircraftKinematics(item, eatInfo, queryNormMins, liveAltFt, altS
         altStr: "TWR",
         isTested,
         text: `Established w/ TWR 118.1 (${+finalDme.toFixed(1)} NM final)`,
-        color: "#34d399",
+        color: getChartAircraftColor("ARR"),
       };
     }
 
@@ -1961,7 +1968,7 @@ function computeAircraftKinematics(item, eatInfo, queryNormMins, liveAltFt, altS
       altStr,
       isTested,
       text: `${+dme.toFixed(1)} NM TO AYT ${wpt.name} @ ${altStr}`,
-      color: isTested ? "#c084fc" : "#38bdf8",
+      color: getChartAircraftColor("ARR"),
     };
   }
 
@@ -1993,7 +2000,7 @@ function computeAircraftKinematics(item, eatInfo, queryNormMins, liveAltFt, altS
       altStr,
       isTested,
       text: `${+dme.toFixed(1)} NM outbound to 10 DME FIX @ ${altStr}`,
-      color: isTested ? "#c084fc" : "#fbbf24",
+      color: getChartAircraftColor("ARR"),
     };
   }
 
@@ -2024,7 +2031,7 @@ function computeAircraftKinematics(item, eatInfo, queryNormMins, liveAltFt, altS
       text: eatInfo.ilsCleared
         ? `HOLDING at 10 DME FIX (${remHold}m to ILS @ ${eatInfo.effectiveFixDisplay}) @ ${altStr}`
         : `HOLDING at 10 DME FIX (awaiting ILS clearance) @ ${altStr}`,
-      color: eatInfo.ilsCleared ? "#f87171" : "#fbbf24",
+      color: getChartAircraftColor("ARR"),
     };
   }
 
@@ -2056,7 +2063,7 @@ function computeAircraftKinematics(item, eatInfo, queryNormMins, liveAltFt, altS
       altStr: `${altStr} ILS`,
       isTested,
       text: `In 5m ILS turn (${remTurn}m to Est) @ ${altStr}`,
-      color: "#34d399",
+      color: getChartAircraftColor("ARR"),
     };
   }
 
@@ -2087,7 +2094,7 @@ function computeAircraftKinematics(item, eatInfo, queryNormMins, liveAltFt, altS
       altStr: "EST/TWR",
       isTested,
       text: `Established w/ TWR 118.1 (${+finalDme.toFixed(1)} NM final)`,
-      color: "#34d399",
+      color: getChartAircraftColor("ARR"),
     };
   }
 
@@ -4717,15 +4724,7 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
         depth: midProj.depth + 5,
         item,
         trajSamples,
-        color: inConflictNow
-          ? "#f87171"
-          : isSelected || isTested
-          ? stNow.color
-          : item.acft.type === "DEP"
-          ? "#fbbf24"
-          : item.acft.type === "TRN"
-          ? "#34d399"
-          : "#38bdf8",
+        color: getChartAircraftColor(item.acft.type, inConflictNow),
         emphasis: isSelected || inConflictNow,
       });
     }
@@ -4870,7 +4869,7 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
 
     if (d.kind === "aircraft") {
       const { item, st, proj3d, projFloor, isSelected, inConflictNow } = d;
-      const blipColor = inConflictNow ? "#f87171" : st.color;
+      const blipColor = getChartAircraftColor(item.acft.type, inConflictNow);
       // Depth-based visual scaling (farther = smaller, closer = larger)
       const dScale = Math.max(0.62, Math.min(1.48, proj3d.scale));
       const fScale = Math.max(0.76, Math.min(1.22, 0.45 + 0.55 * proj3d.scale));
@@ -5614,7 +5613,7 @@ function renderRadarChartOnlyVisuals(solver) {
   if (state.chartMode === "3d") {
     render3dRadarChart(solver, queryNorm, activeNowConflicts);
   } else {
-    render2dSvgRadar(solver, queryNorm);
+    render2dSvgRadar(solver, queryNorm, activeNowConflicts);
   }
   renderConflictHeatmapBar(solver, queryNorm);
   renderChartConflictFeed(solver, queryNorm, activeNowConflicts);
@@ -5764,23 +5763,31 @@ function renderRadarChartView(solver) {
   });
 
   if (state.chartMode === "2d") {
-    render2dSvgRadar(solver, queryNorm);
+    render2dSvgRadar(solver, queryNorm, activeNowConflicts);
   } else if (blipsLayer) {
     blipsLayer.innerHTML = "";
   }
 }
 
-function render2dSvgRadar(solver, queryNorm) {
+function render2dSvgRadar(solver, queryNorm, activeNowConflicts = []) {
   const blipsLayer = document.getElementById("svgBlipsLayer");
   if (!blipsLayer) return;
   blipsLayer.innerHTML = "";
+
+  const activeConflictIds = new Set();
+  (activeNowConflicts || []).forEach((c) => {
+    activeConflictIds.add(c.itemA.acft.id);
+    activeConflictIds.add(c.itemB.acft.id);
+  });
 
   const allItems = getAllItemsFromSolver(solver);
   const visibleBlips = [];
   allItems.forEach((item) => {
     const st = getAircraftStateAtTime(item, solver, queryNorm);
     if (st.visible && st.x !== undefined && st.y !== undefined) {
-      visibleBlips.push({ item, st, x: st.x, y: st.y });
+      const inConflictNow = activeConflictIds.has(item.acft.id);
+      const blipColor = getChartAircraftColor(item.acft.type, inConflictNow);
+      visibleBlips.push({ item, st, x: st.x, y: st.y, blipColor, inConflictNow });
     }
   });
 
@@ -5795,28 +5802,28 @@ function render2dSvgRadar(solver, queryNorm) {
     h: tag.h,
   }));
 
-  visibleBlips.forEach(({ st }, i) => {
+  visibleBlips.forEach(({ st, blipColor }, i) => {
     const tag = tagPlacements[i];
     const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
     g.innerHTML = `
-      <line x1="${st.x}" y1="${st.y}" x2="${tag.anchorX}" y2="${tag.anchorY}" stroke="${st.color}" stroke-width="1.5" opacity="0.9" />
-      <circle cx="${tag.anchorX}" cy="${tag.anchorY}" r="2.2" fill="${st.color}" />
-      <line x1="${st.x}" y1="${st.y}" x2="${st.tipX}" y2="${st.tipY}" stroke="${st.color}" stroke-width="2.2" />
-      <rect x="${st.x - 5}" y="${st.y - 5}" width="10" height="10" fill="#0b111e" stroke="${st.color}" stroke-width="2.2" transform="rotate(45 ${st.x} ${st.y})" />
-      <circle cx="${st.x}" cy="${st.y}" r="2" fill="${st.color}" />
+      <line x1="${st.x}" y1="${st.y}" x2="${tag.anchorX}" y2="${tag.anchorY}" stroke="${blipColor}" stroke-width="1.5" opacity="0.9" />
+      <circle cx="${tag.anchorX}" cy="${tag.anchorY}" r="2.2" fill="${blipColor}" />
+      <line x1="${st.x}" y1="${st.y}" x2="${st.tipX}" y2="${st.tipY}" stroke="${blipColor}" stroke-width="2.2" />
+      <rect x="${st.x - 5}" y="${st.y - 5}" width="10" height="10" fill="#0b111e" stroke="${blipColor}" stroke-width="2.2" transform="rotate(45 ${st.x} ${st.y})" />
+      <circle cx="${st.x}" cy="${st.y}" r="2" fill="${blipColor}" />
     `;
     blipsLayer.appendChild(g);
   });
 
-  visibleBlips.forEach(({ item, st }, i) => {
+  visibleBlips.forEach(({ item, st, blipColor }, i) => {
     const tag = tagPlacements[i];
     const isSel = item.acft.id === state.selectedTestAcftId;
     const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
     g.setAttribute("class", `svg-draggable-tag${isSel ? " selected" : ""}`);
     g.setAttribute("data-tag2d-id", String(item.acft.id));
     g.innerHTML = `
-      <rect x="${tag.tx}" y="${tag.ty}" width="${tag.w}" height="${tag.h}" class="blip-tag-bg" stroke="${isSel ? "#ffffff" : st.color}" stroke-width="${isSel ? "2" : "1.2"}" />
-      <text x="${tag.tx + 5}" y="${tag.ty + 12}" class="blip-tag-title" fill="${st.color}">${item.acft.callsign}</text>
+      <rect x="${tag.tx}" y="${tag.ty}" width="${tag.w}" height="${tag.h}" class="blip-tag-bg" stroke="${isSel ? "#ffffff" : blipColor}" stroke-width="${isSel ? "2" : "1.2"}" />
+      <text x="${tag.tx + 5}" y="${tag.ty + 12}" class="blip-tag-title" fill="${blipColor}">${item.acft.callsign}</text>
       <text x="${tag.tx + 5}" y="${tag.ty + 24}" class="blip-tag-sub">${st.altStr} • ${st.dme}NM</text>
     `;
     blipsLayer.appendChild(g);
