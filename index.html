@@ -1,53 +1,179 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>AYT TMA Radarless Calculator &amp; Conflict Finder</title>
-  <link rel="stylesheet" href="styles.css?v=20261123a" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700;800&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css?v=20261123r4" />
 </head>
 <body>
   <main class="container">
-    <!-- COMPACT TOP CONTROL BAR: RUNWAY SELECTOR + VIEW TABS -->
-    <div class="top-control-strip">
-      <div class="rwy-selector" role="group" aria-label="Active Runway">
+    <!-- ===================================================================== -->
+    <!-- RARE UI FLOATING CAPSULE NAVBAR (Brand + Gooey Nav + RWY + Bell + Theme) -->
+    <!-- ===================================================================== -->
+    <header class="rare-navbar">
+      <!-- Brand Pill (RareUI Flower Mark) -->
+      <div class="rare-nav-capsule rare-brand-pill">
+        <span class="rare-brand-flower" aria-hidden="true">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+            <circle cx="12" cy="5.5" r="3.2" />
+            <circle cx="18.2" cy="10" r="3.2" />
+            <circle cx="15.8" cy="17.2" r="3.2" />
+            <circle cx="8.2" cy="17.2" r="3.2" />
+            <circle cx="5.8" cy="10" r="3.2" />
+          </svg>
+        </span>
+        <span class="rare-brand-title">
+          AYT TMA
+          <span class="rare-brand-tag">RADARLESS</span>
+        </span>
+      </div>
+
+      <!-- Center Gooey Nav: Calculator vs 3D Chart -->
+      <nav class="rare-gooey-group main-view-tabs" role="tablist" aria-label="Main Views">
+        <span class="rare-gooey-indicator" aria-hidden="true"></span>
+        <button type="button" class="view-tab active" data-view="calc" role="tab" aria-selected="true">
+          Calculator &amp; Conflicts
+        </button>
+        <button type="button" class="view-tab" data-view="chart" role="tab" aria-selected="false">
+          3D Chart &amp; FL Tester
+        </button>
+      </nav>
+
+      <!-- Runway Gooey Pill -->
+      <div class="rare-gooey-group subtle-indicator rwy-selector" role="group" aria-label="Active Runway">
+        <span class="rare-gooey-indicator" aria-hidden="true"></span>
         <span class="rwy-label">RWY</span>
         <button type="button" id="btnRwy36" class="rwy-btn active" data-rwy="36">
-          36 <small>(DERYA Str-In)</small>
+          36 <small>DERYA</small>
         </button>
         <button type="button" id="btnRwy18" class="rwy-btn" data-rwy="18">
-          18 <small>(KUMRU Str-In)</small>
+          18 <small>KUMRU</small>
         </button>
       </div>
 
-      <div class="main-view-tabs" role="tablist" aria-label="Main Views">
-        <button type="button" class="view-tab active" data-view="calc" role="tab" aria-selected="true">
-          🧮 Calculator &amp; Conflicts
+      <!-- Right Floating Pills: Notification Bell + Theme Selector -->
+      <div class="rare-nav-right">
+        <button type="button" id="rareBellBtn" class="rare-bell-btn" title="Jump to active conflicts">
+          <span class="bell-icon" aria-hidden="true">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+              <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+            </svg>
+          </span>
+          <span class="rare-bell-dot" aria-hidden="true"></span>
+          <span id="rareBellText">Clear</span>
         </button>
-        <button type="button" class="view-tab" data-view="chart" role="tab" aria-selected="false">
-          🧊 3D Chart &amp; FL Tester
+
+        <button type="button" id="rareThemeTrigger" class="rare-theme-trigger" aria-label="Switch Theme" aria-expanded="false" title="Theme Selector">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="9"/>
+            <path d="M12 3v18"/>
+            <path d="M12 3a9 9 0 0 1 0 18" fill="currentColor"/>
+          </svg>
         </button>
+
+        <!-- RareUI Theme Selector Popover -->
+        <div id="rareThemePopover" class="rare-theme-popover hidden" role="dialog" aria-label="Theme Selector">
+          <div class="rare-theme-pop-head">
+            <strong>Theme</strong>
+            <span>Pick how the interface looks</span>
+          </div>
+          <div class="rare-theme-grid">
+            <button type="button" class="rare-theme-option active" data-rare-theme="dark">
+              <div class="rare-theme-thumb dark-thumb">
+                <div class="thumb-bar"></div>
+                <div class="thumb-cards">
+                  <div class="thumb-card accent-dot"></div>
+                  <div class="thumb-card"></div>
+                </div>
+              </div>
+              <span>Dark</span>
+            </button>
+            <button type="button" class="rare-theme-option" data-rare-theme="light">
+              <div class="rare-theme-thumb light-thumb">
+                <div class="thumb-bar"></div>
+                <div class="thumb-cards">
+                  <div class="thumb-card accent-dot"></div>
+                  <div class="thumb-card"></div>
+                </div>
+              </div>
+              <span>Light</span>
+            </button>
+          </div>
+        </div>
       </div>
-    </div>
+    </header>
 
     <!-- ===================================================================== -->
     <!-- VIEW 1: CALCULATOR, CHECKPOINT SHEET & MASTER SCENARIO SOLVER         -->
     <!-- ===================================================================== -->
     <div id="viewCalc" class="view-panel">
-      <!-- ONE-BY-ONE NEW PLANE PROMPT WIZARD -->
-      <section class="card entry-card">
+      <!-- RARE UI ANIMATED COUNTER KPI STRIP -->
+      <section class="rare-kpi-strip" aria-label="Scenario Metrics">
+        <div class="rare-kpi-card">
+          <div class="rare-kpi-label">
+            <span>Total Traffic</span>
+            <span class="rare-kpi-dot" style="background: var(--rare-orange);"></span>
+          </div>
+          <div class="rare-kpi-value">
+            <span id="odoTotal" class="rare-odometer">0</span>
+          </div>
+        </div>
+        <div class="rare-kpi-card">
+          <div class="rare-kpi-label">
+            <span>Arrivals (ARR)</span>
+            <span class="rare-kpi-dot" style="background: var(--accent-amber);"></span>
+          </div>
+          <div class="rare-kpi-value">
+            <span id="odoArr" class="rare-odometer">0</span>
+          </div>
+        </div>
+        <div class="rare-kpi-card">
+          <div class="rare-kpi-label">
+            <span>Departures (DEP)</span>
+            <span class="rare-kpi-dot" style="background: var(--accent-blue);"></span>
+          </div>
+          <div class="rare-kpi-value">
+            <span id="odoDep" class="rare-odometer">0</span>
+          </div>
+        </div>
+        <div class="rare-kpi-card">
+          <div class="rare-kpi-label">
+            <span>Transits (TRN)</span>
+            <span class="rare-kpi-dot" style="background: var(--accent-purple);"></span>
+          </div>
+          <div class="rare-kpi-value">
+            <span id="odoTrn" class="rare-odometer">0</span>
+          </div>
+        </div>
+        <div class="rare-kpi-card" id="kpiCardConflicts">
+          <div class="rare-kpi-label">
+            <span>Active Conflicts</span>
+            <span class="rare-kpi-dot" style="background: var(--accent-red);"></span>
+          </div>
+          <div class="rare-kpi-value">
+            <span id="odoConflicts" class="rare-odometer">0</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ONE-BY-ONE NEW PLANE PROMPT WIZARD & JSON IMPORTER -->
+      <section id="sectionEntry" class="card entry-card">
         <!-- LAUNCHER BAR -->
         <div id="newPlaneLauncher" class="new-plane-launcher">
           <div class="launcher-btn-group">
             <button type="button" id="btnOpenNewPlane" class="new-plane-hero-btn">
-              <span class="plus-icon">➕</span>
+              <span class="plus-icon">＋</span>
               <span>New Plane</span>
               <small>Step-by-Step</small>
             </button>
             <button type="button" id="btnOpenJsonImporter" class="json-import-hero-btn">
-              <span>📥</span>
               <span>Import Scenario JSON</span>
-              <small>From Gemini / Board</small>
+              <small>Gemini / Board</small>
             </button>
           </div>
           <div class="launcher-meta">
@@ -56,11 +182,11 @@
           </div>
         </div>
 
-        <!-- SCENARIO JSON IMPORTER & GEMINI SKILL HELPER PANEL -->
+        <!-- SCENARIO JSON IMPORTER (RareUI Code Block Style) -->
         <div id="jsonImporterPanel" class="wizard-container json-importer-panel hidden">
           <div class="wizard-top-bar">
             <div>
-              <h3 style="font-size:0.96rem;font-weight:800;">📥 Scenario JSON Importer &amp; Gemini Board Reader</h3>
+              <h3>Scenario JSON Importer &amp; Gemini Board Reader</h3>
               <p class="card-sub">Paste the JSON generated by your Gemini Skill from a whiteboard photo (supports outer fixes like <code>KFK</code>, <code>TOMBİ</code>, <code>HİSAR</code>, <code>CRD</code>, <code>MUT</code>, <code>DOREN</code>, <code>ALPAY</code> and <code>AYT</code>).</p>
             </div>
             <button type="button" id="btnCloseJsonImporter" class="small-btn danger-btn">
@@ -70,44 +196,55 @@
 
           <div class="json-quick-actions">
             <button type="button" id="btnPasteAndImport" class="small-btn accent-btn">
-              📋 Paste Clipboard &amp; Import Now
+              📋 Paste Clipboard &amp; Import
             </button>
             <button type="button" id="btnLoadBoardExample" class="small-btn">
               🏫 Load PR.6 Whiteboard Example
             </button>
             <button type="button" id="btnExportCurrentJson" class="small-btn">
-              📤 Export Current Scenario to Box
+              📤 Export Current Scenario
             </button>
             <label class="small-btn file-upload-label" for="jsonFileInput">
-              📂 Upload .json File
+              📂 Upload .json
               <input type="file" id="jsonFileInput" accept=".json,application/json,text/plain" class="hidden" />
             </label>
             <button type="button" id="btnCopyGeminiPrompt" class="small-btn">
-              🤖 Copy Gemini Skill Prompt
+              🤖 Copy Gemini Prompt
             </button>
           </div>
 
-          <textarea
-            id="jsonImportTextarea"
-            class="json-textarea"
-            rows="9"
-            placeholder='Paste Scenario JSON here (even with ```json code fences)...&#10;Example:&#10;{&#10;  "rwy": "36",&#10;  "aircraft": [&#10;    { "type": "ARR", "callsign": "BAW8VZ", "fl": 260, "time": "10:07", "wpt": "KFK", "dist": 50 },&#10;    { "type": "DEP", "callsign": "MSR5ZV", "fl": 270, "time": "10:03", "wpt": "TOMBI" },&#10;    { "type": "TRN", "callsign": "TCLAB", "fl": 140, "time": "10:01", "route": ["TOMBI", "AYT", "KFK"], "dist": 60 }&#10;  ]&#10;}'
-            spellcheck="false"
-          ></textarea>
+          <div class="rare-code-block">
+            <div class="rare-code-head">
+              <span class="rare-code-filename">
+                <span class="rare-code-dot"></span>
+                scenario.json
+              </span>
+              <button type="button" id="btnCopyJsonBox" class="small-btn" style="height:26px;font-size:0.72rem;">
+                Copy JSON
+              </button>
+            </div>
+            <textarea
+              id="jsonImportTextarea"
+              class="json-textarea"
+              rows="8"
+              placeholder='Paste Scenario JSON here (even with ```json code fences)...&#10;Example:&#10;{&#10;  "rwy": "36",&#10;  "aircraft": [&#10;    { "type": "ARR", "callsign": "BAW8VZ", "fl": 260, "time": "10:07", "wpt": "KFK", "dist": 50 },&#10;    { "type": "DEP", "callsign": "MSR5ZV", "fl": 270, "time": "10:03", "wpt": "TOMBI" },&#10;    { "type": "TRN", "callsign": "TCLAB", "fl": 140, "time": "10:01", "route": ["TOMBI", "AYT", "KFK"], "dist": 60 }&#10;  ]&#10;}'
+              spellcheck="false"
+            ></textarea>
+          </div>
 
           <div id="jsonImportFeedback" class="json-feedback hidden"></div>
 
           <div class="wizard-nav-row">
             <button type="button" id="btnImportAppend" class="small-btn">
-              ➕ Append to Existing Traffic
+              ＋ Append to Existing Traffic
             </button>
             <button type="button" id="btnImportReplace" class="primary-btn">
-              ✅ Import &amp; Replace Scenario
+              Import &amp; Replace Scenario
             </button>
           </div>
         </div>
 
-        <!-- STEP-BY-STEP WIZARD CONTAINER (Opens when "New Plane" is clicked) -->
+        <!-- STEP-BY-STEP WIZARD CONTAINER (RareUI Step Player Header) -->
         <div id="newPlaneWizard" class="wizard-container hidden">
           <div class="wizard-top-bar">
             <div id="wizardStepPills" class="wizard-step-pills">
@@ -120,7 +257,7 @@
 
           <!-- STEP 0: ARR, DEP OR TRANSIT -->
           <div id="wizStepType" class="wizard-step-pane">
-            <div class="wizard-prompt-title">Step 1 — Select Traffic Type: Arrival, Departure, or Transit?</div>
+            <div class="wizard-prompt-title">Step 1 — Select Traffic Type</div>
             <div class="wizard-type-grid">
               <button type="button" id="wizBtnArr" class="wizard-type-card arr-card">
                 <span class="wiz-type-icon">🛬</span>
@@ -135,7 +272,7 @@
               <button type="button" id="wizBtnTrn" class="wizard-type-card trn-card">
                 <span class="wiz-type-icon">✈️</span>
                 <span class="wiz-type-name">Transit (TRN)</span>
-                <span class="wiz-type-flow">Callsign → Maintained FL → Dist → Route (WPTs + AYT VOR) → Time</span>
+                <span class="wiz-type-flow">Callsign → Maintained FL → Dist → Route → Time</span>
               </button>
             </div>
           </div>
@@ -201,7 +338,7 @@
             </div>
           </div>
 
-          <!-- STEP: FIRST REPORT DISTANCE (ARRIVAL ONLY) -->
+          <!-- STEP: FIRST REPORT DISTANCE -->
           <div id="wizStepDist" class="wizard-step-pane hidden">
             <label class="wizard-prompt-title" for="inputDist">
               Enter First Report Distance (NM)
@@ -236,31 +373,26 @@
             <div class="wizard-prompt-title" id="wizWptLabel">
               Select Waypoint / Fix (Auto Normal / Straight-In)
             </div>
-            <!-- Shown when flightType === 'TRN' -->
             <div id="transitRouteBuilder" class="transit-route-builder hidden">
               <div class="transit-route-bar">
                 <span class="route-bar-label">Selected Route:</span>
-                <div id="transitRouteChips" class="transit-route-chips">
-                  <!-- Populated by JS -->
-                </div>
+                <div id="transitRouteChips" class="transit-route-chips"></div>
                 <button type="button" id="btnResetTransitRoute" class="small-btn danger-btn">
                   ⌫ Clear Route
                 </button>
               </div>
               <div class="route-hint">
-                Click waypoints in order to build the route (e.g. <strong>Entry WPT → AYT VOR → Exit WPT</strong>). All waypoints including <strong>AYT VOR</strong> are available below.
+                Click waypoints in order to build the route (e.g. <strong>Entry WPT → AYT VOR → Exit WPT</strong>).
               </div>
             </div>
-            <div class="wpt-grid" id="wptGrid">
-              <!-- Populated by JS -->
-            </div>
+            <div class="wpt-grid" id="wptGrid"></div>
             <div class="wizard-nav-row">
               <button type="button" class="small-btn wiz-back-btn">← Back</button>
               <button type="button" id="wizWptActionBtn" class="primary-btn">Next → (Enter)</button>
             </div>
           </div>
 
-          <!-- STEP: TIME (ARR STEP 5 / DEP STEP 3) -->
+          <!-- STEP: TIME -->
           <div id="wizStepTime" class="wizard-step-pane hidden">
             <label class="wizard-prompt-title" for="inputTime" id="wizTimeLabel">
               Enter Report Time <span class="hint">(e.g. <code>01</code>, <code>05</code>, or <code>10:05</code>)</span>
@@ -282,22 +414,20 @@
             </div>
             <div class="wizard-nav-row">
               <button type="button" class="small-btn wiz-back-btn">← Back</button>
-              <button type="button" id="wizTimeActionBtn" class="primary-btn">✅ Add Arrival to Scenario (Enter)</button>
+              <button type="button" id="wizTimeActionBtn" class="primary-btn">Add Arrival to Scenario (Enter)</button>
             </div>
           </div>
 
           <!-- LIVE INSTANT RESULT BAR -->
-          <div class="live-preview" id="livePreview">
-            <!-- Populated dynamically as you step through -->
-          </div>
+          <div class="live-preview" id="livePreview"></div>
         </div>
       </section>
 
       <!-- SCENARIO CHECKPOINT SHEET -->
-      <section class="card scenario-card">
+      <section id="sectionSheet" class="card scenario-card">
         <div class="card-header scenario-header">
           <div>
-            <h2>📋 Scenario Checkpoint Sheet &amp; DME Crossing Calculator</h2>
+            <h2>Scenario Checkpoint Sheet <span id="countSheet" class="rare-count">[0]</span></h2>
             <p class="card-sub" id="scenarioSummaryText">All traffic fields are directly editable below.</p>
           </div>
           <div class="scenario-actions">
@@ -307,16 +437,31 @@
             <button type="button" id="btnSortByInit" class="small-btn" title="Sort by Initial Report time">
               Sort by Start ⇅
             </button>
-            <button type="button" id="btnClearAll" class="small-btn danger-btn">
-              🗑️ Clear
-            </button>
+
+            <!-- RareUI Delete Button (In-place lid-lift confirmation) -->
+            <div id="rareDeleteClearWrap" class="rare-delete-wrap">
+              <button type="button" id="rareDeleteTrigger" class="rare-delete-trigger" title="Clear all aircraft">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <g class="rare-trash-lid">
+                    <path d="M3 6h18"/>
+                    <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                  </g>
+                  <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+                </svg>
+                <span>Clear</span>
+              </button>
+              <div class="rare-delete-confirm-group">
+                <button type="button" id="btnClearAll" class="rare-del-yes">Confirm</button>
+                <button type="button" id="rareDeleteCancel" class="rare-del-no">Cancel</button>
+              </div>
+            </div>
           </div>
         </div>
 
-        <!-- GLOBAL QUICK DME CROSSING BAR (Syncs custom DME across all planes or edit per plane below) -->
+        <!-- GLOBAL QUICK DME CROSSING BAR -->
         <div class="dme-finder-bar">
           <div class="dme-finder-left">
-            <span class="dme-finder-title">📏 Find Crossing Time @ DME (TO / FROM AYT):</span>
+            <span class="dme-finder-title">Find Crossing Time @ DME (TO / FROM AYT):</span>
             <div class="custom-dist-wrap dme-global-wrap">
               <input type="number" id="globalQueryDmeInput" value="30" min="0" max="150" step="1" aria-label="Custom DME to query across all planes" />
               <span class="unit">NM</span>
@@ -329,7 +474,7 @@
             </div>
           </div>
           <div class="dme-finder-hint">
-            Type any distance here to set all aircraft at once, or type directly inside any aircraft's <strong>🎯 Cross @ DME</strong> box below (Transit shows both <strong>TO</strong> &amp; <strong>FROM AYT</strong>).
+            Syncs all aircraft at once, or edit any plane's <strong>Cross @ DME</strong> cell directly below.
           </div>
         </div>
 
@@ -349,23 +494,21 @@
                 <th>10 NM</th>
                 <th>AYT VOR</th>
                 <th>10 DME FIX</th>
-                <th>Min EAT (Ref)</th>
+                <th>Min EAT</th>
                 <th>Established</th>
-                <th>🎯 Cross @ DME (TO AYT)</th>
-                <th>ILS Clearance (Pick)</th>
+                <th>Cross @ DME (TO)</th>
+                <th>ILS Clearance</th>
                 <th>+Hold</th>
                 <th></th>
               </tr>
             </thead>
-            <tbody id="scenarioTableBody">
-              <!-- Populated by JS -->
-            </tbody>
+            <tbody id="scenarioTableBody"></tbody>
           </table>
         </div>
 
         <!-- DEPARTURES TABLE -->
         <div id="departuresSection" class="departures-sub-section hidden">
-          <h3 class="sub-table-title">🛫 Outbound Departures (Starts at 0 NM • 5 NM/min • MSA &lt;10 NM, MEA &lt;25 NM)</h3>
+          <h3 class="sub-table-title">Outbound Departures <span class="badge-subtle">0 NM • 5 NM/min • MSA &lt;10 / MEA &lt;25</span></h3>
           <div class="table-responsive">
             <table class="checkpoint-table dep-table">
               <thead>
@@ -378,20 +521,18 @@
                   <th>25 NM (≥MEA)</th>
                   <th>50 NM</th>
                   <th>60 NM</th>
-                  <th>🎯 Cross @ DME (FROM AYT)</th>
+                  <th>Cross @ DME (FROM)</th>
                   <th></th>
                 </tr>
               </thead>
-              <tbody id="departuresTableBody">
-                <!-- Populated by JS -->
-              </tbody>
+              <tbody id="departuresTableBody"></tbody>
             </table>
           </div>
         </div>
 
         <!-- TRANSIT TABLE -->
         <div id="transitSection" class="departures-sub-section hidden">
-          <h3 class="sub-table-title">✈️ Transit Traffic (Maintains FL • Enters via Waypoint → Routes through AYT VOR → Exits via Waypoint)</h3>
+          <h3 class="sub-table-title">Transit Traffic <span class="badge-subtle">Maintains FL • Entry → AYT VOR → Exit</span></h3>
           <div class="table-responsive">
             <table class="checkpoint-table trn-table">
               <thead>
@@ -407,76 +548,63 @@
                   <th>10 NM (FROM)</th>
                   <th>25 NM (FROM)</th>
                   <th>50 NM (FROM)</th>
-                  <th>🎯 Cross @ DME (TO &amp; FROM AYT)</th>
+                  <th>Cross @ DME (TO &amp; FROM)</th>
                   <th></th>
                 </tr>
               </thead>
-              <tbody id="transitTableBody">
-                <!-- Populated by JS -->
-              </tbody>
+              <tbody id="transitTableBody"></tbody>
             </table>
           </div>
         </div>
       </section>
 
       <!-- CONFLICT FINDER ENGINE -->
-      <section class="card solver-card">
+      <section id="sectionConflicts" class="card solver-card">
         <div class="card-header">
           <div>
-            <h2>🔍 Live Conflict Finder (Head-to-Head &lt;45°/100 NM, VOR &lt;15 DME &amp; EAT)</h2>
+            <h2>Live Conflict Finder</h2>
             <p class="card-sub">
-              Uses instantaneous <strong>cleared altitudes (teleport)</strong> for procedural conflict checks while keeping gradual climbs/descents visually — catching <strong>H2H (&lt;45° / 100 NM)</strong>, <strong>VOR &lt;15 DME</strong> (DEP↔DEP exempt), and <strong>Same Route</strong> (<strong>10 DME</strong> crossing / <strong>20 DME</strong> same alt).
+              Uses instantaneous <strong>cleared altitudes</strong> for procedural conflict checks — catching <strong>Head-to-Head (&lt;45° / 100 NM)</strong>, <strong>VOR &lt;15 DME</strong> (DEP↔DEP exempt), and <strong>Same Route</strong> (10 DME crossing / 20 DME same alt).
             </p>
           </div>
         </div>
 
         <div class="conflicts-grid">
-          <!-- PART 1: HEAD-TO-HEAD (<45° & <100 NM) CONFLICTS -->
           <div class="conflict-panel">
             <div class="panel-header">
-              <h3>⚔️ Head-to-Head (&lt;45° / 100 NM)</h3>
-              <span class="badge-subtle">Until Passing Each Other</span>
+              <h3>Head-to-Head <span id="countH2h" class="rare-count">[0]</span></h3>
+              <span class="badge-subtle">&lt;45° / 100 NM</span>
             </div>
-            <div id="depArrConflictList" class="conflict-list">
-              <!-- Populated by JS -->
-            </div>
+            <div id="depArrConflictList" class="conflict-list"></div>
           </div>
 
-          <!-- PART 2: VOR <15 DME & SAME-ROUTE CONFLICTS -->
           <div class="conflict-panel">
             <div class="panel-header">
-              <h3>🎯 VOR &lt;15 DME &amp; Same Route</h3>
-              <span class="badge-subtle">10 DME Cross / 20 DME Same Alt</span>
+              <h3>VOR &amp; Same Route <span id="countVor" class="rare-count">[0]</span></h3>
+              <span class="badge-subtle">&lt;15 DME / 10–20 DME</span>
             </div>
-            <div id="radialConflictList" class="conflict-list">
-              <!-- Populated by JS -->
-            </div>
+            <div id="radialConflictList" class="conflict-list"></div>
           </div>
 
-          <!-- PART 3: APPROACH SEQUENCE & ILS CLEARANCE -->
           <div class="conflict-panel">
             <div class="panel-header">
-              <h3>⏳ Approach Sequence &amp; ILS Clearance</h3>
-              <span class="badge-subtle">Hold Until You Clear ILS</span>
+              <h3>Approach &amp; ILS <span id="countIls" class="rare-count">[0]</span></h3>
+              <span class="badge-subtle">Hold Until Cleared</span>
             </div>
-            <div id="ilsDelayList" class="conflict-list">
-              <!-- Populated by JS -->
-            </div>
+            <div id="ilsDelayList" class="conflict-list"></div>
           </div>
         </div>
 
-        <!-- ESSENTIAL TRAFFIC INFORMATION (INFORMATIONAL — NOT CONFLICTS) -->
-        <div class="essential-traffic-section">
+        <!-- ESSENTIAL TRAFFIC INFORMATION -->
+        <div id="sectionEssential" class="essential-traffic-section">
           <div class="panel-header">
-            <h3>📡 Essential Traffic Information</h3>
-            <span class="badge-subtle badge-info-subtle">Same-Airway Head-On Pass Times (Info Only)</span>
+            <h3>Essential Traffic Information <span id="countEss" class="rare-count">[0]</span></h3>
+            <span class="badge-subtle badge-info-subtle">Same-Airway Head-On Pass Times</span>
           </div>
           <p class="essential-sub-note">
-            Opposite-direction aircraft sharing the <strong>same airway</strong> (e.g. head-on departure &amp; arrival, or reciprocal transit/arrival). Shown for traffic awareness and exact <strong>pass-over time</strong> — not necessarily a conflict.
+            Opposite-direction aircraft sharing the <strong>same airway</strong>. Shown for traffic awareness and exact <strong>pass-over time</strong> — not necessarily a conflict.
           </p>
-          <div id="essentialTrafficList" class="essential-traffic-grid">
-            <!-- Populated by JS -->
-          </div>
+          <div id="essentialTrafficList" class="essential-traffic-grid"></div>
         </div>
       </section>
     </div>
@@ -488,19 +616,19 @@
       <section class="card native-chart-card">
         <div class="card-header chart-top-header">
           <div>
-            <h2>🧊 AYT TMA 3D Chart, FL Tester &amp; Conflict Detector</h2>
+            <h2>AYT TMA 3D Chart &amp; FL Tester</h2>
             <p class="card-sub">Drag to orbit in 3D, pinch/scroll to zoom, tap any aircraft to test Flight Levels and catch <strong>VOR &lt;15 DME</strong> or <strong>Head-to-Head &lt;100 NM</strong> conflicts live.</p>
           </div>
           <div class="chart-header-right">
             <span id="liveConflictBadge" class="live-conflict-pill clear">✅ 0 Conflicts</span>
             <div class="chart-mode-toggle" role="group" aria-label="Chart Dimension Mode">
-              <button type="button" id="btnMode3d" class="mode-toggle-btn active">🧊 3D</button>
-              <button type="button" id="btnMode2d" class="mode-toggle-btn">🗺️ 2D Top</button>
+              <button type="button" id="btnMode3d" class="mode-toggle-btn active">3D Orbit</button>
+              <button type="button" id="btnMode2d" class="mode-toggle-btn">2D Top</button>
             </div>
           </div>
         </div>
 
-        <!-- TIME SCRUBBER + CONFLICT TIMELINE HEATMAP -->
+        <!-- TIME SCRUBBER (RareUI Tick-Mark Ruler + Conflict Heatmap) -->
         <div class="radar-time-bar">
           <div class="radar-time-left">
             <label for="lookupTimeInput">Time:</label>
@@ -517,38 +645,30 @@
             <div class="radar-slider-wrap">
               <input type="range" id="radarTimeSlider" min="0" max="40" step="0.2" value="0" aria-label="Scenario Time Slider" />
             </div>
-            <div id="conflictHeatmapBar" class="conflict-heatmap-bar" title="Timeline Conflict Heatmap — Red/Amber = Conflict">
-              <!-- Populated by JS -->
-            </div>
+            <div id="conflictHeatmapBar" class="conflict-heatmap-bar" title="Timeline Conflict Heatmap — Red/Amber = Conflict"></div>
           </div>
         </div>
 
         <div class="chart-and-sidebar">
-          <!-- LEFT / TOP: 3D STAGE (or 2D SVG STAGE) -->
           <div class="chart-visual-column">
             <!-- 3D INTERACTIVE CANVAS -->
             <div id="chart3dStage" class="chart-3d-stage">
               <canvas id="radar3dCanvas" aria-label="Interactive 3D AYT TMA Airspace"></canvas>
 
-              <!-- 3D Camera & Vertical Scale Controls -->
               <div class="cam-controls-overlay">
-                <button type="button" class="cam-btn active" data-cam="iso">🧊 3D Iso</button>
-                <button type="button" class="cam-btn" data-cam="top">⬆️ Top</button>
-                <button type="button" class="cam-btn" data-cam="side">📐 Low</button>
-                <button type="button" class="cam-btn" id="btnResetCam">↻</button>
+                <button type="button" class="cam-btn active" data-cam="iso">3D Iso</button>
+                <button type="button" class="cam-btn" data-cam="top">Top</button>
+                <button type="button" class="cam-btn" data-cam="side">Low</button>
+                <button type="button" class="cam-btn" id="btnResetCam" title="Reset camera">↻</button>
               </div>
 
-              <!-- Active Conflict Floating Alert inside 3D Canvas -->
               <div id="canvas3dConflictBanner" class="canvas3d-conflict-banner hidden"></div>
 
-              <!-- Bottom Hint / Selected Blip Quick Readout -->
               <div class="canvas3d-bottom-bar">
-                <span class="cam-touch-hint">Drag: Orbit • Drag tag: Move • Pinch/Wheel: Zoom • Tap: Test FL</span>
+                <span class="cam-touch-hint">1-Finger: Orbit • 2-Finger: Pan &amp; Zoom • Drag Tag: Move • Tap: Test FL</span>
                 <div class="vert-scale-toggle">
                   <button type="button" id="btnResetTags3d" class="zscale-btn" title="Reset manually moved tags">↺ Tags</button>
-                  <span style="opacity:0.4">|</span>
                   <button type="button" id="btnToggle3dPaths" class="zscale-btn" title="Toggle between Focused and All 3D Trajectory Paths">Paths: Focus</button>
-                  <span style="opacity:0.4">|</span>
                   <span>Alt Z:</span>
                   <button type="button" class="zscale-btn" data-zscale="1">1x</button>
                   <button type="button" class="zscale-btn active" data-zscale="1.5">1.5x</button>
@@ -557,132 +677,112 @@
               </div>
             </div>
 
-            <!-- 2D CLASSIC SVG CHART (Hidden by default unless toggled) -->
+            <!-- 2D CLASSIC SVG CHART -->
             <div id="chart2dStage" class="svg-chart-container hidden">
               <div class="chart2d-controls-overlay">
-                <span class="cam-touch-hint">Drag tags to move • Tap tag: Test FL</span>
-                <button type="button" class="cam-btn" id="btnResetTags2d" title="Reset manually moved 2D tags">↺ Reset Tags</button>
+                <span class="cam-touch-hint">Drag: Pan • Pinch/Scroll: Zoom • Drag tag: Move</span>
+                <button type="button" class="cam-btn" id="btnResetView2d" title="Reset 2D zoom &amp; pan">↻ View</button>
+                <button type="button" class="cam-btn" id="btnResetTags2d" title="Reset manually moved 2D tags">↺ Tags</button>
               </div>
               <svg viewBox="0 0 860 860" class="ayt-svg-chart" id="aytRadarSvg" aria-label="AYT TMA Live Radar Chart">
                 <defs>
                   <marker id="arrowRed" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-                    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#f87171" />
+                    <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#ef4444" />
                   </marker>
                   <marker id="arrowCyan" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
                     <path d="M 0 1.5 L 10 5 L 0 8.5 z" fill="#38bdf8" />
                   </marker>
                 </defs>
 
-                <!-- Distance Rings: 10 NM (r=42), 15 NM (r=63), 25 NM (r=105), 50 NM TMA (r=210), 60 NM (r=252) -->
                 <circle cx="430" cy="430" r="252" class="dme-ring-outer" />
                 <circle cx="430" cy="430" r="210" class="tma-boundary-circle" />
                 <circle cx="430" cy="430" r="105" class="dme-ring-25" />
                 <circle cx="430" cy="430" r="63" class="dme-ring-15" />
                 <circle cx="430" cy="430" r="42" class="dme-ring-10" />
 
-                <!-- Ring Labels -->
                 <text x="436" y="184" class="ring-label">60 NM</text>
                 <text x="436" y="226" class="ring-label">50 NM (TMA)</text>
                 <text x="436" y="330" class="ring-label">25 NM (MSA)</text>
                 <text x="436" y="372" class="ring-label">15 NM (VOR Sep)</text>
 
-                <!-- MSA Boxes inside TMA -->
                 <g class="msa-group">
-                  <rect x="295" y="275" width="76" height="38" rx="4" class="msa-box" />
+                  <rect x="295" y="275" width="76" height="38" rx="6" class="msa-box" />
                   <text x="333" y="291" class="msa-title">MSA (NW)</text>
                   <text x="333" y="306" class="msa-val">10,000'</text>
 
-                  <rect x="502" y="295" width="76" height="38" rx="4" class="msa-box" />
+                  <rect x="502" y="295" width="76" height="38" rx="6" class="msa-box" />
                   <text x="540" y="311" class="msa-title">MSA (NE)</text>
                   <text x="540" y="326" class="msa-val">9,000'</text>
 
-                  <rect x="480" y="505" width="76" height="38" rx="4" class="msa-box" />
+                  <rect x="480" y="505" width="76" height="38" rx="6" class="msa-box" />
                   <text x="518" y="521" class="msa-title">MSA (SE)</text>
                   <text x="518" y="536" class="msa-val">3,000'</text>
 
-                  <rect x="285" y="485" width="76" height="38" rx="4" class="msa-box" />
+                  <rect x="285" y="485" width="76" height="38" rx="6" class="msa-box" />
                   <text x="323" y="501" class="msa-title">MSA (W/SW)</text>
                   <text x="323" y="516" class="msa-val">12,000'</text>
                 </g>
 
-                <!-- Static Airway Corridors Group -->
                 <g id="svgCorridorsLayer"></g>
 
-                <!-- 10 DME FIX Hold & KNK FIX Hold -->
                 <g class="holds-layer">
                   <polygon points="437,466 432,476 442,476" class="wpt-triangle-fix" />
                   <text x="478" y="474" class="chart-fix-label">10 DME FIX</text>
                   <rect x="437" y="471" width="18" height="38" rx="9" class="hold-racetrack-red" />
                   <text x="492" y="492" class="chart-hold-min">1 dk</text>
 
-                  <circle cx="485" cy="430" r="3.5" fill="#38bdf8" />
+                  <circle cx="485" cy="430" r="3.5" fill="#fc4c01" />
                   <text x="488" y="420" class="chart-fix-label">KNK FIX</text>
                   <rect x="485" y="430" width="38" height="16" rx="8" class="hold-racetrack" />
                 </g>
 
-                <!-- CENTER: AYT VOR (430, 430) -->
                 <g class="vor-center">
-                  <rect x="420" y="420" width="20" height="20" fill="#0b111e" stroke="#38bdf8" stroke-width="2" />
-                  <polygon points="430,423 422,436 438,436" fill="none" stroke="#38bdf8" stroke-width="1.6" />
-                  <circle cx="430" cy="431" r="2" fill="#38bdf8" />
+                  <rect x="420" y="420" width="20" height="20" rx="6" fill="#09090b" stroke="#fc4c01" stroke-width="2" />
+                  <polygon points="430,424 423,435 437,435" fill="none" stroke="#fc4c01" stroke-width="1.6" />
+                  <circle cx="430" cy="431" r="2" fill="#fc4c01" />
                   <text x="396" y="454" class="vor-label">AYT VOR</text>
                 </g>
 
-                <!-- DYNAMIC AIRCRAFT BLIPS LAYER -->
                 <g id="svgBlipsLayer"></g>
               </svg>
             </div>
           </div>
 
-          <!-- RIGHT / BOTTOM: INTERACTIVE FL TESTER + LIVE CONFLICTS + TRAFFIC STATUS -->
+          <!-- RIGHT SIDEBAR -->
           <div class="radar-sidebar">
-            <!-- A. FLIGHT LEVEL TESTER (SOLVE & TEST CLEARANCES) -->
             <div class="fl-tester-section">
               <div class="fl-tester-header">
-                <h3>🧪 Test Flight Levels</h3>
+                <h3>Test Flight Levels</h3>
                 <button type="button" id="btnResetAllTestFl" class="small-btn" title="Reset all aircraft back to Auto / Original FLs">
                   ↺ Reset All FLs
                 </button>
               </div>
-              <div id="flTesterPlanePills" class="fl-plane-pills">
-                <!-- Populated by JS -->
-              </div>
-              <div id="flTesterEditor" class="fl-tester-editor">
-                <!-- Populated by JS -->
-              </div>
+              <div id="flTesterPlanePills" class="fl-plane-pills"></div>
+              <div id="flTesterEditor" class="fl-tester-editor"></div>
             </div>
 
-            <!-- B. LIVE CONFLICT DETECTOR FEED -->
             <div class="chart-conflicts-section">
               <div class="fl-tester-header">
-                <h3>🚨 Conflict Detector</h3>
+                <h3>Conflict Detector</h3>
                 <div class="conflict-scope-tabs">
                   <button type="button" class="scope-tab active" data-scope="all" id="btnScopeAll">All</button>
                   <button type="button" class="scope-tab" data-scope="now" id="btnScopeNow">@ Time T</button>
                 </div>
               </div>
-              <div id="chartConflictFeed" class="chart-conflict-feed">
-                <!-- Populated by JS -->
-              </div>
+              <div id="chartConflictFeed" class="chart-conflict-feed"></div>
             </div>
 
-            <!-- B2. ESSENTIAL TRAFFIC INFORMATION (SAME-AIRWAY HEAD-ON PASS TIMES) -->
             <div class="chart-essential-section">
               <div class="fl-tester-header">
-                <h3>📡 Essential Traffic</h3>
+                <h3>Essential Traffic</h3>
                 <span class="badge-subtle badge-info-subtle">Pass Times</span>
               </div>
-              <div id="chartEssentialTrafficList" class="chart-essential-list">
-                <!-- Populated by JS -->
-              </div>
+              <div id="chartEssentialTrafficList" class="chart-essential-list"></div>
             </div>
 
-            <!-- C. TRAFFIC SNAPSHOT AT TIME T -->
             <div class="snapshot-section">
-              <h3>✈️ Traffic @ <code id="sidebarTimeLabel">:00</code></h3>
-              <div id="positionSnapshotList" class="snapshot-list">
-                <!-- Populated by JS -->
-              </div>
+              <h3>Traffic @ <code id="sidebarTimeLabel">:00</code></h3>
+              <div id="positionSnapshotList" class="snapshot-list"></div>
             </div>
           </div>
         </div>
@@ -690,11 +790,30 @@
     </div>
   </main>
 
-  <!-- SEPARATION METHOD CONFIRMATION MODAL -->
+  <!-- RARE UI FLOATING SCROLL PROGRESS PILL -->
+  <nav id="rareScrollPill" class="rare-scroll-pill" aria-label="Quick section navigation">
+    <span class="rare-scroll-ring" aria-hidden="true">
+      <svg width="22" height="22" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="9" fill="none" stroke="var(--border-strong)" stroke-width="2.2" />
+        <circle id="rareScrollRingProgress" cx="12" cy="12" r="9" fill="none" stroke="var(--rare-orange)" stroke-width="2.2" stroke-linecap="round" transform="rotate(-90 12 12)" />
+      </svg>
+    </span>
+    <button type="button" class="rare-scroll-link" data-scroll-target="sectionEntry">Entry</button>
+    <button type="button" class="rare-scroll-link" data-scroll-target="sectionSheet">Sheet</button>
+    <button type="button" class="rare-scroll-link" data-scroll-target="sectionConflicts">Conflicts</button>
+    <button type="button" class="rare-scroll-link" data-scroll-target="sectionEssential">Essential</button>
+  </nav>
+
+  <!-- FOOTER -->
+  <footer class="rare-footer">
+    <span>AYT TMA Radarless Approach Calculator &amp; 4D Conflict Finder</span>
+  </footer>
+
+  <!-- SEPARATION METHOD CONFIRMATION MODAL (RareUI Squircle + Task-List Options) -->
   <div id="confirmSepModal" class="confirm-sep-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="confirmSepTitle">
     <div class="confirm-sep-dialog">
       <div class="confirm-sep-head">
-        <h3 id="confirmSepTitle">✓ Confirm Alternate Separation Method</h3>
+        <h3 id="confirmSepTitle">Confirm Alternate Separation</h3>
         <button type="button" id="btnCloseConfirmSep" class="icon-close-btn" title="Close">✕</button>
       </div>
       <p id="confirmSepDesc" class="confirm-sep-desc"></p>
@@ -702,11 +821,12 @@
       <div id="confirmSepMethods" class="confirm-sep-methods"></div>
       <div class="confirm-sep-actions">
         <button type="button" id="btnCancelConfirmSep" class="small-btn">Cancel</button>
-        <button type="button" id="btnDoConfirmSep" class="primary-btn">✓ Yes, Separated — Remove Conflict</button>
+        <button type="button" id="btnDoConfirmSep" class="primary-btn">Confirm Separated</button>
       </div>
     </div>
   </div>
 
-  <script src="app.js?v=20261123b"></script>
+  <script src="rareui.js?v=20261123r2"></script>
+  <script src="app.js?v=20261123r4"></script>
 </body>
 </html>

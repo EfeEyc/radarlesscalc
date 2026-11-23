@@ -532,6 +532,11 @@ const state = {
     altScale: 1.5,
     showAllPaths: false,
   },
+  view2d: {
+    zoom: 1.0,
+    panX: 0,
+    panY: 0,
+  },
   projectedBlips3d: [], // Hitboxes from last 3D render
   projectedBlips2d: [], // Hitboxes from last 2D render
   tagOffsets3d: {}, // acftId -> { dx, dy } user-dragged offset in 3D canvas CSS px
@@ -3612,6 +3617,9 @@ function jumpChartToTime(normMins, solverHint = null) {
     });
     if (viewCalc) viewCalc.classList.add("hidden");
     if (viewChart) viewChart.classList.remove("hidden");
+    if (window.RareUI && typeof window.RareUI.syncGooeyNavs === "function") {
+      window.RareUI.syncGooeyNavs();
+    }
   }
 
   requestAnimationFrame(() => renderRadarChartView(solver));
@@ -4004,6 +4012,11 @@ function renderConflictPanels(solver) {
   // 4. Essential Traffic Information (Informational — Same-Airway Head-On Pass Times)
   const essListEl = document.getElementById("essentialTrafficList");
   renderEssentialTrafficList(solver.essentialTraffic || [], essListEl, solver, false);
+
+  // Sync RareUI Animated Counters, [N] brackets & Notification Bell
+  if (window.RareUI && typeof window.RareUI.syncMetrics === "function") {
+    window.RareUI.syncMetrics(solver);
+  }
 }
 
 // ============================================================================
@@ -4493,15 +4506,15 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
     else ctx.lineTo(p.x, p.y);
   }
   ctx.closePath();
-  ctx.fillStyle = "rgba(22, 40, 74, 0.28)";
+  ctx.fillStyle = "rgba(255, 255, 255, 0.028)";
   ctx.fill();
   ctx.restore();
 
-  // Floor DME Rings (subtle & clear)
-  drawCircle3d(60, 0, "rgba(71, 104, 158, 0.16)", 1, [4, 6]);
-  drawCircle3d(50, 0, "rgba(96, 138, 204, 0.55)", 1.6, []);
-  drawCircle3d(25, 0, "rgba(56, 189, 248, 0.24)", 1, [5, 5]);
-  drawCircle3d(10, 0, "rgba(52, 211, 153, 0.18)", 1, [2, 4]);
+  // Floor DME Rings (RareUI monochrome matte + International Orange TMA rim)
+  drawCircle3d(60, 0, "rgba(255, 255, 255, 0.08)", 1, [4, 6]);
+  drawCircle3d(50, 0, "rgba(252, 76, 1, 0.48)", 1.6, []);
+  drawCircle3d(25, 0, "rgba(255, 255, 255, 0.18)", 1, [5, 5]);
+  drawCircle3d(10, 0, "rgba(255, 255, 255, 0.12)", 1, [2, 4]);
 
   // 2. 15 DME VOR SEPARATION CYLINDER
   // Clean & unobtrusive when clear; glows crimson when a BOTH <15 DME conflict happens at T!
@@ -4591,7 +4604,7 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
     const sTma = project(pTma.xNm, pTma.yNm, 0);
     const sCtr = project(0, 0, 0);
 
-    ctx.strokeStyle = "rgba(148, 163, 184, 0.18)";
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.11)";
     ctx.lineWidth = 1;
     ctx.setLineDash([4, 4]);
     ctx.beginPath();
@@ -4599,7 +4612,7 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
     ctx.lineTo(sTma.x, sTma.y);
     ctx.stroke();
 
-    ctx.strokeStyle = "rgba(148, 163, 184, 0.24)";
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.16)";
     ctx.lineWidth = 1.1;
     ctx.setLineDash([5, 5]);
     ctx.beginPath();
@@ -4608,27 +4621,28 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
     ctx.stroke();
     ctx.setLineDash([]);
 
-    ctx.fillStyle = "rgba(56, 189, 248, 0.72)";
+    ctx.fillStyle = "rgba(252, 76, 1, 0.85)";
     ctx.beginPath();
-    ctx.arc(sTma.x, sTma.y, 2.8, 0, Math.PI * 2);
+    ctx.arc(sTma.x, sTma.y, 3, 0, Math.PI * 2);
     ctx.fill();
 
     const pLbl = polarToNm(56, wpt.deg);
     const sLbl = project(pLbl.xNm, pLbl.yNm, 0);
-    ctx.fillStyle = "rgba(226, 232, 240, 0.72)";
+    ctx.fillStyle = "rgba(229, 229, 229, 0.72)";
     ctx.font = "700 9px JetBrains Mono, monospace";
     ctx.textAlign = "center";
     ctx.fillText(`${wpt.name}`, sLbl.x, sLbl.y + 3);
   });
 
-  // 4. Center AYT VOR Marker + Outer Rim Altitude Scale Post (kept clear of center!)
+  // 4. Center AYT VOR Marker (Rounded Squircle in RareUI Orange) + Outer Rim Altitude Scale Post
   const sVor = project(0, 0, 0);
-  ctx.fillStyle = "#38bdf8";
-  ctx.strokeStyle = "rgba(56, 189, 248, 0.75)";
+  ctx.fillStyle = "#fc4c01";
+  ctx.strokeStyle = "rgba(252, 76, 1, 0.85)";
   ctx.lineWidth = 1.6;
-  ctx.strokeRect(sVor.x - 4.5, sVor.y - 4.5, 9, 9);
+  roundRectPath(ctx, sVor.x - 5, sVor.y - 5, 10, 10, 3.5);
+  ctx.stroke();
   ctx.beginPath();
-  ctx.arc(sVor.x, sVor.y, 2, 0, Math.PI * 2);
+  ctx.arc(sVor.x, sVor.y, 2.2, 0, Math.PI * 2);
   ctx.fill();
 
   if (cosPhi > 0.14) {
@@ -4637,7 +4651,7 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
     const rimY = 52 * sinYaw;
     const sPoleBot = project(rimX, rimY, 0);
     const sPoleTop = project(rimX, rimY, 36000);
-    ctx.strokeStyle = "rgba(148, 163, 184, 0.28)";
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.22)";
     ctx.lineWidth = 1;
     ctx.setLineDash([2, 3]);
     ctx.beginPath();
@@ -4648,12 +4662,12 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
 
     [10000, 20000, 30000].forEach((alt) => {
       const pTick = project(rimX, rimY, alt);
-      ctx.fillStyle = "rgba(148, 163, 184, 0.78)";
+      ctx.fillStyle = "rgba(163, 163, 163, 0.85)";
       ctx.font = "700 9px JetBrains Mono, monospace";
       ctx.textAlign = "right";
       ctx.fillText(`FL${alt / 100}`, pTick.x - 5, pTick.y + 3);
-      ctx.fillStyle = "rgba(56, 189, 248, 0.55)";
-      ctx.fillRect(pTick.x - 2, pTick.y - 0.5, 5, 1);
+      ctx.fillStyle = "rgba(252, 76, 1, 0.72)";
+      ctx.fillRect(pTick.x - 2, pTick.y - 0.5, 5, 1.2);
     });
   }
 
@@ -4853,11 +4867,11 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
         ? `🎯 VOR <15 DME`
         : `📏 ${d.conflict.dmeDiff ?? d.distNm} NM (<${d.conflict.reqDmeMin || 20})`;
       ctx.font = "800 10px JetBrains Mono, monospace";
-      const tw = ctx.measureText(lbl).width + 12;
+      const tw = ctx.measureText(lbl).width + 16;
       ctx.fillStyle = isH2h ? "rgba(127, 29, 29, 0.92)" : "rgba(120, 53, 15, 0.92)";
       ctx.strokeStyle = beamColor;
       ctx.lineWidth = 1.2;
-      roundRectPath(ctx, mx - tw / 2, my - 9, tw, 18, 5);
+      roundRectPath(ctx, mx - tw / 2, my - 10, tw, 20, 10);
       ctx.fill();
       ctx.stroke();
       ctx.fillStyle = "#fff";
@@ -4920,28 +4934,33 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
         ctx.translate(proj3d.x, proj3d.y);
         ctx.rotate(angle);
         ctx.fillStyle = blipColor;
-        ctx.strokeStyle = "#0b111e";
-        ctx.lineWidth = Math.max(0.9, 1.4 * dScale);
+        ctx.strokeStyle = "#111111";
+        ctx.lineWidth = Math.max(1.2, 1.8 * dScale);
+        ctx.lineJoin = "round";
+        ctx.lineCap = "round";
+        // Rounded RareUI-style directional teardrop / soft chevron blip
         ctx.beginPath();
-        ctx.moveTo(9.5 * dScale, 0);
-        ctx.lineTo(-6.2 * dScale, -5.8 * dScale);
-        ctx.lineTo(-3.1 * dScale, 0);
-        ctx.lineTo(-6.2 * dScale, 5.8 * dScale);
+        ctx.moveTo(8.2 * dScale, -1.3 * dScale);
+        ctx.quadraticCurveTo(10.2 * dScale, 0, 8.2 * dScale, 1.3 * dScale);
+        ctx.lineTo(-3.8 * dScale, 5.8 * dScale);
+        ctx.quadraticCurveTo(-6.6 * dScale, 6.6 * dScale, -5.6 * dScale, 3.6 * dScale);
+        ctx.quadraticCurveTo(-3.8 * dScale, 0, -5.6 * dScale, -3.6 * dScale);
+        ctx.quadraticCurveTo(-6.6 * dScale, -6.6 * dScale, -3.8 * dScale, -5.8 * dScale);
         ctx.closePath();
         ctx.fill();
         ctx.stroke();
         ctx.restore();
       } else {
-        const halfSq = 5.5 * dScale;
+        const rad = 5.5 * dScale;
         ctx.save();
         ctx.globalAlpha = isSelected ? 1 : depthAlpha;
-        ctx.translate(proj3d.x, proj3d.y);
-        ctx.rotate(Math.PI / 4);
-        ctx.fillStyle = "#0b111e";
+        ctx.fillStyle = "#111111";
         ctx.strokeStyle = blipColor;
         ctx.lineWidth = Math.max(1.5, 2.3 * dScale);
-        ctx.fillRect(-halfSq, -halfSq, halfSq * 2, halfSq * 2);
-        ctx.strokeRect(-halfSq, -halfSq, halfSq * 2, halfSq * 2);
+        ctx.beginPath();
+        ctx.arc(proj3d.x, proj3d.y, rad, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
         ctx.restore();
       }
 
@@ -4958,9 +4977,9 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
       const w1 = ctx.measureText(line1).width;
       ctx.font = `700 ${f2Px}px JetBrains Mono, monospace`;
       const w2 = ctx.measureText(line2).width;
-      const padH = Math.round(5.5 * fScale);
+      const padH = Math.round(8 * fScale);
       const tagW = Math.round(Math.max(w1, w2) + padH * 2);
-      const tagH = Math.round(28 * fScale);
+      const tagH = Math.round(30 * fScale);
       const dxC = proj3d.x - centerX;
       const dyC = proj3d.y - centerY;
       const pushOutX = dxC >= 0 ? 16 : -(tagW + 16);
@@ -5015,20 +5034,20 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
     ctx.stroke();
 
     ctx.globalAlpha = lbl.alpha;
-    ctx.fillStyle = lbl.isSelected ? "rgba(30, 58, 138, 0.94)" : "rgba(9, 14, 26, 0.9)";
-    ctx.strokeStyle = lbl.blipColor;
-    ctx.lineWidth = lbl.isSelected ? 1.8 : 1.1;
-    roundRectPath(ctx, lbl.tx, lbl.ty, lbl.tw, lbl.th, 5);
+    ctx.fillStyle = lbl.isSelected ? "rgba(38, 17, 9, 0.95)" : "rgba(17, 17, 17, 0.92)";
+    ctx.strokeStyle = lbl.isSelected ? "#fc4c01" : lbl.blipColor;
+    ctx.lineWidth = lbl.isSelected ? 1.8 : 1.15;
+    roundRectPath(ctx, lbl.tx, lbl.ty, lbl.tw, lbl.th, 10);
     ctx.fill();
     ctx.stroke();
 
-    ctx.fillStyle = lbl.blipColor;
+    ctx.fillStyle = lbl.isSelected ? "#ffffff" : lbl.blipColor;
     ctx.font = `800 ${lbl.f1Px}px JetBrains Mono, monospace`;
     ctx.textAlign = "left";
-    ctx.fillText(lbl.line1, lbl.tx + lbl.padH, lbl.ty + Math.round(lbl.th * 0.43));
-    ctx.fillStyle = "#e2e8f0";
+    ctx.fillText(lbl.line1, lbl.tx + lbl.padH, lbl.ty + Math.round(lbl.th * 0.44));
+    ctx.fillStyle = "#a3a3a3";
     ctx.font = `700 ${lbl.f2Px}px JetBrains Mono, monospace`;
-    ctx.fillText(lbl.line2, lbl.tx + lbl.padH, lbl.ty + Math.round(lbl.th * 0.83));
+    ctx.fillText(lbl.line2, lbl.tx + lbl.padH, lbl.ty + Math.round(lbl.th * 0.82));
     ctx.restore();
 
     projectedBlips3d.push({
@@ -5809,7 +5828,7 @@ function render2dSvgRadar(solver, queryNorm, activeNowConflicts = []) {
       <line x1="${st.x}" y1="${st.y}" x2="${tag.anchorX}" y2="${tag.anchorY}" stroke="${blipColor}" stroke-width="1.5" opacity="0.9" />
       <circle cx="${tag.anchorX}" cy="${tag.anchorY}" r="2.2" fill="${blipColor}" />
       <line x1="${st.x}" y1="${st.y}" x2="${st.tipX}" y2="${st.tipY}" stroke="${blipColor}" stroke-width="2.2" />
-      <rect x="${st.x - 5}" y="${st.y - 5}" width="10" height="10" fill="#0b111e" stroke="${blipColor}" stroke-width="2.2" transform="rotate(45 ${st.x} ${st.y})" />
+      <rect x="${st.x - 5}" y="${st.y - 5}" width="10" height="10" rx="3" fill="#0a0a0a" stroke="${blipColor}" stroke-width="2.2" transform="rotate(45 ${st.x} ${st.y})" />
       <circle cx="${st.x}" cy="${st.y}" r="2" fill="${blipColor}" />
     `;
     blipsLayer.appendChild(g);
@@ -5822,31 +5841,68 @@ function render2dSvgRadar(solver, queryNorm, activeNowConflicts = []) {
     g.setAttribute("class", `svg-draggable-tag${isSel ? " selected" : ""}`);
     g.setAttribute("data-tag2d-id", String(item.acft.id));
     g.innerHTML = `
-      <rect x="${tag.tx}" y="${tag.ty}" width="${tag.w}" height="${tag.h}" class="blip-tag-bg" stroke="${isSel ? "#ffffff" : blipColor}" stroke-width="${isSel ? "2" : "1.2"}" />
-      <text x="${tag.tx + 5}" y="${tag.ty + 12}" class="blip-tag-title" fill="${blipColor}">${item.acft.callsign}</text>
-      <text x="${tag.tx + 5}" y="${tag.ty + 24}" class="blip-tag-sub">${st.altStr} • ${st.dme}NM</text>
+      <rect x="${tag.tx}" y="${tag.ty}" width="${tag.w}" height="${tag.h}" rx="10" ry="10" class="blip-tag-bg" stroke="${isSel ? "#fc4c01" : blipColor}" stroke-width="${isSel ? "2" : "1.2"}" />
+      <text x="${tag.tx + 7}" y="${tag.ty + 12}" class="blip-tag-title" fill="${isSel ? "#ffffff" : blipColor}">${item.acft.callsign}</text>
+      <text x="${tag.tx + 7}" y="${tag.ty + 24}" class="blip-tag-sub">${st.altStr} • ${st.dme}NM</text>
     `;
     blipsLayer.appendChild(g);
   });
 }
 
-// Wire up 2D SVG Draggable Tags (Mouse + Touch) and Tap-to-Select
+// Wire up 2D SVG Pan, Pinch/Wheel Zoom, Draggable Tags (Mouse + Touch), and Tap-to-Select
 function setup2dSvgInteractions() {
   const svg = document.getElementById("aytRadarSvg");
   if (!svg) return;
 
-  let activePtrId = null;
+  const activePointers = new Map();
   let dragTagId = null;
   let grabOffX = 0;
   let grabOffY = 0;
   let startClient = null;
   let hasDragged = false;
+  let lastPinchDist = null;
+  let lastPinchMid = null;
+
+  function getViewBox2d() {
+    const v = state.view2d || { zoom: 1, panX: 0, panY: 0 };
+    const zoom = Math.max(0.65, Math.min(4.5, v.zoom || 1));
+    const vbW = 860 / zoom;
+    const vbH = 860 / zoom;
+    const maxPan = 420;
+    const panX = Math.max(-maxPan, Math.min(maxPan, v.panX || 0));
+    const panY = Math.max(-maxPan, Math.min(maxPan, v.panY || 0));
+    v.zoom = zoom;
+    v.panX = panX;
+    v.panY = panY;
+    return {
+      x: 430 - vbW / 2 - panX,
+      y: 430 - vbH / 2 - panY,
+      w: vbW,
+      h: vbH,
+      zoom,
+    };
+  }
+
+  function applyViewBox2d() {
+    const vb = getViewBox2d();
+    svg.setAttribute(
+      "viewBox",
+      `${vb.x.toFixed(2)} ${vb.y.toFixed(2)} ${vb.w.toFixed(2)} ${vb.h.toFixed(2)}`
+    );
+  }
 
   function clientToSvg(clientX, clientY) {
     const rect = svg.getBoundingClientRect();
+    const vb = getViewBox2d();
+    // Preserve aspect ratio (meet) centering offset
+    const scale = Math.min((rect.width || 860) / vb.w, (rect.height || 860) / vb.h);
+    const renderedW = vb.w * scale;
+    const renderedH = vb.h * scale;
+    const offX = rect.left + ((rect.width || 860) - renderedW) / 2;
+    const offY = rect.top + ((rect.height || 860) - renderedH) / 2;
     return {
-      x: ((clientX - rect.left) / (rect.width || 860)) * 860,
-      y: ((clientY - rect.top) / (rect.height || 860)) * 860,
+      x: vb.x + (clientX - offX) / (scale || 1),
+      y: vb.y + (clientY - offY) / (scale || 1),
     };
   }
 
@@ -5855,52 +5911,121 @@ function setup2dSvgInteractions() {
     renderRadarChartOnlyVisuals(solver);
   }
 
-  svg.addEventListener("pointerdown", (e) => {
-    const tagGroup = e.target.closest("[data-tag2d-id]");
-    if (!tagGroup) return;
-    const id = Number(tagGroup.getAttribute("data-tag2d-id"));
-    const blip = (state.projectedBlips2d || []).find((b) => b.id === id);
-    if (!blip) return;
+  applyViewBox2d();
 
+  const btnResetView2d = document.getElementById("btnResetView2d");
+  if (btnResetView2d) {
+    btnResetView2d.addEventListener("click", () => {
+      state.view2d = { zoom: 1.0, panX: 0, panY: 0 };
+      applyViewBox2d();
+    });
+  }
+
+  svg.addEventListener("pointerdown", (e) => {
     e.preventDefault();
     svg.setPointerCapture(e.pointerId);
-    const pt = clientToSvg(e.clientX, e.clientY);
-    activePtrId = e.pointerId;
-    dragTagId = id;
-    grabOffX = pt.x - blip.tx;
-    grabOffY = pt.y - blip.ty;
-    startClient = { x: e.clientX, y: e.clientY };
-    hasDragged = false;
-    state.draggingTagId2d = id;
-    svg.classList.add("dragging-tag");
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (activePointers.size === 1) {
+      startClient = { x: e.clientX, y: e.clientY };
+      hasDragged = false;
+      lastPinchDist = null;
+      lastPinchMid = null;
+
+      const tagGroup = e.target.closest("[data-tag2d-id]");
+      if (tagGroup) {
+        const id = Number(tagGroup.getAttribute("data-tag2d-id"));
+        const blip = (state.projectedBlips2d || []).find((b) => b.id === id);
+        if (blip) {
+          const pt = clientToSvg(e.clientX, e.clientY);
+          dragTagId = id;
+          grabOffX = pt.x - blip.tx;
+          grabOffY = pt.y - blip.ty;
+          state.draggingTagId2d = id;
+          svg.classList.add("dragging-tag");
+          return;
+        }
+      }
+      dragTagId = null;
+      state.draggingTagId2d = null;
+    } else if (activePointers.size === 2) {
+      dragTagId = null;
+      state.draggingTagId2d = null;
+      svg.classList.remove("dragging-tag");
+      const pts = Array.from(activePointers.values());
+      lastPinchDist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      lastPinchMid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+      hasDragged = true;
+    }
   });
 
   svg.addEventListener("pointermove", (e) => {
-    if (activePtrId !== e.pointerId || dragTagId === null) return;
-    if (startClient && Math.hypot(e.clientX - startClient.x, e.clientY - startClient.y) > 4) {
-      hasDragged = true;
-    }
-    if (!hasDragged) return;
+    const prev = activePointers.get(e.pointerId);
+    if (!prev) return;
+    const dx = e.clientX - prev.x;
+    const dy = e.clientY - prev.y;
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
-    const blip = (state.projectedBlips2d || []).find((b) => b.id === dragTagId);
-    if (!blip) return;
-    const pt = clientToSvg(e.clientX, e.clientY);
-    const newTx = Math.max(10, Math.min(850 - blip.w, pt.x - grabOffX));
-    const newTy = Math.max(10, Math.min(850 - blip.h, pt.y - grabOffY));
-    state.tagOffsets2d[dragTagId] = {
-      dx: +(newTx - blip.bx).toFixed(1),
-      dy: +(newTy - blip.by).toFixed(1),
-    };
-    redraw2d();
+    if (activePointers.size === 1) {
+      if (startClient && Math.hypot(e.clientX - startClient.x, e.clientY - startClient.y) > 4) {
+        hasDragged = true;
+      }
+      if (!hasDragged) return;
+
+      if (dragTagId !== null) {
+        const blip = (state.projectedBlips2d || []).find((b) => b.id === dragTagId);
+        if (!blip) return;
+        const pt = clientToSvg(e.clientX, e.clientY);
+        const newTx = Math.max(10, Math.min(850 - blip.w, pt.x - grabOffX));
+        const newTy = Math.max(10, Math.min(850 - blip.h, pt.y - grabOffY));
+        state.tagOffsets2d[dragTagId] = {
+          dx: +(newTx - blip.bx).toFixed(1),
+          dy: +(newTy - blip.by).toFixed(1),
+        };
+        redraw2d();
+      } else {
+        // 1-finger / mouse drag pans the 2D chart smoothly
+        const rect = svg.getBoundingClientRect();
+        const vb = getViewBox2d();
+        const scale = Math.min((rect.width || 860) / vb.w, (rect.height || 860) / vb.h) || 1;
+        state.view2d.panX += dx / scale;
+        state.view2d.panY += dy / scale;
+        applyViewBox2d();
+      }
+    } else if (activePointers.size === 2) {
+      const pts = Array.from(activePointers.values());
+      const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      const mid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+      const rect = svg.getBoundingClientRect();
+      const vbBefore = getViewBox2d();
+      const scaleBefore = Math.min((rect.width || 860) / vbBefore.w, (rect.height || 860) / vbBefore.h) || 1;
+
+      if (lastPinchMid) {
+        state.view2d.panX += (mid.x - lastPinchMid.x) / scaleBefore;
+        state.view2d.panY += (mid.y - lastPinchMid.y) / scaleBefore;
+      }
+      if (lastPinchDist && dist > 10) {
+        const factor = dist / lastPinchDist;
+        state.view2d.zoom = Math.max(0.65, Math.min(4.5, state.view2d.zoom * factor));
+      }
+      lastPinchDist = dist;
+      lastPinchMid = mid;
+      applyViewBox2d();
+    }
   });
 
   const end2d = (e) => {
-    if (activePtrId !== e.pointerId) return;
-    const tappedId = !hasDragged ? dragTagId : null;
-    activePtrId = null;
-    dragTagId = null;
-    state.draggingTagId2d = null;
-    svg.classList.remove("dragging-tag");
+    const tappedId = activePointers.size === 1 && !hasDragged ? dragTagId : null;
+    activePointers.delete(e.pointerId);
+    if (activePointers.size < 2) {
+      lastPinchDist = null;
+      lastPinchMid = null;
+    }
+    if (activePointers.size === 0) {
+      dragTagId = null;
+      state.draggingTagId2d = null;
+      svg.classList.remove("dragging-tag");
+    }
     if (tappedId !== null) {
       state.selectedTestAcftId = tappedId;
       const solver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
@@ -5910,15 +6035,33 @@ function setup2dSvgInteractions() {
 
   svg.addEventListener("pointerup", end2d);
   svg.addEventListener("pointercancel", end2d);
+
+  svg.addEventListener(
+    "wheel",
+    (e) => {
+      e.preventDefault();
+      const before = clientToSvg(e.clientX, e.clientY);
+      const factor = e.deltaY < 0 ? 1.12 : 0.89;
+      state.view2d.zoom = Math.max(0.65, Math.min(4.5, state.view2d.zoom * factor));
+      applyViewBox2d();
+      const after = clientToSvg(e.clientX, e.clientY);
+      state.view2d.panX += after.x - before.x;
+      state.view2d.panY += after.y - before.y;
+      applyViewBox2d();
+    },
+    { passive: false }
+  );
 }
 
-// Wire up 3D Touch/Mouse Orbit, Pinch Zoom, Draggable Tags, and Tap-to-Select Plane
+// Wire up 3D Touch/Mouse Orbit, 2-Finger Touch Pan & Pinch Zoom, Draggable Tags, and Tap-to-Select Plane
 function setup3dCanvasInteractions() {
   const canvas = document.getElementById("radar3dCanvas");
   if (!canvas) return;
 
   const activePointers = new Map();
   let lastPinchDist = null;
+  let lastPinchMid = null;
+  let isDesktopPan = false;
   let dragStartPos = null;
   let hasDragged = false;
   let tagDragCtx = null; // { id, grabOffX, grabOffY, sx, sy, tw, th }
@@ -5968,6 +6111,8 @@ function setup3dCanvasInteractions() {
     }
   }
 
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
   canvas.addEventListener("pointerdown", (e) => {
     canvas.setPointerCapture(e.pointerId);
     activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -5975,7 +6120,9 @@ function setup3dCanvasInteractions() {
       dragStartPos = { x: e.clientX, y: e.clientY };
       hasDragged = false;
       lastPinchDist = null;
-      const hitTag = findTagAt(e.clientX, e.clientY);
+      lastPinchMid = null;
+      isDesktopPan = e.button === 1 || e.button === 2 || e.shiftKey;
+      const hitTag = !isDesktopPan ? findTagAt(e.clientX, e.clientY) : null;
       if (hitTag) {
         tagDragCtx = {
           id: hitTag.b.id,
@@ -5995,8 +6142,10 @@ function setup3dCanvasInteractions() {
     } else if (activePointers.size === 2) {
       tagDragCtx = null;
       state.draggingTagId3d = null;
+      isDesktopPan = false;
       const pts = Array.from(activePointers.values());
       lastPinchDist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      lastPinchMid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
       hasDragged = true;
     }
   });
@@ -6030,6 +6179,10 @@ function setup3dCanvasInteractions() {
           dy: +(newTy - tagDragCtx.sy).toFixed(1),
         };
         redrawOnly3d();
+      } else if (hasDragged && isDesktopPan) {
+        state.cam.panX = Math.max(-420, Math.min(420, (state.cam.panX || 0) + dx));
+        state.cam.panY = Math.max(-420, Math.min(420, (state.cam.panY || 0) + dy));
+        redrawOnly3d();
       } else if (hasDragged) {
         state.cam.yawDeg = (state.cam.yawDeg - dx * 0.42 + 360) % 360;
         state.cam.pitchDeg = Math.max(8, Math.min(89.5, state.cam.pitchDeg + dy * 0.35));
@@ -6037,23 +6190,42 @@ function setup3dCanvasInteractions() {
         redrawOnly3d();
       }
     } else if (activePointers.size === 2) {
+      // 2-finger mobile touch gesture: simultaneous pan + pinch-to-zoom!
       const pts = Array.from(activePointers.values());
       const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      const mid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+      let changed = false;
+
+      if (lastPinchMid) {
+        const panDx = mid.x - lastPinchMid.x;
+        const panDy = mid.y - lastPinchMid.y;
+        if (Math.abs(panDx) > 0.1 || Math.abs(panDy) > 0.1) {
+          state.cam.panX = Math.max(-420, Math.min(420, (state.cam.panX || 0) + panDx));
+          state.cam.panY = Math.max(-420, Math.min(420, (state.cam.panY || 0) + panDy));
+          changed = true;
+        }
+      }
       if (lastPinchDist && dist > 10) {
         const factor = dist / lastPinchDist;
         state.cam.zoom = Math.max(0.5, Math.min(3.2, state.cam.zoom * factor));
-        redrawOnly3d();
+        changed = true;
       }
       lastPinchDist = dist;
+      lastPinchMid = mid;
+      if (changed) redrawOnly3d();
     }
   });
 
   const endPointer = (e) => {
-    const wasSingleTap = activePointers.size === 1 && !hasDragged;
+    const wasSingleTap = activePointers.size === 1 && !hasDragged && !isDesktopPan;
     activePointers.delete(e.pointerId);
-    if (activePointers.size < 2) lastPinchDist = null;
+    if (activePointers.size < 2) {
+      lastPinchDist = null;
+      lastPinchMid = null;
+    }
     if (activePointers.size === 0) {
       tagDragCtx = null;
+      isDesktopPan = false;
       state.draggingTagId3d = null;
       canvas.style.cursor = "move";
     }
@@ -6427,6 +6599,13 @@ function initApp() {
     saveState();
     syncWizardUI(false);
     renderScenarioBoard();
+    if (window.RareToast) {
+      window.RareToast.show({
+        type: "success",
+        title: `Added ${callsign}`,
+        description: `${state.flightType} added to active scenario.`,
+      });
+    }
   }
 
   function syncWizardUI(autoFocus = true) {
@@ -6638,6 +6817,9 @@ function initApp() {
   function updateRwyUI() {
     btnRwy36.classList.toggle("active", state.activeRwy === "36");
     btnRwy18.classList.toggle("active", state.activeRwy === "18");
+    if (window.RareUI && typeof window.RareUI.syncGooeyNavs === "function") {
+      window.RareUI.syncGooeyNavs();
+    }
     renderWaypointGrid();
     renderLivePreview();
     renderScenarioBoard();
@@ -6873,8 +7055,22 @@ function initApp() {
         } aircraft</strong>${label}: ${arrCount} ARR, ${depCount} DEP, ${trnCount} TRN.`,
         true
       );
+      if (window.RareToast) {
+        window.RareToast.show({
+          type: "success",
+          title: `Imported ${addedItems.length} Aircraft`,
+          description: `${arrCount} ARR • ${depCount} DEP • ${trnCount} TRN`,
+        });
+      }
     } catch (err) {
       showJsonFeedback(`❌ ${err.message}`, false);
+      if (window.RareToast) {
+        window.RareToast.show({
+          type: "error",
+          title: "JSON Import Failed",
+          description: err.message,
+        });
+      }
     }
   }
 
