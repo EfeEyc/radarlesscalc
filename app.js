@@ -6253,6 +6253,14 @@ function setup3dCanvasInteractions() {
       redrawOnly3d();
     }
   });
+
+  window.addEventListener("orientationchange", () => {
+    setTimeout(() => {
+      if (state.activeView === "chart" && state.chartMode === "3d") {
+        redrawOnly3d();
+      }
+    }, 160);
+  });
 }
 
 // ============================================================================

@@ -162,6 +162,7 @@ html {
   -moz-osx-font-smoothing: grayscale;
   scrollbar-color: var(--border-strong) transparent;
   scrollbar-width: thin;
+  overflow-x: clip;
 }
 
 /* Sleek RareUI Custom Thin Scrollbars (no jarring gray browser bars) */
@@ -191,6 +192,7 @@ body {
   line-height: 1.5;
   min-height: 100vh;
   padding-bottom: 5.5rem;
+  overflow-x: clip;
   transition: background-color 0.28s var(--ease-out), color 0.28s var(--ease-out);
 }
 
@@ -260,19 +262,25 @@ button:active:not(:disabled) {
    RARE UI FLOATING CAPSULE TOP BAR (Brand + Gooey Nav + Runway + Bell + Theme)
    ============================================================================ */
 .rare-navbar {
-  position: sticky;
-  top: 0.75rem;
+  position: relative;
   z-index: 60;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
   flex-wrap: wrap;
-  pointer-events: none;
 }
 
-.rare-navbar > * {
-  pointer-events: auto;
+@media (min-width: 1120px) and (min-height: 620px) and (hover: hover) and (pointer: fine) {
+  .rare-navbar {
+    position: sticky;
+    top: 0.75rem;
+    pointer-events: none;
+  }
+
+  .rare-navbar > * {
+    pointer-events: auto;
+  }
 }
 
 .rare-nav-capsule {
@@ -341,6 +349,7 @@ button:active:not(:disabled) {
   display: inline-flex;
   align-items: center;
   gap: 0.2rem;
+  max-width: 100%;
   background: var(--backdrop-blur);
   backdrop-filter: blur(18px);
   -webkit-backdrop-filter: blur(18px);
@@ -518,6 +527,7 @@ button:active:not(:disabled) {
   top: calc(100% + 10px);
   right: 0;
   width: 280px;
+  max-width: calc(100vw - 1.5rem);
   background: var(--bg-card);
   border: 1px solid var(--border-strong);
   border-radius: 24px;
@@ -2229,7 +2239,7 @@ button:active:not(:disabled) {
 
 .essential-traffic-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(310px, 100%), 1fr));
   gap: 0.7rem;
 }
 
@@ -3305,12 +3315,82 @@ button:active:not(:disabled) {
   }
 }
 
+@media (max-width: 1119px) {
+  .rare-navbar {
+    gap: 0.5rem;
+  }
+  .rare-brand-pill {
+    padding: 0.3rem 0.7rem 0.3rem 0.45rem;
+    gap: 0.4rem;
+  }
+  .rare-brand-title {
+    font-size: 0.84rem;
+  }
+  .rare-brand-tag {
+    font-size: 0.58rem;
+    padding: 0.1rem 0.36rem;
+  }
+  .view-tab {
+    padding: 0.4rem 0.72rem;
+    font-size: 0.76rem;
+  }
+  .rwy-label {
+    padding: 0 0.32rem 0 0.48rem;
+    font-size: 0.64rem;
+  }
+  .rwy-btn {
+    padding: 0.36rem 0.62rem;
+    font-size: 0.74rem;
+  }
+  .rare-bell-btn {
+    height: 36px;
+    padding: 0 0.72rem;
+    font-size: 0.74rem;
+  }
+  .rare-theme-trigger {
+    width: 36px;
+    height: 36px;
+  }
+}
+
 @media (max-width: 780px) {
   .container {
-    padding: 0.7rem 0.75rem 2rem;
+    padding: 0.65rem 0.75rem 2rem;
+    gap: 0.85rem;
   }
   .rare-navbar {
-    top: 0.45rem;
+    gap: 0.45rem;
+  }
+  .rare-brand-pill {
+    order: 1;
+  }
+  .rare-nav-right {
+    order: 2;
+    margin-left: auto;
+  }
+  .main-view-tabs {
+    order: 3;
+    flex: 1 1 100%;
+    width: 100%;
+  }
+  .main-view-tabs .view-tab {
+    flex: 1 1 0;
+    justify-content: center;
+    padding: 0.42rem 0.5rem;
+    font-size: 0.75rem;
+    min-width: 0;
+  }
+  .rwy-selector {
+    order: 4;
+    flex: 1 1 100%;
+    width: 100%;
+  }
+  .rwy-selector .rwy-btn {
+    flex: 1 1 0;
+    justify-content: center;
+    padding: 0.38rem 0.5rem;
+    font-size: 0.75rem;
+    min-width: 0;
   }
   .rare-kpi-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3321,6 +3401,49 @@ button:active:not(:disabled) {
   .chart-3d-stage,
   .svg-chart-container {
     height: 460px;
+  }
+}
+
+@media (max-width: 440px) {
+  .rare-brand-tag {
+    display: none;
+  }
+}
+
+@media (max-height: 540px) and (orientation: landscape) {
+  .container {
+    padding: 0.45rem 0.75rem 1.5rem;
+    gap: 0.75rem;
+  }
+  .rare-navbar {
+    gap: 0.4rem;
+  }
+  .rare-brand-pill,
+  .rare-nav-right,
+  .main-view-tabs,
+  .rwy-selector {
+    order: 0;
+    flex: 0 1 auto;
+    width: auto;
+    margin-left: 0;
+  }
+  .main-view-tabs .view-tab,
+  .rwy-selector .rwy-btn {
+    flex: 0 0 auto;
+  }
+  .rare-brand-tag {
+    display: none;
+  }
+  .chart-3d-stage,
+  .svg-chart-container {
+    height: 74vh;
+    height: clamp(260px, 74dvh, 460px);
+  }
+}
+
+@media (max-width: 780px), (max-height: 540px), (hover: none) and (pointer: coarse) {
+  body {
+    padding-bottom: 2rem;
   }
   .rare-scroll-pill {
     display: none;

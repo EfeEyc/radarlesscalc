@@ -117,12 +117,19 @@
 
     const left = activeBtn.offsetLeft;
     const width = activeBtn.offsetWidth;
+    if (!width) return;
     indicator.style.width = `${width}px`;
     indicator.style.transform = `translateX(${left}px)`;
   }
 
   function syncAllGooeyNavs() {
     document.querySelectorAll(".rare-gooey-group").forEach(syncGooeyGroup);
+  }
+
+  function scheduleGooeySync() {
+    requestAnimationFrame(syncAllGooeyNavs);
+    setTimeout(syncAllGooeyNavs, 120);
+    setTimeout(syncAllGooeyNavs, 300);
   }
 
   // --------------------------------------------------------------------------
@@ -315,6 +322,10 @@
       updateProgress();
       syncAllGooeyNavs();
     });
+    window.addEventListener("orientationchange", () => {
+      updateProgress();
+      scheduleGooeySync();
+    });
 
     pill.querySelectorAll("[data-scroll-target]").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -395,6 +406,15 @@
     // Sync Gooey Nav indicators after fonts & layout settle
     syncAllGooeyNavs();
     setTimeout(syncAllGooeyNavs, 120);
+
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver((entries) => {
+        entries.forEach((entry) => syncGooeyGroup(entry.target));
+      });
+      document.querySelectorAll(".rare-gooey-group").forEach((group) => ro.observe(group));
+    }
+
+    window.addEventListener("orientationchange", scheduleGooeySync);
 
     document.querySelectorAll(".rare-gooey-group button").forEach((btn) => {
       btn.addEventListener("click", () => {
