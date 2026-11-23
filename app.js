@@ -533,6 +533,11 @@ const state = {
     showAllPaths: false,
   },
   projectedBlips3d: [], // Hitboxes from last 3D render
+  projectedBlips2d: [], // Hitboxes from last 2D render
+  tagOffsets3d: {}, // acftId -> { dx, dy } user-dragged offset in 3D canvas CSS px
+  tagOffsets2d: {}, // acftId -> { dx, dy } user-dragged offset in 2D SVG units
+  draggingTagId3d: null,
+  draggingTagId2d: null,
 };
 
 function getPairKey(idA, idB) {
@@ -1198,6 +1203,7 @@ function analyzeScenarioConflicts(aircraftList, activeRwy) {
     headOnConflicts: scanResult.headOnConflicts,
     radialConflicts: scanResult.radialConflicts,
     conflicts4d: scanResult.conflicts4d,
+    essentialTraffic: scanResult.essentialTraffic || [],
     confirmedResolvedPairs: scanResult.confirmedResolvedPairs,
     heatmapBins: scanResult.heatmapBins,
     conflictAcftIds: scanResult.conflictAcftIds,
@@ -2339,6 +2345,34 @@ function measureH2hClosing(stA, stB, bothDep = false) {
   return { isH2hTrack: true, headOnOffDeg, closingRate, horizDistNm };
 }
 
+function findWaypointByRadial(radialDeg) {
+  if (radialDeg === null || radialDeg === undefined) return null;
+  let best = null;
+  let bestDiff = 12;
+  WAYPOINTS.forEach((w) => {
+    const d = angularDiffDeg(w.deg, radialDeg);
+    if (d < bestDiff) {
+      bestDiff = d;
+      best = w;
+    }
+  });
+  return best;
+}
+
+function isSameAirwayHeadOn(stA, stB, bothDep = false) {
+  const h2h = measureH2hClosing(stA, stB, bothDep);
+  if (!h2h.isH2hTrack || h2h.headOnOffDeg >= 10) {
+    return { isSameAirway: false, closingRate: 0, horizDistNm: h2h.horizDistNm };
+  }
+  const radDiff = angularDiffDeg(stA.radialDeg, stB.radialDeg);
+  const collinear = radDiff < 10 || Math.abs(radDiff - 180) < 10;
+  return {
+    isSameAirway: collinear,
+    closingRate: h2h.closingRate,
+    horizDistNm: h2h.horizDistNm,
+  };
+}
+
 function detect4DConflicts(solver) {
   const { refHour, useHasHour } = solver;
   const allItems = getAllItemsFromSolver(solver);
@@ -2357,6 +2391,7 @@ function detect4DConflicts(solver) {
       headOnConflicts: [],
       radialConflicts: [],
       conflicts4d: [],
+      essentialTraffic: [],
       confirmedResolvedPairs: [],
       heatmapBins: times.map((t) => ({ t, severity: "safe" })),
       conflictAcftIds: new Set(),
@@ -2373,6 +2408,7 @@ function detect4DConflicts(solver) {
   });
 
   const conflicts4d = [];
+  const essentialTraffic = [];
   const confirmedResolvedPairs = [];
   const conflictAcftIds = new Set();
 
@@ -2482,6 +2518,71 @@ function detect4DConflicts(solver) {
       let passedH2hTimeNorm = null;
       const bothDep = itemA.acft.type === "DEP" && itemB.acft.type === "DEP";
 
+      // Essential Traffic Information: detect exact pass-over time for same-airway head-on pairs
+      // (runs regardless of vertical separation or confirmed separation — purely informational!)
+      if (!bothDep) {
+        let prevSameH2h = null;
+        let recordedPass = false;
+        for (let k = 0; k < times.length && !recordedPass; k++) {
+          const curSame = isSameAirwayHeadOn(sA[k], sB[k], false);
+          if (
+            prevSameH2h &&
+            prevSameH2h.isSameAirway &&
+            prevSameH2h.closingRate > 0.1 &&
+            (!curSame.isSameAirway || curSame.closingRate <= 0.1) &&
+            prevSameH2h.horizDistNm <= prevSameH2h.closingRate * DT + 0.6
+          ) {
+            const dtFrac = Math.max(
+              0,
+              Math.min(DT, prevSameH2h.horizDistNm / Math.max(0.1, prevSameH2h.closingRate))
+            );
+            const tPass = +(times[k - 1] + dtFrac).toFixed(2);
+            const stPassA = getAircraftStateAtTime(itemA, solver, tPass);
+            const stPassB = getAircraftStateAtTime(itemB, solver, tPass);
+            const passDme = +(((stPassA.dme + stPassB.dme) / 2)).toFixed(1);
+            const passRadial = stPassA.dme >= stPassB.dme ? stPassA.radialDeg : stPassB.radialDeg;
+            const passWpt = findWaypointByRadial(passRadial);
+            const airwayLabel =
+              passDme <= 1.5
+                ? "Over AYT VOR (0 NM)"
+                : passWpt
+                ? `${passDme} NM ${passWpt.name}${passWpt.airway ? ` • ${passWpt.airway}` : ""}`
+                : `${passDme} NM (R-${String(Math.round(passRadial)).padStart(3, "0")})`;
+
+            const passTimeStr = formatTime(
+              denormalizeTime(tPass, useHasHour, refHour),
+              useHasHour
+            );
+            const iconA = getAcftIcon(itemA.acft.type);
+            const iconB = getAcftIcon(itemB.acft.type);
+            const corrA = getAcftCorridorShort(itemA);
+            const corrB = getAcftCorridorShort(itemB);
+            const altDiffPass = Math.abs(stPassA.conflictAltFt - stPassB.conflictAltFt);
+            const isVertSeparated = altDiffPass >= 999.5;
+
+            essentialTraffic.push({
+              id: `ess-${itemA.acft.id}-${itemB.acft.id}-${tPass}`,
+              pairKey,
+              itemA,
+              itemB,
+              pairLabel: `${iconA} ${itemA.acft.callsign} (${corrA}) ↔ ${iconB} ${itemB.acft.callsign} (${corrB})`,
+              tPass,
+              passTimeStr,
+              passDme,
+              airwayLabel,
+              altAStr: formatAltShort(stPassA.altFt),
+              altBStr: formatAltShort(stPassB.altFt),
+              conflictAltAStr: formatAltShort(stPassA.conflictAltFt),
+              conflictAltBStr: formatAltShort(stPassB.conflictAltFt),
+              isVertSeparated,
+              preEntry: stPassA.phase === "pending" || stPassB.phase === "pending",
+            });
+            recordedPass = true;
+          }
+          prevSameH2h = curSame;
+        }
+      }
+
       if (confirmedRec) {
         const iconA = getAcftIcon(itemA.acft.type);
         const iconB = getAcftIcon(itemB.acft.type);
@@ -2564,6 +2665,7 @@ function detect4DConflicts(solver) {
   }
 
   conflicts4d.sort((a, b) => a.tStart - b.tStart);
+  essentialTraffic.sort((a, b) => a.tPass - b.tPass);
 
   // Downsample heatmap bins into ~50 crisp visual bars
   const TARGET_BINS = 54;
@@ -2591,6 +2693,7 @@ function detect4DConflicts(solver) {
     headOnConflicts: conflicts4d.filter((c) => c.ruleType === "HEAD_TO_HEAD"),
     radialConflicts: conflicts4d.filter((c) => c.ruleType !== "HEAD_TO_HEAD"),
     conflicts4d,
+    essentialTraffic,
     confirmedResolvedPairs,
     heatmapBins,
     conflictAcftIds,
@@ -3659,6 +3762,61 @@ function wireConflictCardButtons(containerEl, solver) {
   });
 }
 
+function renderEssentialTrafficList(list, containerEl, solver, compact = false) {
+  if (!containerEl) return;
+  const items = Array.isArray(list) ? list : [];
+
+  if (items.length === 0) {
+    containerEl.innerHTML = `
+      <div class="essential-box essential-empty">
+        <div class="conflict-detail">
+          No same-airway head-on pass-overs detected in this scenario.
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  containerEl.innerHTML = items
+    .map((et) => {
+      const sepTag = et.isVertSeparated
+        ? `<span class="badge badge-info-sep">✓ Vert Sep (${et.conflictAltAStr} / ${et.conflictAltBStr})</span>`
+        : `<span class="badge badge-info-cross">⚡ Crossing FL (${et.conflictAltAStr} / ${et.conflictAltBStr})</span>`;
+      return `
+        <div class="essential-box${compact ? " compact" : ""}">
+          <div class="conflict-top">
+            <span class="conflict-pair">${et.pairLabel}</span>
+            <span class="badge badge-pass-time">⏱️ PASS @ ${et.passTimeStr}</span>
+          </div>
+          <div class="conflict-metrics">
+            <div class="metric-pill info-pill">📍 <strong>${et.airwayLabel}</strong>${
+        et.preEntry ? " (pre-entry)" : ""
+      }</div>
+            ${sepTag}
+            <button type="button" class="conflict-jump-btn info-jump-btn" data-ess-jump-t="${
+              et.tPass
+            }">📍 Go @ ${et.passTimeStr}</button>
+          </div>
+          ${
+            compact
+              ? ""
+              : `<div class="conflict-detail" style="color:var(--text-main);">
+            <strong>${et.itemA.acft.callsign}</strong> (${et.altAStr}) and <strong>${et.itemB.acft.callsign}</strong> (${et.altBStr}) pass head-on on the same airway at <code>${et.passTimeStr}</code> near <strong>${et.airwayLabel}</strong>.
+          </div>`
+          }
+        </div>
+      `;
+    })
+    .join("");
+
+  containerEl.querySelectorAll("[data-ess-jump-t]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const tVal = parseFloat(btn.getAttribute("data-ess-jump-t"));
+      if (!Number.isNaN(tVal)) jumpChartToTime(tVal, solver);
+    });
+  });
+}
+
 // Render the 3 Conflict Finder Panels on Calculator Tab (Powered by Live 4D Engine)
 function renderConflictPanels(solver) {
   const depArrListEl = document.getElementById("depArrConflictList");
@@ -3835,6 +3993,10 @@ function renderConflictPanels(solver) {
       });
     }
   }
+
+  // 4. Essential Traffic Information (Informational — Same-Airway Head-On Pass Times)
+  const essListEl = document.getElementById("essentialTrafficList");
+  renderEssentialTrafficList(solver.essentialTraffic || [], essListEl, solver, false);
 }
 
 // ============================================================================
@@ -3908,15 +4070,175 @@ function segmentsIntersect(p1x, p1y, p2x, p2y, p3x, p3y, p4x, p4y) {
   );
 }
 
-function computeNonOverlappingTagPositions(visibleBlips) {
+// Shared guaranteed zero-overlap tag solver for both 2D SVG and 3D Canvas.
+// Respects pinned (actively dragged) and manually moved tags while guaranteeing
+// strictly zero tag-to-tag overlap inside bounds.
+function resolveTagOverlapsGuaranteed(items, bounds, pad = 6, pinnedId = null) {
+  const { minX, maxX, minY, maxY } = bounds;
+  const clampItem = (it) => {
+    it.tx = Math.max(minX, Math.min(maxX - it.tw, it.tx));
+    it.ty = Math.max(minY, Math.min(maxY - it.th, it.ty));
+  };
+  items.forEach(clampItem);
+
+  // 1. Gentle repulsion away from aircraft icon dots for auto-placed tags only
+  for (let pass = 0; pass < 8; pass++) {
+    let movedDot = false;
+    for (let i = 0; i < items.length; i++) {
+      const A = items[i];
+      if (A.isManual || A.id === pinnedId) continue;
+      for (let j = 0; j < items.length; j++) {
+        const B = items[j];
+        const cxA = A.tx + A.tw / 2;
+        const cyA = A.ty + A.th / 2;
+        const dxD = cxA - B.sx;
+        const dyD = cyA - B.sy;
+        const clearX = A.tw / 2 + 12;
+        const clearY = A.th / 2 + 12;
+        if (Math.abs(dxD) < clearX && Math.abs(dyD) < clearY) {
+          movedDot = true;
+          A.tx += dxD >= 0 ? 4 : -4;
+          A.ty += dyD >= 0 ? 4 : -4;
+          clampItem(A);
+        }
+      }
+    }
+    if (!movedDot) break;
+  }
+
+  // 2. Wall-aware iterative tag-vs-tag separation
+  for (let iter = 0; iter < 90; iter++) {
+    let moved = false;
+    for (let i = 0; i < items.length; i++) {
+      const A = items[i];
+      for (let j = i + 1; j < items.length; j++) {
+        const B = items[j];
+        const cxA = A.tx + A.tw / 2;
+        const cyA = A.ty + A.th / 2;
+        const cxB = B.tx + B.tw / 2;
+        const cyB = B.ty + B.th / 2;
+        const ovX = (A.tw + B.tw) / 2 + pad - Math.abs(cxA - cxB);
+        const ovY = (A.th + B.th) / 2 + pad - Math.abs(cyA - cyB);
+        if (ovX <= 0 || ovY <= 0) continue;
+
+        moved = true;
+        let wA = 0.5;
+        let wB = 0.5;
+        if (A.id === pinnedId || (A.isManual && !B.isManual && B.id !== pinnedId)) {
+          wA = 0;
+          wB = 1;
+        } else if (B.id === pinnedId || (B.isManual && !A.isManual && A.id !== pinnedId)) {
+          wA = 1;
+          wB = 0;
+        }
+
+        const pushAxis = (axis, amount) => {
+          const isY = axis === "y";
+          const posA = isY ? A.ty : A.tx;
+          const posB = isY ? B.ty : B.tx;
+          const dir = posA <= posB ? -1 : 1;
+          const reqA = dir * amount * wA;
+          const reqB = -dir * amount * wB;
+
+          const prevA = posA;
+          const prevB = posB;
+          if (isY) {
+            A.ty += reqA;
+            B.ty += reqB;
+          } else {
+            A.tx += reqA;
+            B.tx += reqB;
+          }
+          clampItem(A);
+          clampItem(B);
+
+          // Transfer any wall-blocked remainder to the other tag
+          const movedA = (isY ? A.ty : A.tx) - prevA;
+          const movedB = (isY ? B.ty : B.tx) - prevB;
+          const remA = reqA - movedA;
+          const remB = reqB - movedB;
+          if (Math.abs(remA) > 0.05 && B.id !== pinnedId) {
+            if (isY) B.ty -= remA;
+            else B.tx -= remA;
+            clampItem(B);
+          }
+          if (Math.abs(remB) > 0.05 && A.id !== pinnedId) {
+            if (isY) A.ty -= remB;
+            else A.tx -= remB;
+            clampItem(A);
+          }
+        };
+
+        if (ovY <= ovX * 1.25) {
+          pushAxis("y", ovY + 0.5);
+        } else {
+          pushAxis("x", ovX + 0.5);
+        }
+      }
+    }
+    if (!moved) break;
+  }
+
+  // 3. Hard Guarantee Spiral Pass: strictly zero overlap even in tight clusters
+  const ordered = [...items].sort((a, b) => {
+    if (a.id === pinnedId) return -1;
+    if (b.id === pinnedId) return 1;
+    if (a.isManual !== b.isManual) return a.isManual ? -1 : 1;
+    return 0;
+  });
+
+  const locked = [];
+  const hasAnyOverlap = (tx, ty, tw, th, minGap) =>
+    locked.some((L) => rectsOverlap(tx, ty, tw, th, L.tx, L.ty, L.tw, L.th, minGap));
+
+  ordered.forEach((cur) => {
+    if (!hasAnyOverlap(cur.tx, cur.ty, cur.tw, cur.th, pad - 0.5)) {
+      locked.push(cur);
+      return;
+    }
+
+    const origX = cur.tx;
+    const origY = cur.ty;
+    let found = null;
+
+    for (const tryGap of [pad, 3, 1]) {
+      for (let ring = 1; ring <= 60 && !found; ring++) {
+        const radius = ring * 8;
+        const steps = 16;
+        let bestDist = Infinity;
+        for (let s = 0; s < steps; s++) {
+          const ang = (s * 2 * Math.PI) / steps;
+          const candX = Math.max(minX, Math.min(maxX - cur.tw, origX + radius * Math.cos(ang)));
+          const candY = Math.max(minY, Math.min(maxY - cur.th, origY + radius * Math.sin(ang)));
+          if (!hasAnyOverlap(candX, candY, cur.tw, cur.th, tryGap)) {
+            const d = Math.hypot(candX - origX, candY - origY);
+            if (d < bestDist) {
+              bestDist = d;
+              found = { x: candX, y: candY };
+            }
+          }
+        }
+      }
+      if (found) break;
+    }
+
+    if (found) {
+      cur.tx = found.x;
+      cur.ty = found.y;
+    }
+    locked.push(cur);
+  });
+}
+
+function computeNonOverlappingTagPositions(visibleBlips, pinnedId = null) {
   const TAG_W = 88;
   const TAG_H = 30;
   const PAD = 8;
   const BLIP_CLEARANCE = 14;
   const MIN_X = 10;
-  const MAX_X = 850 - TAG_W;
+  const MAX_X = 850;
   const MIN_Y = 10;
-  const MAX_Y = 850 - TAG_H;
+  const MAX_Y = 850;
 
   const placedTags = [];
   const angleSteps = [
@@ -3925,6 +4247,31 @@ function computeNonOverlappingTagPositions(visibleBlips) {
   const radii = [46, 68, 92, 118, 146, 176, 210];
 
   visibleBlips.forEach((b, idx) => {
+    const id = b.item.acft.id;
+    const manualOff = state.tagOffsets2d[id];
+    if (manualOff) {
+      const tx = Math.max(MIN_X, Math.min(MAX_X - TAG_W, b.x + manualOff.dx));
+      const ty = Math.max(MIN_Y, Math.min(MAX_Y - TAG_H, b.y + manualOff.dy));
+      const anchor = getRectPerimeterAnchor(b.x, b.y, tx, ty, TAG_W, TAG_H);
+      placedTags.push({
+        id,
+        sx: b.x,
+        sy: b.y,
+        bx: b.x,
+        by: b.y,
+        tx,
+        ty,
+        tw: TAG_W,
+        th: TAG_H,
+        w: TAG_W,
+        h: TAG_H,
+        anchorX: anchor.x,
+        anchorY: anchor.y,
+        isManual: true,
+      });
+      return;
+    }
+
     const dxCenter = b.x - SVG_CENTER_X;
     const dyCenter = b.y - SVG_CENTER_Y;
     const baseAngleRad =
@@ -3940,8 +4287,8 @@ function computeNonOverlappingTagPositions(visibleBlips) {
         const ang = baseAngleRad + (aDeg * Math.PI) / 180;
         const centerX = b.x + r * Math.cos(ang);
         const centerY = b.y + r * Math.sin(ang);
-        const tx = Math.max(MIN_X, Math.min(MAX_X, centerX - TAG_W / 2));
-        const ty = Math.max(MIN_Y, Math.min(MAX_Y, centerY - TAG_H / 2));
+        const tx = Math.max(MIN_X, Math.min(MAX_X - TAG_W, centerX - TAG_W / 2));
+        const ty = Math.max(MIN_Y, Math.min(MAX_Y - TAG_H, centerY - TAG_H / 2));
 
         let overlapsTag = false;
         for (const pt of placedTags) {
@@ -4003,8 +4350,8 @@ function computeNonOverlappingTagPositions(visibleBlips) {
 
     if (!bestCandidate) {
       bestCandidate = {
-        tx: Math.max(MIN_X, Math.min(MAX_X, b.x + 28)),
-        ty: Math.max(MIN_Y, Math.min(MAX_Y, b.y - 36 - idx * 38)),
+        tx: Math.max(MIN_X, Math.min(MAX_X - TAG_W, b.x + 28)),
+        ty: Math.max(MIN_Y, Math.min(MAX_Y - TAG_H, b.y - 36 - idx * 38)),
       };
     }
 
@@ -4018,42 +4365,29 @@ function computeNonOverlappingTagPositions(visibleBlips) {
     );
 
     placedTags.push({
+      id,
+      sx: b.x,
+      sy: b.y,
       bx: b.x,
       by: b.y,
       tx: bestCandidate.tx,
       ty: bestCandidate.ty,
-      anchorX: anchor.x,
-      anchorY: anchor.y,
+      tw: TAG_W,
+      th: TAG_H,
       w: TAG_W,
       h: TAG_H,
+      anchorX: anchor.x,
+      anchorY: anchor.y,
+      isManual: false,
     });
   });
 
-  for (let iter = 0; iter < 50; iter++) {
-    let moved = false;
-    for (let i = 0; i < placedTags.length; i++) {
-      for (let j = i + 1; j < placedTags.length; j++) {
-        const A = placedTags[i];
-        const B = placedTags[j];
-        const overlapX = A.w + PAD - Math.abs(A.tx + A.w / 2 - (B.tx + B.w / 2));
-        const overlapY = A.h + PAD - Math.abs(A.ty + A.h / 2 - (B.ty + B.h / 2));
-
-        if (overlapX > 0 && overlapY > 0) {
-          moved = true;
-          if (overlapX < overlapY) {
-            const dir = A.tx <= B.tx ? -1 : 1;
-            A.tx = Math.max(MIN_X, Math.min(MAX_X, A.tx + (dir * overlapX) / 2));
-            B.tx = Math.max(MIN_X, Math.min(MAX_X, B.tx - (dir * overlapX) / 2));
-          } else {
-            const dir = A.ty <= B.ty ? -1 : 1;
-            A.ty = Math.max(MIN_Y, Math.min(MAX_Y, A.ty + (dir * overlapY) / 2));
-            B.ty = Math.max(MIN_Y, Math.min(MAX_Y, B.ty - (dir * overlapY) / 2));
-          }
-        }
-      }
-    }
-    if (!moved) break;
-  }
+  resolveTagOverlapsGuaranteed(
+    placedTags,
+    { minX: MIN_X, maxX: MAX_X, minY: MIN_Y, maxY: MAX_Y },
+    PAD,
+    pinnedId
+  );
 
   placedTags.forEach((pt) => {
     const anchor = getRectPerimeterAnchor(pt.bx, pt.by, pt.tx, pt.ty, pt.w, pt.h);
@@ -4632,8 +4966,11 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
       const dyC = proj3d.y - centerY;
       const pushOutX = dxC >= 0 ? 16 : -(tagW + 16);
       const pushOutY = dyC >= 0 ? 11 : -(tagH + 11);
-      const tx = Math.max(6, Math.min(W - tagW - 6, proj3d.x + pushOutX));
-      const ty = Math.max(46, Math.min(H - tagH - 38, proj3d.y + pushOutY));
+      const manualOff = state.tagOffsets3d[item.acft.id];
+      const rawTx = manualOff ? proj3d.x + manualOff.dx : proj3d.x + pushOutX;
+      const rawTy = manualOff ? proj3d.y + manualOff.dy : proj3d.y + pushOutY;
+      const tx = Math.max(6, Math.min(W - tagW - 6, rawTx));
+      const ty = Math.max(46, Math.min(H - tagH - 38, rawTy));
 
       labelQueue.push({
         id: item.acft.id,
@@ -4652,54 +4989,18 @@ function render3dRadarChart(solver, queryNorm, activeNowConflicts) {
         line2,
         blipColor,
         isSelected,
+        isManual: Boolean(manualOff),
       });
     }
   });
 
-  // Fast iterative 2D tag de-overlap pass (repel both other tags AND aircraft dots)
-  for (let iter = 0; iter < 36; iter++) {
-    let moved = false;
-    for (let i = 0; i < labelQueue.length; i++) {
-      const A = labelQueue[i];
-      // Repel away from any aircraft icon dot
-      for (let j = 0; j < labelQueue.length; j++) {
-        const B = labelQueue[j];
-        const dotX = B.sx;
-        const dotY = B.sy;
-        const cxA = A.tx + A.tw / 2;
-        const cyA = A.ty + A.th / 2;
-        const dxD = cxA - dotX;
-        const dyD = cyA - dotY;
-        const clearX = A.tw / 2 + 12;
-        const clearY = A.th / 2 + 12;
-        if (Math.abs(dxD) < clearX && Math.abs(dyD) < clearY) {
-          moved = true;
-          A.ty = Math.max(46, Math.min(H - A.th - 38, A.ty + (dyD >= 0 ? 4 : -4)));
-          A.tx = Math.max(6, Math.min(W - A.tw - 6, A.tx + (dxD >= 0 ? 4 : -4)));
-        }
-      }
-      // Repel away from other tags
-      for (let j = i + 1; j < labelQueue.length; j++) {
-        const B = labelQueue[j];
-        const pad = 7;
-        const ovX = (A.tw + B.tw) / 2 + pad - Math.abs(A.tx + A.tw / 2 - (B.tx + B.tw / 2));
-        const ovY = (A.th + B.th) / 2 + pad - Math.abs(A.ty + A.th / 2 - (B.ty + B.th / 2));
-        if (ovX > 0 && ovY > 0) {
-          moved = true;
-          if (ovY <= ovX * 1.4) {
-            const dir = A.ty <= B.ty ? -1 : 1;
-            A.ty = Math.max(46, Math.min(H - A.th - 38, A.ty + (dir * ovY) / 2));
-            B.ty = Math.max(46, Math.min(H - B.th - 38, B.ty - (dir * ovY) / 2));
-          } else {
-            const dir = A.tx <= B.tx ? -1 : 1;
-            A.tx = Math.max(6, Math.min(W - A.tw - 6, A.tx + (dir * ovX) / 2));
-            B.tx = Math.max(6, Math.min(W - B.tw - 6, B.tx - (dir * ovX) / 2));
-          }
-        }
-      }
-    }
-    if (!moved) break;
-  }
+  // Guaranteed zero-overlap 2D tag solver (respects dragged & manually positioned tags)
+  resolveTagOverlapsGuaranteed(
+    labelQueue,
+    { minX: 6, maxX: W - 6, minY: 46, maxY: H - 38 },
+    6,
+    state.draggingTagId3d
+  );
 
   // Draw leader lines & de-overlapped 3D labels sorted back-to-front by depth
   labelQueue.sort((a, b) => b.depth - a.depth);
@@ -5288,6 +5589,10 @@ function renderChartConflictFeed(solver, queryNorm, activeNowConflicts) {
   });
 
   wireConflictCardButtons(feedEl, solver);
+
+  // Sync Essential Traffic Information in Chart Sidebar
+  const chartEssEl = document.getElementById("chartEssentialTrafficList");
+  renderEssentialTrafficList(solver.essentialTraffic || [], chartEssEl, solver, true);
 }
 
 // Fast visual refresh used while dragging the FL slider smoothly without destroying focus
@@ -5308,6 +5613,8 @@ function renderRadarChartOnlyVisuals(solver) {
   }
   if (state.chartMode === "3d") {
     render3dRadarChart(solver, queryNorm, activeNowConflicts);
+  } else {
+    render2dSvgRadar(solver, queryNorm);
   }
   renderConflictHeatmapBar(solver, queryNorm);
   renderChartConflictFeed(solver, queryNorm, activeNowConflicts);
@@ -5456,36 +5763,149 @@ function renderRadarChartView(solver) {
     }
   });
 
-  if (blipsLayer && state.chartMode === "2d") {
-    const tagPlacements = computeNonOverlappingTagPositions(visibleBlips);
-
-    visibleBlips.forEach(({ st }, i) => {
-      const tag = tagPlacements[i];
-      const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
-      g.innerHTML = `
-        <line x1="${st.x}" y1="${st.y}" x2="${tag.anchorX}" y2="${tag.anchorY}" stroke="${st.color}" stroke-width="1.5" opacity="0.9" />
-        <circle cx="${tag.anchorX}" cy="${tag.anchorY}" r="2.2" fill="${st.color}" />
-        <line x1="${st.x}" y1="${st.y}" x2="${st.tipX}" y2="${st.tipY}" stroke="${st.color}" stroke-width="2.2" />
-        <rect x="${st.x - 5}" y="${st.y - 5}" width="10" height="10" fill="#0b111e" stroke="${st.color}" stroke-width="2.2" transform="rotate(45 ${st.x} ${st.y})" />
-        <circle cx="${st.x}" cy="${st.y}" r="2" fill="${st.color}" />
-      `;
-      blipsLayer.appendChild(g);
-    });
-
-    visibleBlips.forEach(({ item, st }, i) => {
-      const tag = tagPlacements[i];
-      const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
-      g.innerHTML = `
-        <rect x="${tag.tx}" y="${tag.ty}" width="${tag.w}" height="${tag.h}" class="blip-tag-bg" stroke="${st.color}" />
-        <text x="${tag.tx + 5}" y="${tag.ty + 12}" class="blip-tag-title" fill="${st.color}">${item.acft.callsign}</text>
-        <text x="${tag.tx + 5}" y="${tag.ty + 24}" class="blip-tag-sub">${st.altStr} • ${st.dme}NM</text>
-      `;
-      blipsLayer.appendChild(g);
-    });
+  if (state.chartMode === "2d") {
+    render2dSvgRadar(solver, queryNorm);
+  } else if (blipsLayer) {
+    blipsLayer.innerHTML = "";
   }
 }
 
-// Wire up 3D Touch/Mouse Orbit, Pinch Zoom, and Tap-to-Select Plane
+function render2dSvgRadar(solver, queryNorm) {
+  const blipsLayer = document.getElementById("svgBlipsLayer");
+  if (!blipsLayer) return;
+  blipsLayer.innerHTML = "";
+
+  const allItems = getAllItemsFromSolver(solver);
+  const visibleBlips = [];
+  allItems.forEach((item) => {
+    const st = getAircraftStateAtTime(item, solver, queryNorm);
+    if (st.visible && st.x !== undefined && st.y !== undefined) {
+      visibleBlips.push({ item, st, x: st.x, y: st.y });
+    }
+  });
+
+  const tagPlacements = computeNonOverlappingTagPositions(visibleBlips, state.draggingTagId2d);
+  state.projectedBlips2d = tagPlacements.map((tag, i) => ({
+    id: visibleBlips[i].item.acft.id,
+    bx: tag.bx,
+    by: tag.by,
+    tx: tag.tx,
+    ty: tag.ty,
+    w: tag.w,
+    h: tag.h,
+  }));
+
+  visibleBlips.forEach(({ st }, i) => {
+    const tag = tagPlacements[i];
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    g.innerHTML = `
+      <line x1="${st.x}" y1="${st.y}" x2="${tag.anchorX}" y2="${tag.anchorY}" stroke="${st.color}" stroke-width="1.5" opacity="0.9" />
+      <circle cx="${tag.anchorX}" cy="${tag.anchorY}" r="2.2" fill="${st.color}" />
+      <line x1="${st.x}" y1="${st.y}" x2="${st.tipX}" y2="${st.tipY}" stroke="${st.color}" stroke-width="2.2" />
+      <rect x="${st.x - 5}" y="${st.y - 5}" width="10" height="10" fill="#0b111e" stroke="${st.color}" stroke-width="2.2" transform="rotate(45 ${st.x} ${st.y})" />
+      <circle cx="${st.x}" cy="${st.y}" r="2" fill="${st.color}" />
+    `;
+    blipsLayer.appendChild(g);
+  });
+
+  visibleBlips.forEach(({ item, st }, i) => {
+    const tag = tagPlacements[i];
+    const isSel = item.acft.id === state.selectedTestAcftId;
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    g.setAttribute("class", `svg-draggable-tag${isSel ? " selected" : ""}`);
+    g.setAttribute("data-tag2d-id", String(item.acft.id));
+    g.innerHTML = `
+      <rect x="${tag.tx}" y="${tag.ty}" width="${tag.w}" height="${tag.h}" class="blip-tag-bg" stroke="${isSel ? "#ffffff" : st.color}" stroke-width="${isSel ? "2" : "1.2"}" />
+      <text x="${tag.tx + 5}" y="${tag.ty + 12}" class="blip-tag-title" fill="${st.color}">${item.acft.callsign}</text>
+      <text x="${tag.tx + 5}" y="${tag.ty + 24}" class="blip-tag-sub">${st.altStr} • ${st.dme}NM</text>
+    `;
+    blipsLayer.appendChild(g);
+  });
+}
+
+// Wire up 2D SVG Draggable Tags (Mouse + Touch) and Tap-to-Select
+function setup2dSvgInteractions() {
+  const svg = document.getElementById("aytRadarSvg");
+  if (!svg) return;
+
+  let activePtrId = null;
+  let dragTagId = null;
+  let grabOffX = 0;
+  let grabOffY = 0;
+  let startClient = null;
+  let hasDragged = false;
+
+  function clientToSvg(clientX, clientY) {
+    const rect = svg.getBoundingClientRect();
+    return {
+      x: ((clientX - rect.left) / (rect.width || 860)) * 860,
+      y: ((clientY - rect.top) / (rect.height || 860)) * 860,
+    };
+  }
+
+  function redraw2d() {
+    const solver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+    renderRadarChartOnlyVisuals(solver);
+  }
+
+  svg.addEventListener("pointerdown", (e) => {
+    const tagGroup = e.target.closest("[data-tag2d-id]");
+    if (!tagGroup) return;
+    const id = Number(tagGroup.getAttribute("data-tag2d-id"));
+    const blip = (state.projectedBlips2d || []).find((b) => b.id === id);
+    if (!blip) return;
+
+    e.preventDefault();
+    svg.setPointerCapture(e.pointerId);
+    const pt = clientToSvg(e.clientX, e.clientY);
+    activePtrId = e.pointerId;
+    dragTagId = id;
+    grabOffX = pt.x - blip.tx;
+    grabOffY = pt.y - blip.ty;
+    startClient = { x: e.clientX, y: e.clientY };
+    hasDragged = false;
+    state.draggingTagId2d = id;
+    svg.classList.add("dragging-tag");
+  });
+
+  svg.addEventListener("pointermove", (e) => {
+    if (activePtrId !== e.pointerId || dragTagId === null) return;
+    if (startClient && Math.hypot(e.clientX - startClient.x, e.clientY - startClient.y) > 4) {
+      hasDragged = true;
+    }
+    if (!hasDragged) return;
+
+    const blip = (state.projectedBlips2d || []).find((b) => b.id === dragTagId);
+    if (!blip) return;
+    const pt = clientToSvg(e.clientX, e.clientY);
+    const newTx = Math.max(10, Math.min(850 - blip.w, pt.x - grabOffX));
+    const newTy = Math.max(10, Math.min(850 - blip.h, pt.y - grabOffY));
+    state.tagOffsets2d[dragTagId] = {
+      dx: +(newTx - blip.bx).toFixed(1),
+      dy: +(newTy - blip.by).toFixed(1),
+    };
+    redraw2d();
+  });
+
+  const end2d = (e) => {
+    if (activePtrId !== e.pointerId) return;
+    const tappedId = !hasDragged ? dragTagId : null;
+    activePtrId = null;
+    dragTagId = null;
+    state.draggingTagId2d = null;
+    svg.classList.remove("dragging-tag");
+    if (tappedId !== null) {
+      state.selectedTestAcftId = tappedId;
+      const solver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
+      renderRadarChartView(solver);
+    }
+  };
+
+  svg.addEventListener("pointerup", end2d);
+  svg.addEventListener("pointercancel", end2d);
+}
+
+// Wire up 3D Touch/Mouse Orbit, Pinch Zoom, Draggable Tags, and Tap-to-Select Plane
 function setup3dCanvasInteractions() {
   const canvas = document.getElementById("radar3dCanvas");
   if (!canvas) return;
@@ -5494,10 +5914,26 @@ function setup3dCanvasInteractions() {
   let lastPinchDist = null;
   let dragStartPos = null;
   let hasDragged = false;
+  let tagDragCtx = null; // { id, grabOffX, grabOffY, sx, sy, tw, th }
 
   function redrawOnly3d() {
     const solver = analyzeScenarioConflicts(state.aircraftList, state.activeRwy);
     renderRadarChartOnlyVisuals(solver);
+  }
+
+  function findTagAt(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const cx = clientX - rect.left;
+    const cy = clientY - rect.top;
+    const list = state.projectedBlips3d || [];
+    // Search front-to-back (last drawn = closest to camera)
+    for (let i = list.length - 1; i >= 0; i--) {
+      const b = list[i];
+      if (cx >= b.tx - 4 && cx <= b.tx + b.tw + 4 && cy >= b.ty - 4 && cy <= b.ty + b.th + 4) {
+        return { b, cx, cy };
+      }
+    }
+    return null;
   }
 
   function pickAirplaneAt(clientX, clientY) {
@@ -5532,7 +5968,26 @@ function setup3dCanvasInteractions() {
       dragStartPos = { x: e.clientX, y: e.clientY };
       hasDragged = false;
       lastPinchDist = null;
+      const hitTag = findTagAt(e.clientX, e.clientY);
+      if (hitTag) {
+        tagDragCtx = {
+          id: hitTag.b.id,
+          grabOffX: hitTag.cx - hitTag.b.tx,
+          grabOffY: hitTag.cy - hitTag.b.ty,
+          sx: hitTag.b.sx,
+          sy: hitTag.b.sy,
+          tw: hitTag.b.tw,
+          th: hitTag.b.th,
+        };
+        state.draggingTagId3d = hitTag.b.id;
+        canvas.style.cursor = "grabbing";
+      } else {
+        tagDragCtx = null;
+        state.draggingTagId3d = null;
+      }
     } else if (activePointers.size === 2) {
+      tagDragCtx = null;
+      state.draggingTagId3d = null;
       const pts = Array.from(activePointers.values());
       lastPinchDist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
       hasDragged = true;
@@ -5541,7 +5996,11 @@ function setup3dCanvasInteractions() {
 
   canvas.addEventListener("pointermove", (e) => {
     const prev = activePointers.get(e.pointerId);
-    if (!prev) return;
+    if (!prev) {
+      // Hover cursor feedback when over a draggable 3D tag
+      canvas.style.cursor = findTagAt(e.clientX, e.clientY) ? "grab" : "move";
+      return;
+    }
     const dx = e.clientX - prev.x;
     const dy = e.clientY - prev.y;
     activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -5549,11 +6008,22 @@ function setup3dCanvasInteractions() {
     if (activePointers.size === 1) {
       if (
         dragStartPos &&
-        Math.hypot(e.clientX - dragStartPos.x, e.clientY - dragStartPos.y) > 6
+        Math.hypot(e.clientX - dragStartPos.x, e.clientY - dragStartPos.y) > 4
       ) {
         hasDragged = true;
       }
-      if (hasDragged) {
+      if (hasDragged && tagDragCtx) {
+        const rect = canvas.getBoundingClientRect();
+        const cx = e.clientX - rect.left;
+        const cy = e.clientY - rect.top;
+        const newTx = Math.max(6, Math.min(rect.width - tagDragCtx.tw - 6, cx - tagDragCtx.grabOffX));
+        const newTy = Math.max(46, Math.min(rect.height - tagDragCtx.th - 38, cy - tagDragCtx.grabOffY));
+        state.tagOffsets3d[tagDragCtx.id] = {
+          dx: +(newTx - tagDragCtx.sx).toFixed(1),
+          dy: +(newTy - tagDragCtx.sy).toFixed(1),
+        };
+        redrawOnly3d();
+      } else if (hasDragged) {
         state.cam.yawDeg = (state.cam.yawDeg - dx * 0.42 + 360) % 360;
         state.cam.pitchDeg = Math.max(8, Math.min(89.5, state.cam.pitchDeg + dy * 0.35));
         document.querySelectorAll(".cam-btn[data-cam]").forEach((b) => b.classList.remove("active"));
@@ -5575,6 +6045,11 @@ function setup3dCanvasInteractions() {
     const wasSingleTap = activePointers.size === 1 && !hasDragged;
     activePointers.delete(e.pointerId);
     if (activePointers.size < 2) lastPinchDist = null;
+    if (activePointers.size === 0) {
+      tagDragCtx = null;
+      state.draggingTagId3d = null;
+      canvas.style.cursor = "move";
+    }
     if (wasSingleTap) {
       pickAirplaneAt(e.clientX, e.clientY);
     }
@@ -5644,8 +6119,25 @@ function initApp() {
     });
   });
 
-  // 3D Chart Mode, Camera Presets, Z-Scale & Live Tester Event Listeners
+  // 3D & 2D Chart Mode, Camera Presets, Draggable Tags, Z-Scale & Live Tester Event Listeners
   setup3dCanvasInteractions();
+  setup2dSvgInteractions();
+
+  const btnResetTags3d = document.getElementById("btnResetTags3d");
+  if (btnResetTags3d) {
+    btnResetTags3d.addEventListener("click", () => {
+      state.tagOffsets3d = {};
+      renderRadarChartOnlyVisuals(analyzeScenarioConflicts(state.aircraftList, state.activeRwy));
+    });
+  }
+
+  const btnResetTags2d = document.getElementById("btnResetTags2d");
+  if (btnResetTags2d) {
+    btnResetTags2d.addEventListener("click", () => {
+      state.tagOffsets2d = {};
+      renderRadarChartOnlyVisuals(analyzeScenarioConflicts(state.aircraftList, state.activeRwy));
+    });
+  }
 
   const btnMode3d = document.getElementById("btnMode3d");
   const btnMode2d = document.getElementById("btnMode2d");
@@ -6266,6 +6758,8 @@ function initApp() {
   document.getElementById("btnClearAll").addEventListener("click", () => {
     state.aircraftList = [];
     state.confirmedSeparations = {};
+    state.tagOffsets3d = {};
+    state.tagOffsets2d = {};
     state.nextId = 1;
     saveState();
     renderScenarioBoard();
@@ -6342,6 +6836,8 @@ function initApp() {
       if (mode === "replace") {
         state.aircraftList = [];
         state.confirmedSeparations = {};
+        state.tagOffsets3d = {};
+        state.tagOffsets2d = {};
         state.nextId = 1;
       }
 

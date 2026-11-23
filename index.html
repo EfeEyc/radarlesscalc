@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>AYT TMA Radarless Calculator &amp; Conflict Finder</title>
-  <link rel="stylesheet" href="styles.css?v=20261117k" />
+  <link rel="stylesheet" href="styles.css?v=20261123a" />
 </head>
 <body>
   <main class="container">
@@ -464,6 +464,20 @@
             </div>
           </div>
         </div>
+
+        <!-- ESSENTIAL TRAFFIC INFORMATION (INFORMATIONAL — NOT CONFLICTS) -->
+        <div class="essential-traffic-section">
+          <div class="panel-header">
+            <h3>📡 Essential Traffic Information</h3>
+            <span class="badge-subtle badge-info-subtle">Same-Airway Head-On Pass Times (Info Only)</span>
+          </div>
+          <p class="essential-sub-note">
+            Opposite-direction aircraft sharing the <strong>same airway</strong> (e.g. head-on departure &amp; arrival, or reciprocal transit/arrival). Shown for traffic awareness and exact <strong>pass-over time</strong> — not necessarily a conflict.
+          </p>
+          <div id="essentialTrafficList" class="essential-traffic-grid">
+            <!-- Populated by JS -->
+          </div>
+        </div>
       </section>
     </div>
 
@@ -529,8 +543,10 @@
 
               <!-- Bottom Hint / Selected Blip Quick Readout -->
               <div class="canvas3d-bottom-bar">
-                <span class="cam-touch-hint">Drag: Orbit • Pinch/Wheel: Zoom • Tap plane: Test FL</span>
+                <span class="cam-touch-hint">Drag: Orbit • Drag tag: Move • Pinch/Wheel: Zoom • Tap: Test FL</span>
                 <div class="vert-scale-toggle">
+                  <button type="button" id="btnResetTags3d" class="zscale-btn" title="Reset manually moved tags">↺ Tags</button>
+                  <span style="opacity:0.4">|</span>
                   <button type="button" id="btnToggle3dPaths" class="zscale-btn" title="Toggle between Focused and All 3D Trajectory Paths">Paths: Focus</button>
                   <span style="opacity:0.4">|</span>
                   <span>Alt Z:</span>
@@ -543,6 +559,10 @@
 
             <!-- 2D CLASSIC SVG CHART (Hidden by default unless toggled) -->
             <div id="chart2dStage" class="svg-chart-container hidden">
+              <div class="chart2d-controls-overlay">
+                <span class="cam-touch-hint">Drag tags to move • Tap tag: Test FL</span>
+                <button type="button" class="cam-btn" id="btnResetTags2d" title="Reset manually moved 2D tags">↺ Reset Tags</button>
+              </div>
               <svg viewBox="0 0 860 860" class="ayt-svg-chart" id="aytRadarSvg" aria-label="AYT TMA Live Radar Chart">
                 <defs>
                   <marker id="arrowRed" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
@@ -646,6 +666,17 @@
               </div>
             </div>
 
+            <!-- B2. ESSENTIAL TRAFFIC INFORMATION (SAME-AIRWAY HEAD-ON PASS TIMES) -->
+            <div class="chart-essential-section">
+              <div class="fl-tester-header">
+                <h3>📡 Essential Traffic</h3>
+                <span class="badge-subtle badge-info-subtle">Pass Times</span>
+              </div>
+              <div id="chartEssentialTrafficList" class="chart-essential-list">
+                <!-- Populated by JS -->
+              </div>
+            </div>
+
             <!-- C. TRAFFIC SNAPSHOT AT TIME T -->
             <div class="snapshot-section">
               <h3>✈️ Traffic @ <code id="sidebarTimeLabel">:00</code></h3>
@@ -676,6 +707,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=20261117k"></script>
+  <script src="app.js?v=20261123a"></script>
 </body>
 </html>
